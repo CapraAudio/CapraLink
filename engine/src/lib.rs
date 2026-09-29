@@ -26,6 +26,7 @@ pub fn output_devices() -> Vec<String> {
 pub fn resolve_peer(peer: &str) -> anyhow::Result<SocketAddr> {
     use std::net::ToSocketAddrs;
     let peer = peer.trim();
+    anyhow::ensure!(!peer.is_empty(), "enter the other computer's IP address");
     peer.to_socket_addrs()
         .or_else(|_| (peer, Config::default().port).to_socket_addrs())
         .with_context(|| format!("invalid peer address \"{peer}\""))?
