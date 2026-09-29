@@ -3,7 +3,7 @@
 Read `MASTER.md` first. This file is the live position.
 
 ## Current position
-- Linux tray app (owner request 2026-09-29): CI now builds AppImage/deb/rpm (app/, npx @tauri-apps/cli@2); single-instance plugin added. Owner's Linux = SteamOS (KDE desktop mode, read-only root → use AppImage). Pending owner test. Game Mode needs M6 service.
+- Linux tray app (owner request 2026-09-29): CI now builds AppImage/deb/rpm (app/, npx @tauri-apps/cli@2); single-instance plugin added. Owner's Linux = Steam Deck, SteamOS (KDE Wayland desktop mode, read-only root → AppImage). SSH access set up (see memory steamos-test-device). AppImage at ~/Applications/CapraLink on the Deck: window + KDE tray + pactl virtual devices (incl. remap-source) all WORK. Fixed: hostname fallback (no `hostname` binary on SteamOS). Deck Wi-Fi power save ON → rx gaps ~100 ms, target maxes 125 ms; owner to disable Wi-Fi power management (SteamOS Developer settings). Game Mode needs M6 service.
 - Phase: M0 + M1 done and owner-validated (Mac↔Linux, no clicks). M2 code committed + verified locally (MASTER §3.3). Owner test 2026-09-29: discovery + PIN pairing Mac(app)↔Linux(capralinkd) WORKS. Connect/audio/disconnect verified → M2 DONE. Linux needs new capralinkd (v1/v2 packets incompatible). Config dir override: $CAPRALINK_CONFIG_DIR. Now: M3 virtual devices (Linux first).
 
 ## Machine facts
