@@ -13,7 +13,7 @@ Read `MASTER.md` first. This file is the live position.
 - Test machines: Windows 10/11 PC and PipeWire Linux PC on the LAN (D10).
 
 ## Pending owner actions / questions
-1. Two-machine test: Mac runs target/release/capralink; PC runs capralinkd from CI artifacts (latest: https://github.com/CapraAudio/CapraLink/actions/runs/36619303433). Owner reports sound/latency/stats + window layout.
+1. Two-machine test: Mac runs target/release/capralink; PC runs capralinkd from CI artifacts (latest: https://github.com/CapraAudio/CapraLink/actions/runs/36621397746). Owner reports sound/latency/stats + window layout.
 
 ## Owner test results (2026-09-29, Mac app ↔ Linux capralinkd)
 - Linux mic → Mac headphones: WORKS, latency "not much at all".
