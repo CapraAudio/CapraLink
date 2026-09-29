@@ -57,9 +57,9 @@ fn stats(state: tauri::State<AppState>) -> Option<Stats> {
 
 const WINDOW_LABEL: &str = "main";
 
-fn toggle_window(app: &AppHandle) {
+fn show_window(app: &AppHandle) {
     if let Some(win) = app.get_webview_window(WINDOW_LABEL) {
-        let _ = win.close();
+        let _ = win.set_focus();
         return;
     }
     let _ = WebviewWindowBuilder::new(app, WINDOW_LABEL, WebviewUrl::App("index.html".into()))
@@ -86,19 +86,23 @@ fn main() {
                 .icon_as_template(true)
                 .menu(&menu)
                 .on_menu_event(|app, event| match event.id().as_ref() {
-                    "open" => toggle_window(app),
+                    "open" => show_window(app),
                     "quit" => app.exit(0),
                     _ => {}
                 })
                 .build(app)?;
 
+            show_window(app.handle());
             Ok(())
         })
         .build(tauri::generate_context!())
         .expect("error while building tauri application")
-        .run(|_app, event| {
-            if let RunEvent::ExitRequested { api, .. } = event {
-                api.prevent_exit();
-            }
+        .run(|app, event| match event {
+            // closing the last window keeps the tray running; explicit Quit (code set) exits
+            RunEvent::ExitRequested { api, code: None, .. } => api.prevent_exit(),
+            // launching the app again while it runs (Finder, `open`) brings the window back
+            #[cfg(target_os = "macos")]
+            RunEvent::Reopen { .. } => show_window(app),
+            _ => {}
         });
 }
