@@ -68,12 +68,17 @@ pub struct Stats {
     pub fec_recovered: u64,
     pub underruns: u64,
     pub buffer_ms: f32,
+    /// Peak sample (0..1) captured / played since the previous `stats()` call.
+    pub in_peak: f32,
+    pub out_peak: f32,
 }
 
 #[derive(Default)]
 struct Shared {
     c: Counters,
     buffer_ms: AtomicU32, // f32 bits
+    in_peak: AtomicU32,   // f32 bits, reset on read
+    out_peak: AtomicU32,  // f32 bits, reset on read
     rx_channels: AtomicU8,
 }
 
@@ -135,6 +140,8 @@ impl Link {
             fec_recovered: c.fec_recovered.load(Relaxed),
             underruns: c.underruns.load(Relaxed),
             buffer_ms: f32::from_bits(self.shared.buffer_ms.load(Relaxed)),
+            in_peak: f32::from_bits(self.shared.in_peak.swap(0, Relaxed)),
+            out_peak: f32::from_bits(self.shared.out_peak.swap(0, Relaxed)),
         }
     }
 }
@@ -155,6 +162,12 @@ fn pick_config(def: cpal::SupportedStreamConfig, mut all: impl Iterator<Item = c
     }
     all.find_map(|r| (r.channels() == def.channels() && r.sample_format() == def.sample_format()).then(|| r.try_with_sample_rate(RATE)).flatten())
         .unwrap_or(def)
+}
+
+/// Raises a reset-on-read peak meter. Positive f32 bit patterns order like the floats.
+fn meter(peak: &AtomicU32, samples: &[f32]) {
+    let p = samples.iter().fold(0f32, |m, s| m.max(s.abs()));
+    peak.fetch_max(p.to_bits(), Relaxed);
 }
 
 fn err_cb(e: cpal::Error) {
@@ -190,6 +203,7 @@ impl Tx {
                 self.mixed.extend([s(0), s(1)]);
             }
         }
+        meter(&self.shared.in_peak, &self.mixed);
         let pcm = match self.rs.as_mut() {
             Some(rs) => {
                 self.resampled.clear();
@@ -281,6 +295,7 @@ impl Playback {
                 None => self.staged.extend_from_slice(&self.scratch),
             }
         }
+        meter(&self.shared.out_peak, &self.staged[..frames * 2]);
         let mono = self.shared.rx_channels.load(Relaxed) == 1;
         for (f, s) in out.chunks_exact_mut(self.dev_ch).zip(self.staged.as_chunks::<2>().0) {
             if self.dev_ch == 1 {

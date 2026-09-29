@@ -14,7 +14,7 @@
   }
   * { box-sizing: border-box; }
   body {
-    margin: 0; padding: 14px; width: 360px; height: 540px; overflow: hidden;
+    margin: 0; padding: 14px;
     background: var(--bg); color: var(--fg);
     font-family: -apple-system, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
     font-size: 13px;
@@ -48,6 +48,8 @@
   #startStop.stop { background: var(--danger); }
   #error { color: var(--danger); font-size: 11px; margin-top: 6px; min-height: 14px; }
   #stats { font-size: 11px; color: var(--sub); text-align: center; }
+  .meters { display: grid; grid-template-columns: auto 1fr; gap: 4px 8px; align-items: center; font-size: 11px; color: var(--sub); margin-top: 10px; }
+  meter { width: 100%; height: 8px; }
 </style>
 </head>
 <body>
@@ -57,10 +59,10 @@
   </header>
 
   <section>
-    <label>Peer (host:port)</label>
-    <input id="peer" placeholder="192.168.1.20:47800" />
-    <label>Local port</label>
-    <input id="port" type="number" value="47800" />
+    <div class="row">
+      <div style="flex:2"><label>Peer</label><input id="peer" placeholder="192.168.1.20" /></div>
+      <div><label>Local port</label><input id="port" type="number" value="47800" /></div>
+    </div>
   </section>
 
   <section>
@@ -83,7 +85,11 @@
 
   <button id="startStop">Start</button>
   <div id="error"></div>
-  <div id="stats" style="margin-top:10px;"></div>
+  <div class="meters">
+    <span>Sending</span><meter id="inLevel" min="-60" max="0" low="-20" high="-6" optimum="-30" value="-60"></meter>
+    <span>Receiving</span><meter id="outLevel" min="-60" max="0" low="-20" high="-6" optimum="-30" value="-60"></meter>
+  </div>
+  <div id="stats" style="margin-top:8px;"></div>
 
 <script>
 const { invoke } = window.__TAURI__.core;
@@ -160,12 +166,16 @@ function setRunning(v) {
     clearInterval(statsTimer);
     statsTimer = null;
     els.stats.textContent = '';
+    inLevel.value = outLevel.value = -60;
   }
 }
 
 async function refreshStats() {
   const s = await invoke('stats');
   if (!s) { setRunning(false); return; }
+  const db = (p) => Math.max(-60, 20 * Math.log10(p));
+  inLevel.value = db(s.in_peak);
+  outLevel.value = db(s.out_peak);
   els.stats.textContent =
     `sent ${s.sent} · recv ${s.received} · lost ${s.lost} · fec ${s.fec_recovered} · underruns ${s.underruns} · buf ${s.buffer_ms.toFixed(0)}ms`;
 }

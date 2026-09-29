@@ -33,8 +33,13 @@ fn main() -> anyhow::Result<()> {
         std::thread::sleep(Duration::from_secs(5));
         let s = link.stats();
         eprintln!(
-            "sent={} received={} lost={} fec_recovered={} underruns={} buffer_ms={:.1}",
-            s.sent, s.received, s.lost, s.fec_recovered, s.underruns, s.buffer_ms
+            "sent={} received={} lost={} fec_recovered={} underruns={} buffer_ms={:.1} in={:.0}dB out={:.0}dB",
+            s.sent, s.received, s.lost, s.fec_recovered, s.underruns, s.buffer_ms, db(s.in_peak), db(s.out_peak)
         );
     }
+}
+
+/// Peak level in dBFS; -99 means silence (e.g. mic permission denied).
+fn db(peak: f32) -> f32 {
+    (20.0 * peak.log10()).max(-99.0)
 }
