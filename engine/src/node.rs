@@ -447,7 +447,14 @@ fn start_link(s: &Settings, port: u16, peer: SocketAddr, keys: &Keys) -> Result<
 fn load(dir: &Path) -> Result<Config> {
     let path = dir.join("config.json");
     match std::fs::read(&path) {
-        Ok(b) => serde_json::from_slice(&b).with_context(|| format!("invalid config file {}", path.display())),
+        Ok(b) => {
+            let mut cfg: Config = serde_json::from_slice(&b).with_context(|| format!("invalid config file {}", path.display()))?;
+            // "CapraLink" is the fallback when no hostname could be read; retry so the real name shows up
+            if cfg.name == "CapraLink" {
+                cfg.name = hostname();
+            }
+            Ok(cfg)
+        }
         Err(e) if e.kind() == io::ErrorKind::NotFound => {
             let cfg = Config { device_id: hex(&random::<16>()), name: hostname(), settings: Settings::default(), peers: vec![] };
             save(dir, &cfg)?;
@@ -487,7 +494,8 @@ fn secret(cfg: &Config, id: &str) -> Option<[u8; 32]> {
 }
 
 fn hostname() -> String {
-    let n = std::env::var("COMPUTERNAME").ok().or_else(|| {
+    // Windows sets COMPUTERNAME; Linux has the kernel's name even without a `hostname` binary (SteamOS)
+    let n = std::env::var("COMPUTERNAME").ok().or_else(|| std::fs::read_to_string("/proc/sys/kernel/hostname").ok()).or_else(|| {
         let o = std::process::Command::new("hostname").output().ok()?;
         Some(String::from_utf8_lossy(&o.stdout).into_owned())
     });
