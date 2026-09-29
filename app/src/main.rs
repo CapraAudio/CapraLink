@@ -65,7 +65,7 @@ fn show_window(app: &AppHandle) {
     let _ = WebviewWindowBuilder::new(app, WINDOW_LABEL, WebviewUrl::App("index.html".into()))
         .title("CapraLink")
         .inner_size(360.0, 600.0)
-        .resizable(false)
+        .min_inner_size(360.0, 480.0)
         .build();
 }
 

@@ -14,19 +14,19 @@
   }
   * { box-sizing: border-box; }
   body {
-    margin: 0; padding: 14px;
+    margin: 0; padding: 12px;
     background: var(--bg); color: var(--fg);
     font-family: -apple-system, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
     font-size: 13px;
   }
   h1 { font-size: 16px; margin: 0; }
-  header { display: flex; align-items: center; justify-content: space-between; margin-bottom: 12px; }
+  header { display: flex; align-items: center; justify-content: space-between; margin-bottom: 8px; }
   .pill {
     padding: 3px 10px; border-radius: 999px; font-size: 11px; font-weight: 600;
     background: var(--border); color: var(--sub);
   }
   .pill.on { background: #d7f5e0; color: #1a7a3c; }
-  section { background: var(--card); border: 1px solid var(--border); border-radius: 10px; padding: 10px; margin-bottom: 10px; }
+  section { background: var(--card); border: 1px solid var(--border); border-radius: 10px; padding: 8px 10px 2px; margin-bottom: 8px; }
   label { display: block; font-size: 11px; color: var(--sub); margin-bottom: 4px; }
   input, select {
     width: 100%; padding: 6px 8px; border-radius: 6px; border: 1px solid var(--border);
@@ -84,12 +84,13 @@
   </section>
 
   <button id="startStop">Start</button>
-  <div id="error"></div>
   <div class="meters">
     <span>Sending</span><meter id="inLevel" min="-60" max="0" low="-20" high="-6" optimum="-30" value="-60"></meter>
     <span>Receiving</span><meter id="outLevel" min="-60" max="0" low="-20" high="-6" optimum="-30" value="-60"></meter>
   </div>
   <div id="stats" style="margin-top:8px;"></div>
+  <div id="error"></div>
+
 
 <script>
 const { invoke } = window.__TAURI__.core;
