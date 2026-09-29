@@ -14,7 +14,11 @@ Read `MASTER.md` first. This file is the live position.
 - Test machines: Windows 10/11 PC and PipeWire Linux PC on the LAN (D10).
 
 ## Pending owner actions / questions
-None blocking. Rounds 1–2 answered (D3–D10).
+None blocking. D4 settled 2026-09-29 (test-signed driver fork).
 
 ## Next step
 Verify engine build/tests, commit, then build app/ (Tauri tray) against the engine API, add CI.
+
+## In flight (2026-09-29)
+- Engine M1 delegated (Opus agent) — writes Cargo.toml + engine/. Not committed until verified.
+If a session resumes and these are missing, re-run them from MASTER §3.2 / §6.

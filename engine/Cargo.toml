@@ -1,0 +1,16 @@
+[package]
+name = "capralink_engine"
+version = "0.1.0"
+edition = "2021"
+license = "GPL-3.0-only"
+
+[[bin]]
+name = "capralinkd"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1"
+cpal = "0.18"
+opus = "0.4"
+ringbuf = "0.5"
+serde = { version = "1", features = ["derive"] }

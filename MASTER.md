@@ -129,6 +129,24 @@ A node runs one **TX** stream and one **RX** stream. Which devices they use is c
 7. **Latency budget (wired LAN):** 10 ms frame + ~20 ms jitter buffer + ~10–20 ms device
    buffers each side ≈ 40–60 ms. Wi-Fi adds jitter; the buffer grows adaptively.
 
+### 4.1 Virtual device research (2026-09-29)
+
+- **macOS:** BlackHole (GPL-3.0, compatible with D8) supports compile-time renaming
+  (`kDriver_Name`, `kPlugIn_BundleID`, `kNumber_Of_Channels`). Each build is one loopback device,
+  so we ship two builds: "CapraLink Input" and "CapraLink Output". Installs to
+  `/Library/Audio/Plug-Ins/HAL`, then coreaudiod restart (admin once). Distribution to others
+  needs Developer ID signing + notarization.
+- **Linux:** PipeWire/Pulse `module-null-sink` (Audio/Sink for Output, `media.class=Audio/Source/Virtual`
+  for Input), created at runtime via `pactl`, or persisted in `~/.config/pipewire/pipewire.conf.d/`.
+  cpal has `pipewire`/`pulseaudio` features for opening nodes by name.
+- **Windows:** VirtualDrivers/Virtual-Audio-Driver (MIT, speaker + mic) is beta, has no releases,
+  and needs **test-signing mode** — which major anti-cheats (Vanguard, FACEIT, EAC) refuse to run
+  under. Scream is speaker-only and also test-signed. VB-Cable is signed but closed and not
+  renameable. **No off-the-shelf signed OSS option exists → D4 must be revisited.**
+- **Driverless capture exists for the Output side:** Windows 10 2004+ process loopback
+  (WASAPI `PROCESS_LOOPBACK`) and macOS 14.2+ Core Audio process taps can capture a chosen app's
+  audio (e.g. Discord) with no virtual device. The **Input side (virtual mic) always needs a driver.**
+
 ## 5. Decisions log
 
 | ID | Date | Decision | Reason |
@@ -136,7 +154,7 @@ A node runs one **TX** stream and one **RX** stream. Which devices they use is c
 | D1 | 2026-09-29 | UI = Tauri 2 + vanilla HTML/JS; window destroyed when closed | Same layout on all OSes; zero UI cost while gaming |
 | D2 | 2026-09-29 | Codec = Opus, 10 ms frames, FEC on | Industry standard for low-latency voice/audio |
 | D3 | 2026-09-29 | Opus @ 48 kHz, adaptive 8–96 kbps (start 64 kbps) | 16 kHz too muffled for game/music; owner agreed |
-| D4 | 2026-09-29 | Windows: build on an existing open-source signed virtual audio driver, devices renamed to CapraLink Input/Output | No EV cert / driver dev; owner agreed |
+| D4 | 2026-09-29 | Windows: fork VirtualDrivers/Virtual-Audio-Driver (MIT), rename devices to CapraLink Input/Output, test-sign ourselves; users enable test-signing (`bcdedit /set testsigning on`, Secure Boot off) | Owner choice over phased/driverless. Known cost: anti-cheat games (Vanguard, FACEIT, EAC) won't run on that Windows machine. Upgrade path: attestation signing with EV cert |
 | D5 | 2026-09-29 | UDP + per-packet encryption keyed by PIN pairing | Low latency, LAN-safe |
 | D6 | 2026-09-29 | "Service" = headless login agent, not system service | OS audio is per-user-session |
 | D7 | 2026-09-29 | One peer at a time (1:1 link) | Covers the use case; simplest |
@@ -152,7 +170,7 @@ A node runs one **TX** stream and one **RX** stream. Which devices they use is c
 | M1 | Engine: mic → Opus → UDP → speaker, two hard-coded peers | Hear yourself across two machines; latency measured |
 | M2 | mDNS discovery, PIN pairing, encryption, saved pairings | Pair two machines from the UI |
 | M3 | Virtual devices: Linux, then macOS HAL plug-in | Discord on A can pick CapraLink Input/Output |
-| M4 | Virtual devices: Windows (per D4) | Same, on Windows |
+| M4 | Virtual devices: Windows — fork + rename + test-sign VirtualDrivers driver, built in CI (D4) | Same, on Windows |
 | M5 | Adaptive bitrate (loss/RTT/CPU), jitter tuning | Holds quality on Wi-Fi; CPU target met |
 | M6 | Service mode + remote configuration | Configure a headless machine from another |
 | M7 | Installers + signing for all 3 OSes | One-click install per OS |
