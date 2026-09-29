@@ -70,6 +70,12 @@ fn set_settings(app: State<App>, settings: Settings) -> Result<(), String> {
 
 const WINDOW_LABEL: &str = "main";
 
+// macOS menu bar: black silhouette that the system recolours; elsewhere: white for dark panels
+#[cfg(target_os = "macos")]
+const TRAY_ICON: &[u8] = include_bytes!("../icons/tray-template.png");
+#[cfg(not(target_os = "macos"))]
+const TRAY_ICON: &[u8] = include_bytes!("../icons/tray.png");
+
 fn show_window(app: &AppHandle) {
     if let Some(win) = app.get_webview_window(WINDOW_LABEL) {
         let _ = win.set_focus();
@@ -97,8 +103,8 @@ fn main() {
             let menu = Menu::with_items(app, &[&open, &quit])?;
 
             TrayIconBuilder::new()
-                .icon(app.default_window_icon().cloned().unwrap())
-                .icon_as_template(true)
+                .icon(tauri::image::Image::from_bytes(TRAY_ICON)?)
+                .icon_as_template(cfg!(target_os = "macos"))
                 .menu(&menu)
                 .on_menu_event(|app, event| match event.id().as_ref() {
                     "open" => show_window(app),
