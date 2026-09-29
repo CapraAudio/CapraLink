@@ -1,0 +1,224 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8" />
+<title>CapraLink</title>
+<style>
+  :root {
+    color-scheme: light dark;
+    --bg: #f4f4f6; --fg: #1c1c1e; --sub: #6b6b72; --card: #ffffff;
+    --border: #d9d9de; --accent: #3a7afe; --danger: #d92d20;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root { --bg: #1c1c1e; --fg: #f2f2f3; --sub: #9a9aa2; --card: #2a2a2d; --border: #3d3d41; }
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; padding: 14px; width: 360px; height: 540px; overflow: hidden;
+    background: var(--bg); color: var(--fg);
+    font-family: -apple-system, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+    font-size: 13px;
+  }
+  h1 { font-size: 16px; margin: 0; }
+  header { display: flex; align-items: center; justify-content: space-between; margin-bottom: 12px; }
+  .pill {
+    padding: 3px 10px; border-radius: 999px; font-size: 11px; font-weight: 600;
+    background: var(--border); color: var(--sub);
+  }
+  .pill.on { background: #d7f5e0; color: #1a7a3c; }
+  section { background: var(--card); border: 1px solid var(--border); border-radius: 10px; padding: 10px; margin-bottom: 10px; }
+  label { display: block; font-size: 11px; color: var(--sub); margin-bottom: 4px; }
+  input, select {
+    width: 100%; padding: 6px 8px; border-radius: 6px; border: 1px solid var(--border);
+    background: var(--bg); color: var(--fg); font-size: 13px; margin-bottom: 8px;
+  }
+  .row { display: flex; gap: 8px; }
+  .row > div { flex: 1; }
+  .seg { display: flex; border: 1px solid var(--border); border-radius: 6px; overflow: hidden; margin-bottom: 8px; }
+  .seg button {
+    flex: 1; padding: 6px; border: none; background: var(--bg); color: var(--fg); cursor: pointer; font-size: 13px;
+  }
+  .seg button.active { background: var(--accent); color: white; }
+  input[type=range] { padding: 0; margin-bottom: 4px; }
+  .bitrate-val { font-size: 11px; color: var(--sub); text-align: right; margin-bottom: 8px; }
+  #startStop {
+    width: 100%; padding: 10px; border: none; border-radius: 8px; font-size: 15px; font-weight: 600;
+    background: var(--accent); color: white; cursor: pointer;
+  }
+  #startStop.stop { background: var(--danger); }
+  #error { color: var(--danger); font-size: 11px; margin-top: 6px; min-height: 14px; }
+  #stats { font-size: 11px; color: var(--sub); text-align: center; }
+</style>
+</head>
+<body>
+  <header>
+    <h1>CapraLink</h1>
+    <span class="pill" id="status">Idle</span>
+  </header>
+
+  <section>
+    <label>Peer (host:port)</label>
+    <input id="peer" placeholder="192.168.1.20:47800" />
+    <label>Local port</label>
+    <input id="port" type="number" value="47800" />
+  </section>
+
+  <section>
+    <label>Send from</label>
+    <select id="input"></select>
+    <label>Play to</label>
+    <select id="output"></select>
+  </section>
+
+  <section>
+    <label>Channels</label>
+    <div class="seg" id="channels">
+      <button data-v="1" class="active">Mono</button>
+      <button data-v="2">Stereo</button>
+    </div>
+    <label>Bitrate</label>
+    <input id="bitrate" type="range" min="8" max="96" step="8" value="64" />
+    <div class="bitrate-val" id="bitrateVal">64 kbps</div>
+  </section>
+
+  <button id="startStop">Start</button>
+  <div id="error"></div>
+  <div id="stats" style="margin-top:10px;"></div>
+
+<script>
+const { invoke } = window.__TAURI__.core;
+
+const els = {
+  peer: document.getElementById('peer'),
+  port: document.getElementById('port'),
+  input: document.getElementById('input'),
+  output: document.getElementById('output'),
+  channels: document.getElementById('channels'),
+  bitrate: document.getElementById('bitrate'),
+  bitrateVal: document.getElementById('bitrateVal'),
+  startStop: document.getElementById('startStop'),
+  error: document.getElementById('error'),
+  status: document.getElementById('status'),
+  stats: document.getElementById('stats'),
+};
+
+let channels = 1;
+let running = false;
+let statsTimer = null;
+
+function save() {
+  try {
+    localStorage.setItem('capralink.form', JSON.stringify({
+      peer: els.peer.value, port: els.port.value,
+      input: els.input.value, output: els.output.value,
+      channels, bitrate: els.bitrate.value,
+    }));
+  } catch (_) {}
+}
+
+function restore() {
+  let f = null;
+  try { f = JSON.parse(localStorage.getItem('capralink.form')); } catch (_) {}
+  if (!f) return;
+  if (f.peer) els.peer.value = f.peer;
+  if (f.port) els.port.value = f.port;
+  if (f.input) els.input.value = f.input;
+  if (f.output) els.output.value = f.output;
+  if (f.bitrate) { els.bitrate.value = f.bitrate; els.bitrateVal.textContent = f.bitrate + ' kbps'; }
+  if (f.channels) setChannels(f.channels);
+}
+
+function setChannels(v) {
+  channels = v;
+  for (const b of els.channels.children) b.classList.toggle('active', Number(b.dataset.v) === v);
+}
+
+els.channels.addEventListener('click', (e) => {
+  if (e.target.tagName !== 'BUTTON') return;
+  setChannels(Number(e.target.dataset.v));
+  save();
+});
+
+els.bitrate.addEventListener('input', () => {
+  els.bitrateVal.textContent = els.bitrate.value + ' kbps';
+  save();
+});
+
+for (const id of ['peer', 'port', 'input', 'output']) {
+  els[id].addEventListener('change', save);
+}
+
+function setRunning(v) {
+  running = v;
+  els.startStop.textContent = v ? 'Stop' : 'Start';
+  els.startStop.classList.toggle('stop', v);
+  els.status.textContent = v ? 'Streaming' : 'Idle';
+  els.status.classList.toggle('on', v);
+  if (v) {
+    if (!statsTimer) statsTimer = setInterval(refreshStats, 1000);
+  } else {
+    clearInterval(statsTimer);
+    statsTimer = null;
+    els.stats.textContent = '';
+  }
+}
+
+async function refreshStats() {
+  const s = await invoke('stats');
+  if (!s) { setRunning(false); return; }
+  els.stats.textContent =
+    `sent ${s.sent} · recv ${s.received} · lost ${s.lost} · fec ${s.fec_recovered} · underruns ${s.underruns} · buf ${s.buffer_ms.toFixed(0)}ms`;
+}
+
+els.startStop.addEventListener('click', async () => {
+  els.error.textContent = '';
+  if (running) {
+    await invoke('stop');
+    setRunning(false);
+    return;
+  }
+  try {
+    await invoke('start', {
+      peer: els.peer.value,
+      port: Number(els.port.value) || 47800,
+      input: els.input.value || null,
+      output: els.output.value || null,
+      bitrate: Number(els.bitrate.value) * 1000,
+      channels,
+    });
+    setRunning(true);
+    save();
+  } catch (e) {
+    els.error.textContent = String(e);
+  }
+});
+
+async function loadDevices() {
+  const d = await invoke('devices');
+  const fill = (sel, list) => {
+    const prev = sel.value;
+    sel.innerHTML = '';
+    const def = document.createElement('option');
+    def.value = ''; def.textContent = 'System default';
+    sel.appendChild(def);
+    for (const name of list) {
+      const o = document.createElement('option');
+      o.value = name; o.textContent = name;
+      sel.appendChild(o);
+    }
+    if (prev) sel.value = prev;
+  };
+  fill(els.input, d.inputs);
+  fill(els.output, d.outputs);
+}
+
+(async function init() {
+  await loadDevices(); // options must exist before saved selections can apply
+  restore();
+  const s = await invoke('stats');
+  setRunning(!!s);
+  if (s) refreshStats();
+})();
+</script>
+</body>
+</html>

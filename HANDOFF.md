@@ -3,7 +3,7 @@
 Read `MASTER.md` first. This file is the live position.
 
 ## Current position
-- Phase: M1 engine done + verified on Mac loopback. Next: M0 Tauri tray app (app/) using engine API; then two-machine test with owner.
+- Phase: M0 + M1 done. Next: owner two-machine test (Mac ↔ Windows/Linux), then M2 (discovery + PIN pairing + encryption).
 
 ## Machine facts
 - GitHub: private repo CapraAudio/CapraLink, branch main. Repo-local git identity set.
@@ -13,7 +13,7 @@ Read `MASTER.md` first. This file is the live position.
 - Test machines: Windows 10/11 PC and PipeWire Linux PC on the LAN (D10).
 
 ## Pending owner actions / questions
-None blocking. D4 settled 2026-09-29 (test-signed driver fork).
+1. Two-machine test: run capralinkd or the app on both, report sound/latency/stats. Also eyeball the window layout.
 
 ## Next step
 Verify engine build/tests, commit, then build app/ (Tauri tray) against the engine API, add CI.
