@@ -12,7 +12,7 @@ use std::net::{SocketAddr, UdpSocket};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU8, Ordering::Relaxed};
 use std::sync::Arc;
 use std::thread::JoinHandle;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 pub fn input_devices() -> Vec<String> {
     cpal::default_host().input_devices().map(|d| d.map(|d| name(&d)).collect()).unwrap_or_default()
@@ -74,6 +74,10 @@ pub struct Stats {
     /// Peak sample (0..1) captured / played since the previous `stats()` call.
     pub in_peak: f32,
     pub out_peak: f32,
+    /// Longest gap between packets sent / received since the previous `stats()` call.
+    /// Even ~10 ms means a smooth link; big gaps show where bursts come from.
+    pub tx_gap_ms: f32,
+    pub rx_gap_ms: f32,
 }
 
 #[derive(Default)]
@@ -84,6 +88,8 @@ struct Shared {
     in_peak: AtomicU32,   // f32 bits, reset on read
     out_peak: AtomicU32,  // f32 bits, reset on read
     rx_channels: AtomicU8,
+    tx_gap_us: AtomicU32, // reset on read
+    rx_gap_us: AtomicU32, // reset on read
 }
 
 /// A running TX + RX link. Dropping it stops everything.
@@ -118,13 +124,14 @@ impl Link {
         let rx = {
             let (shared, stop) = (shared.clone(), stop.clone());
             std::thread::Builder::new().name("capralink-rx".into()).spawn(move || {
-                let (mut rx, mut buf) = (Rx::default(), [0u8; 2048]);
+                let (mut rx, mut buf, mut last) = (Rx::default(), [0u8; 2048], None);
                 while !stop.load(Relaxed) {
                     // Errors are timeouts (checked above) or transient (e.g. ICMP resets on Windows).
                     let Ok((n, _)) = sock.recv_from(&mut buf) else { continue };
                     if let Some(ch) = rx.handle(&buf[..n], &shared.c, &mut |pcm: &[f32]| {
                         prod.push_slice(pcm);
                     }) {
+                        gap(&mut last, &shared.rx_gap_us);
                         shared.rx_channels.store(ch, Relaxed);
                     }
                 }
@@ -147,6 +154,8 @@ impl Link {
             target_ms: f32::from_bits(self.shared.target_ms.load(Relaxed)),
             in_peak: f32::from_bits(self.shared.in_peak.swap(0, Relaxed)),
             out_peak: f32::from_bits(self.shared.out_peak.swap(0, Relaxed)),
+            tx_gap_ms: self.shared.tx_gap_us.swap(0, Relaxed) as f32 / 1000.0,
+            rx_gap_ms: self.shared.rx_gap_us.swap(0, Relaxed) as f32 / 1000.0,
         }
     }
 }
@@ -169,6 +178,14 @@ fn pick_config(def: cpal::SupportedStreamConfig, mut all: impl Iterator<Item = c
         .unwrap_or(def)
 }
 
+/// Records the time since `last` into a reset-on-read max-gap meter.
+fn gap(last: &mut Option<Instant>, max_us: &AtomicU32) {
+    let now = Instant::now();
+    if let Some(prev) = last.replace(now) {
+        max_us.fetch_max((now - prev).as_micros() as u32, Relaxed);
+    }
+}
+
 /// Raises a reset-on-read peak meter. Positive f32 bit patterns order like the floats.
 fn meter(peak: &AtomicU32, samples: &[f32]) {
     let p = samples.iter().fold(0f32, |m, s| m.max(s.abs()));
@@ -188,6 +205,7 @@ struct Tx {
     mixed: Vec<f32>,
     resampled: Vec<f32>,
     frame: Vec<f32>,
+    last_send: Option<Instant>,
     shared: Arc<Shared>,
 }
 
@@ -224,6 +242,7 @@ impl Tx {
                 if let Ok(p) = self.pk.packet(&self.frame) {
                     if self.sock.send_to(p, self.peer).is_ok() {
                         self.shared.c.sent.fetch_add(1, Relaxed);
+                        gap(&mut self.last_send, &self.shared.tx_gap_us);
                     }
                 }
                 self.frame.clear();
@@ -246,6 +265,7 @@ fn build_input(dev: &cpal::Device, cfg: &Config, sock: UdpSocket, shared: Arc<Sh
         mixed: Vec::with_capacity(16_384 * ch),
         resampled: Vec::with_capacity(32_768 * ch),
         frame: Vec::with_capacity(FRAME * ch),
+        last_send: None,
         shared,
     };
     let mut c = sc.config();

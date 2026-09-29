@@ -178,7 +178,7 @@ async function refreshStats() {
   inLevel.value = db(s.in_peak);
   outLevel.value = db(s.out_peak);
   els.stats.textContent =
-    `sent ${s.sent} · recv ${s.received} · lost ${s.lost} · fec ${s.fec_recovered} · underruns ${s.underruns} · buf ${s.buffer_ms.toFixed(0)}/${s.target_ms.toFixed(0)}ms`;
+    `sent ${s.sent} · recv ${s.received} · lost ${s.lost} · fec ${s.fec_recovered} · underruns ${s.underruns} · buf ${s.buffer_ms.toFixed(0)}/${s.target_ms.toFixed(0)}ms · gap tx ${s.tx_gap_ms.toFixed(0)} rx ${s.rx_gap_ms.toFixed(0)}ms`;
 }
 
 els.startStop.addEventListener('click', async () => {

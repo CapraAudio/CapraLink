@@ -33,8 +33,8 @@ fn main() -> anyhow::Result<()> {
         std::thread::sleep(Duration::from_secs(5));
         let s = link.stats();
         eprintln!(
-            "sent={} received={} lost={} fec_recovered={} underruns={} buffer_ms={:.1} target_ms={:.0} in={:.0}dB out={:.0}dB",
-            s.sent, s.received, s.lost, s.fec_recovered, s.underruns, s.buffer_ms, s.target_ms, db(s.in_peak), db(s.out_peak)
+            "sent={} received={} lost={} fec_recovered={} underruns={} buffer_ms={:.1} target_ms={:.0} in={:.0}dB out={:.0}dB tx_gap={:.0}ms rx_gap={:.0}ms",
+            s.sent, s.received, s.lost, s.fec_recovered, s.underruns, s.buffer_ms, s.target_ms, db(s.in_peak), db(s.out_peak), s.tx_gap_ms, s.rx_gap_ms
         );
     }
 }
