@@ -204,7 +204,7 @@ config, mDNS advertise+browse, a TCP control listener, and at most one `Link` (D
 |---|---|---|
 | M0 | Toolchain, repo, Tauri tray skeleton on macOS | Tray icon runs on this Mac |
 | M1 | Engine: mic → Opus → UDP → speaker, two hard-coded peers | Hear yourself across two machines; latency measured |
-| M2 | mDNS discovery, PIN pairing, encryption, saved pairings | Pair two machines from the UI — code done 2026-09-29, owner test pending |
+| M2 | mDNS discovery, PIN pairing, encryption, saved pairings | Pair two machines from the UI — **done 2026-09-29**, owner-verified Mac↔Linux (pair, connect, audio both ways, disconnect/reconnect) |
 | M3 | Virtual devices: Linux, then macOS HAL plug-in | Discord on A can pick CapraLink Input/Output |
 | M4 | Virtual devices: Windows — fork + rename + test-sign VirtualDrivers driver, built in CI (D4) | Same, on Windows |
 | M5 | Adaptive bitrate (loss/RTT/CPU), jitter tuning | Holds quality on Wi-Fi; CPU target met |
@@ -220,6 +220,7 @@ See `HANDOFF.md` → "Pending owner actions" for the live list. Answers get move
 | Date | Change |
 |---|---|
 | 2026-09-29 | Project started. Master plan written. No Rust toolchain on the Mac yet. |
+| 2026-09-29 | M2 signed off by owner. Starting M3 (Linux virtual devices first). |
 | 2026-09-29 | M2 landed (engine/src/node.rs): mDNS discovery (all LAN IPv4 addrs, ranked dialing), SPAKE2 PIN pairing w/ rate limit, Noise NNpsk0 control + keepalive, forward-secret per-session ChaCha20-Poly1305 audio (packet v2), config.json (0600, atomic). App UI: PIN, device list, pair/connect/forget, settings in node. CLI = headless node. 8 tests; 2-process smoke test OK. Awaiting owner 2-machine test. |
 | 2026-09-29 | M1 signed off by owner: Mac↔Linux both directions, no clicks, low latency, jitter-sized cushion. |
 | 2026-09-29 | Two-machine tuning (Mac↔Linux): mic permission fix (.app + usage string); Linux ALSA 40 ms bursts → 10 ms capture buffers (0 underruns); ~0.3% clock drift → resampling drift control on low-water cushion. Stats gained levels, target, tx/rx gaps. |
