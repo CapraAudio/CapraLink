@@ -241,6 +241,7 @@ See `HANDOFF.md` → "Pending owner actions" for the live list. Answers get move
 | Date | Change |
 |---|---|
 | 2026-09-29 | Project started. Master plan written. No Rust toolchain on the Mac yet. |
+| 2026-09-29 | M3-Linux code: cpal pulseaudio host on Linux; pactl creates capralink_output / capralink_input_feed + remap source capralink_input (reuses leftovers, unloads on shutdown incl. Ctrl-C/SIGTERM); special names mapped in lib.rs; pulse playback requests 10 ms buffers. Untested on Linux — owner test pending. |
 | 2026-09-29 | M2 signed off by owner. Starting M3 (Linux virtual devices first). |
 | 2026-09-29 | M2 landed (engine/src/node.rs): mDNS discovery (all LAN IPv4 addrs, ranked dialing), SPAKE2 PIN pairing w/ rate limit, Noise NNpsk0 control + keepalive, forward-secret per-session ChaCha20-Poly1305 audio (packet v2), config.json (0600, atomic). App UI: PIN, device list, pair/connect/forget, settings in node. CLI = headless node. 8 tests; 2-process smoke test OK. Awaiting owner 2-machine test. |
 | 2026-09-29 | M1 signed off by owner: Mac↔Linux both directions, no clicks, low latency, jitter-sized cushion. |

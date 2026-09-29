@@ -1,4 +1,4 @@
-use capralink_engine::{input_devices, output_devices, Node};
+use capralink_engine::{input_devices, output_devices, Node, VIRTUAL_INPUT, VIRTUAL_OUTPUT};
 use std::time::Duration;
 
 const USAGE: &str = "usage: capralinkd [--port N] [--pair NAME_OR_ID PIN] [--connect NAME_OR_ID]
@@ -27,6 +27,12 @@ fn main() -> anyhow::Result<()> {
     }
 
     let node = Node::start(std::env::var_os("CAPRALINK_CONFIG_DIR").map(Into::into), port, true)?;
+    // Ctrl-C / service stop: remove the virtual devices and say goodbye on mDNS before exiting
+    let n = node.clone();
+    ctrlc::set_handler(move || {
+        n.shutdown();
+        std::process::exit(0);
+    })?;
     let (mut shown_pin, mut shown_err) = (String::new(), None);
     // state() resets the peak/gap meters, so each tick reads it once
     let mut header = |st: &capralink_engine::NodeState| {
@@ -42,6 +48,13 @@ fn main() -> anyhow::Result<()> {
         }
     };
     header(&node.state());
+    match node.state().virtual_error {
+        Some(e) => println!("{e}"),
+        None if input_devices().iter().any(|d| d == VIRTUAL_OUTPUT) && output_devices().iter().any(|d| d == VIRTUAL_INPUT) => {
+            println!("Virtual devices ready: \"{VIRTUAL_OUTPUT}\" (send from it) and \"{VIRTUAL_INPUT}\" (play to it)")
+        }
+        None => println!("Virtual devices not installed"),
+    }
     if let Some((who, pin)) = pair {
         let r = find(&node, &who).and_then(|id| node.pair(&id, &pin));
         if r.is_err() || connect.is_none() {

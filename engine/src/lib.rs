@@ -2,6 +2,7 @@
 
 mod dsp;
 mod node;
+mod vdev;
 
 pub use node::{Device, Node, NodeState};
 
@@ -17,16 +18,43 @@ use std::sync::Arc;
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
+/// Settings device names that mean the CapraLink virtual devices (MASTER.md §3.4).
+/// On macOS the drivers carry these names; on Linux `label` maps the Pulse devices to them.
+pub const VIRTUAL_OUTPUT: &str = "CapraLink Output";
+pub const VIRTUAL_INPUT: &str = "CapraLink Input";
+
 pub fn input_devices() -> Vec<String> {
-    cpal::default_host().input_devices().map(|d| d.map(|d| name(&d)).collect()).unwrap_or_default()
+    devices(&cpal::default_host(), true).into_iter().map(|(n, _)| n).collect()
 }
 
 pub fn output_devices() -> Vec<String> {
-    cpal::default_host().output_devices().map(|d| d.map(|d| name(&d)).collect()).unwrap_or_default()
+    devices(&cpal::default_host(), false).into_iter().map(|(n, _)| n).collect()
+}
+
+/// Devices by the name the lists show (and settings store); hidden plumbing left out.
+fn devices(host: &cpal::Host, input: bool) -> Vec<(String, cpal::Device)> {
+    let all = if input { host.input_devices() } else { host.output_devices() };
+    let shown = |d: &cpal::Device| match d.id() {
+        Ok(id) if cfg!(target_os = "linux") => label(input, id.id(), name(d)),
+        _ => Some(name(d)),
+    };
+    all.into_iter().flatten().filter_map(|d| Some((shown(&d)?, d))).collect()
 }
 
 fn name(d: &cpal::Device) -> String {
     d.description().map(|d| d.name().to_string()).unwrap_or_default()
+}
+
+/// Linux: the listed name of a device, from its Pulse name (cpal's device id on the Pulse host).
+/// Our virtual devices get the special names; the internal plumbing is hidden (`None`), and so is
+/// CapraLink Input as a send source / CapraLink Output as a play target (both would loop audio back).
+fn label(input: bool, pulse_name: &str, name: String) -> Option<String> {
+    match (input, pulse_name) {
+        (true, "capralink_output.monitor") => Some(VIRTUAL_OUTPUT.into()),
+        (false, "capralink_input_feed") => Some(VIRTUAL_INPUT.into()),
+        (true, "capralink_input" | "capralink_input_feed.monitor") | (false, "capralink_output") => None,
+        _ => Some(name),
+    }
 }
 
 /// Audio settings (saved in the node's config). `None` device = system default.
@@ -97,12 +125,12 @@ impl Link {
     pub fn start(cfg: &Settings, port: u16, peer: SocketAddr, keys: &Keys) -> anyhow::Result<Link> {
         anyhow::ensure!(matches!(cfg.channels, 1 | 2), "channels must be 1 or 2");
         let host = cpal::default_host();
-        let find = |want: &Option<String>, list: Option<Vec<cpal::Device>>, default: Option<cpal::Device>| match want {
-            Some(n) => list.into_iter().flatten().find(|d| name(d) == *n).ok_or_else(|| anyhow!("device not found: {n}")),
+        let find = |input: bool, want: &Option<String>, default: Option<cpal::Device>| match want {
+            Some(n) => devices(&host, input).into_iter().find(|(s, _)| s == n).map(|(_, d)| d).ok_or_else(|| anyhow!("device not found: {n}")),
             None => default.ok_or_else(|| anyhow!("no default device")),
         };
-        let in_dev = find(&cfg.input, host.input_devices().ok().map(|d| d.collect()), host.default_input_device())?;
-        let out_dev = find(&cfg.output, host.output_devices().ok().map(|d| d.collect()), host.default_output_device())?;
+        let in_dev = find(true, &cfg.input, host.default_input_device())?;
+        let out_dev = find(false, &cfg.output, host.default_output_device())?;
 
         let sock = UdpSocket::bind(("0.0.0.0", port)).with_context(|| format!("bind UDP port {port}"))?;
         sock.set_read_timeout(Some(Duration::from_millis(200)))?;
@@ -358,7 +386,14 @@ fn build_output(dev: &cpal::Device, cons: HeapCons<f32>, shared: Arc<Shared>) ->
         dev_ch: sc.channels() as usize,
         shared,
     };
-    let c = sc.config();
+    let mut c = sc.config();
+    // PulseAudio's default playback buffer is ~2 s; ask for 10 ms periods there (20 ms total).
+    // Other hosts keep their default (validated) behaviour.
+    if dev.id().is_ok_and(|i| i.host().name() == "PulseAudio") {
+        if let cpal::SupportedBufferSize::Range { min, max } = *sc.buffer_size() {
+            c.buffer_size = cpal::BufferSize::Fixed((rate / 100).clamp(min, max));
+        }
+    }
     Ok(match fmt {
         SampleFormat::F32 => dev.build_output_stream(c, move |d: &mut [f32], _: &_| pb.fill(d), err_cb, None)?,
         SampleFormat::I16 => dev.build_output_stream(c, move |d: &mut [i16], _: &_| pb.fill(d), err_cb, None)?,
@@ -366,6 +401,19 @@ fn build_output(dev: &cpal::Device, cons: HeapCons<f32>, shared: Arc<Shared>) ->
         SampleFormat::U16 => dev.build_output_stream(c, move |d: &mut [u16], _: &_| pb.fill(d), err_cb, None)?,
         f => anyhow::bail!("unsupported output sample format {f}"),
     })
+}
+
+#[cfg(test)]
+#[test]
+fn linux_labels() {
+    let l = |input, pulse: &str| label(input, pulse, "desc".into());
+    assert_eq!(l(true, "capralink_output.monitor").as_deref(), Some(VIRTUAL_OUTPUT));
+    assert_eq!(l(false, "capralink_input_feed").as_deref(), Some(VIRTUAL_INPUT));
+    for (input, hidden) in [(true, "capralink_input"), (true, "capralink_input_feed.monitor"), (false, "capralink_output")] {
+        assert_eq!(l(input, hidden), None, "{hidden}");
+    }
+    assert_eq!(l(true, "alsa_input.usb-mic").as_deref(), Some("desc"));
+    assert_eq!(l(false, "capralink_output.monitor").as_deref(), Some("desc"), "direction matters");
 }
 
 #[cfg(test)]

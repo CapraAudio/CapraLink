@@ -9,6 +9,7 @@ name = "capralinkd"
 path = "src/main.rs"
 
 [dependencies]
+ctrlc = { version = "3.5", features = ["termination"] }
 anyhow = "1"
 chacha20poly1305 = "0.11.0"
 cpal = "0.18"
@@ -24,3 +25,7 @@ serde_json = "1.0.151"
 sha2 = "0.11.0"
 snow = { version = "0.10.0", default-features = false, features = ["default-resolver", "use-chacha20poly1305", "use-sha2", "use-curve25519", "use-getrandom", "risky-raw-split"] }
 spake2 = "0.4.0"
+
+# PulseAudio host (also serves PipeWire via pipewire-pulse); ALSA stays the fallback.
+[target.'cfg(target_os = "linux")'.dependencies]
+cpal = { version = "0.18", features = ["pulseaudio"] }

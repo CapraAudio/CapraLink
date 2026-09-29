@@ -1,6 +1,7 @@
 //! One node per process: config, mDNS discovery, PIN pairing (SPAKE2), the Noise control
 //! channel and the single active `Link` (MASTER.md §3.3).
 
+use crate::vdev::Virtual;
 use crate::{Keys, Link, Settings, Stats};
 use anyhow::{anyhow, bail, ensure, Context, Result};
 use hkdf::Hkdf;
@@ -33,6 +34,8 @@ pub struct NodeState {
     pub stats: Option<Stats>,
     pub settings: Settings,
     pub error: Option<String>,
+    /// Why the virtual devices couldn't be created (Linux), if they couldn't.
+    pub virtual_error: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -95,6 +98,7 @@ struct St {
     found: HashMap<String, Found>,
     session: Option<Session>,
     error: Option<String>,
+    vdev: Virtual,
 }
 
 struct Inner {
@@ -131,7 +135,7 @@ impl Node {
         } else {
             (None, None)
         };
-        let st = St { cfg, pin: new_pin(), failures: 0, found: HashMap::new(), session: None, error: None };
+        let st = St { cfg, pin: new_pin(), failures: 0, found: HashMap::new(), session: None, error: None, vdev: Virtual::setup() };
         let node = Node(Arc::new(Inner { dir, port, mdns: daemon, st: Mutex::new(st) }));
         if let Some(rx) = browse {
             let n = node.clone();
@@ -149,6 +153,7 @@ impl Node {
     /// Clean exit: stops the session and tells the network we're gone.
     pub fn shutdown(&self) {
         self.disconnect();
+        self.st().vdev.unload();
         if let Some(d) = &self.0.mdns {
             let id = self.st().cfg.device_id.clone();
             if let Ok(rx) = d.unregister(&format!("{id}.{SERVICE}")) {
@@ -193,6 +198,7 @@ impl Node {
             stats: st.session.as_ref().and_then(|s| s.link.as_ref()).map(Link::stats),
             settings: st.cfg.settings.clone(),
             error: st.error.clone(),
+            virtual_error: st.vdev.error.clone(),
         }
     }
 

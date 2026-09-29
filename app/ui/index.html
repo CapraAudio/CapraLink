@@ -255,24 +255,26 @@ async function poll() {
     inLevel.value = outLevel.value = -60;
     els.stats.textContent = '';
   }
-  els.error.textContent = actionError || st.error || '';
+  els.error.textContent = [actionError || st.error, st.virtual_error].filter(Boolean).join(' · ');
 }
 
 async function loadDevices() {
   const d = await invoke('devices');
-  const fill = (sel, list) => {
+  // the CapraLink virtual device (if present) goes first, right after System default
+  const fill = (sel, list, special, hint) => {
     sel.innerHTML = '';
     const def = document.createElement('option');
     def.value = ''; def.textContent = 'System default';
     sel.appendChild(def);
-    for (const name of list) {
+    const names = list.includes(special) ? [special, ...list.filter((n) => n !== special)] : list;
+    for (const name of names) {
       const o = document.createElement('option');
-      o.value = name; o.textContent = name;
+      o.value = name; o.textContent = name === special ? name + ' — ' + hint : name;
       sel.appendChild(o);
     }
   };
-  fill(els.input, d.inputs);
-  fill(els.output, d.outputs);
+  fill(els.input, d.inputs, 'CapraLink Output', 'apps on this computer play into it');
+  fill(els.output, d.outputs, 'CapraLink Input', 'apps on this computer record from it');
 }
 
 (async function init() {
