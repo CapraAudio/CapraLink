@@ -160,6 +160,22 @@ these to the real per-OS device names in one small function; the UI lists them f
   BlackHole's flags allow while cpal can still open our side.
 - **Windows:** M4 (test-signed VirtualDrivers fork, D4).
 
+### 3.5 Adaptive bitrate and CPU (M5 design)
+
+- **Feedback:** each side's node sends `{"type":"report","received","lost","underruns","jitter_ms"}`
+  (deltas since the last report) over the existing encrypted control channel every 1 s. Old peers
+  ignore unknown messages (already handled).
+- **Bitrate controller (sender, pure fn in dsp.rs, AIMD):** on each report from the peer:
+  loss > 5 % or new underruns → bitrate × 0.7; loss < 1 % and no underruns → +8 kbps.
+  Clamped to [8 kbps, the user's Bitrate setting] — the slider is now the ceiling, not a fixed value.
+  Opus `packet_loss_perc` follows measured loss (0–30 %) so FEC scales with loss; at lower bitrates
+  Opus switches to SILK/hybrid where in-band FEC is actually effective (see M1 note).
+  Applied by the capture callback via atomics (`set_bitrate` only when the value changes).
+- **CPU controller (sender, in the capture path):** EMA of Opus encode time per 10 ms frame. EMA >
+  1.5 ms (15 % of the frame budget — the machine is loaded, e.g. a game) → complexity −1 (min 0);
+  EMA < 0.3 ms for ~5 s → +1 (max 5). Bitrate is not a CPU lever for Opus.
+- **Visibility:** Stats gain `bitrate` (current kbps) and `complexity`; UI stats line shows them.
+
 ## 4. Feasibility notes (owner asked for honest feedback)
 
 1. **Virtual devices on Windows are the hardest part.** Windows has no user-mode way to create
@@ -214,6 +230,7 @@ these to the real per-OS device names in one small function; the UI lists them f
 | D5 | 2026-09-29 | UDP + per-packet encryption keyed by PIN pairing | Low latency, LAN-safe |
 | D6 | 2026-09-29 | "Service" = headless login agent, not system service | OS audio is per-user-session |
 | D7 | 2026-09-29 | One peer at a time (1:1 link) | Covers the use case; simplest |
+| D12 | 2026-09-29 | M5: network drives bitrate (AIMD on receiver loss/underrun reports, slider = ceiling); CPU drives Opus complexity (encode-time EMA) | Opus bitrate ≠ CPU cost; complexity is the real CPU knob |
 | D11 | 2026-09-29 | M2 security: SPAKE2 PIN pairing → stored secret; Noise NNpsk0 control channel; per-session ChaCha20-Poly1305 audio keys; standing PIN on target, auto-accept from paired peers | Standard, audited crates; no PKI; headless-friendly |
 | D8 | 2026-09-29 | Open-source release, GPL-3.0 | Owner choice; lets us reuse GPL drivers (e.g. BlackHole on macOS) |
 | D9 | 2026-09-29 | No echo canceller; headphones required on B | Owner choice; zero extra CPU |
