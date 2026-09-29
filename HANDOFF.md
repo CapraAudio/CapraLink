@@ -3,7 +3,7 @@
 Read `MASTER.md` first. This file is the live position.
 
 ## Current position
-- Phase: M0 + M1 done. Next: owner two-machine test (Mac ↔ Windows/Linux), then M2 (discovery + PIN pairing + encryption).
+- Phase: M0 + M1 done and owner-validated (Mac↔Linux, no clicks). M2 (discovery + PIN pairing + encryption, MASTER §3.3) in progress.
 
 ## Machine facts
 - GitHub: private repo CapraAudio/CapraLink, branch main. Repo-local git identity set.

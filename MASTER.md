@@ -106,6 +106,38 @@ A node runs one **TX** stream and one **RX** stream. Which devices they use is c
   Encryption wraps this in M2.
 - Default UDP port 47800.
 
+### 3.3 Discovery, pairing, encryption (M2 design)
+
+**Pieces:** one `Node` per process (tray app and `capralinkd` both use it) owning: persistent
+config, mDNS advertise+browse, a TCP control listener, and at most one `Link` (D7).
+
+- **Config file** `<OS config dir>/CapraLink/config.json` (`dirs::config_dir()`):
+  `device_id` (random 128-bit hex), `name` (hostname default), audio settings
+  (input, output, bitrate, channels), `peers: [{id, name, secret}]` (secret = 32-byte hex).
+  Written atomically (temp file + rename). Secrets never leave the file except as keys.
+- **Discovery:** mDNS `_capralink._udp.local.` with TXT `id`, `name`, `v=2`; port = control/audio
+  port (47800). Browse list = discovered devices, marked paired/unpaired.
+- **Control channel:** TCP on the same port number. Frames: `u16 length | payload`.
+- **PIN:** each node shows a standing 6-digit PIN (window; `capralinkd` prints it). Regenerated on
+  every start and after each successful pairing. 5 failed attempts → PIN rotates.
+- **Pairing (initiator types the target's PIN):** TCP → cleartext hello {id, name} both ways →
+  SPAKE2 (symmetric, password = PIN, identity = "capralink-pair-v1") → key confirmation (each side
+  sends HMAC-SHA256(K, "confirm"|role|both ids)) → pairing secret = HKDF-SHA256(K, info
+  "capralink pairing secret") → both store {peer id, name, secret}.
+- **Session (connect):** initiator TCP → cleartext hello {id} → Noise `NNpsk0_25519_ChaChaPoly_SHA256`
+  with psk = pairing secret (unknown id → close). Inside the encrypted channel: JSON messages,
+  first `{"type":"link","channels":N}` → responder auto-accepts (paired peers are trusted), starts its
+  own `Link` back to the initiator's address, replies `{"type":"ok"}`. Either side sends
+  `{"type":"stop"}` or closes TCP → both stop. Control connection stays open for the session
+  (M6 remote config rides on it).
+- **Audio encryption:** per-session keys from the Noise handshake hash: key_dir = HKDF-SHA256(hh,
+  info "capralink audio " + sender id). ChaCha20-Poly1305, nonce = 8 zero bytes | seq u32 BE.
+  Fresh keys every session → seq-as-nonce never repeats. Packet v2:
+  `magic u16 | version u8 (2) | seq u32 | AEAD(channels u8 | opus)` with the 7-byte header as AAD.
+  Packets failing auth are dropped silently. UDP from any address other than the session peer ignored.
+- **Not in M2:** manual add-by-IP (add if mDNS proves unreliable), multiple simultaneous peers (D7),
+  remote config (M6).
+
 ## 4. Feasibility notes (owner asked for honest feedback)
 
 1. **Virtual devices on Windows are the hardest part.** Windows has no user-mode way to create
@@ -160,6 +192,7 @@ A node runs one **TX** stream and one **RX** stream. Which devices they use is c
 | D5 | 2026-09-29 | UDP + per-packet encryption keyed by PIN pairing | Low latency, LAN-safe |
 | D6 | 2026-09-29 | "Service" = headless login agent, not system service | OS audio is per-user-session |
 | D7 | 2026-09-29 | One peer at a time (1:1 link) | Covers the use case; simplest |
+| D11 | 2026-09-29 | M2 security: SPAKE2 PIN pairing → stored secret; Noise NNpsk0 control channel; per-session ChaCha20-Poly1305 audio keys; standing PIN on target, auto-accept from paired peers | Standard, audited crates; no PKI; headless-friendly |
 | D8 | 2026-09-29 | Open-source release, GPL-3.0 | Owner choice; lets us reuse GPL drivers (e.g. BlackHole on macOS) |
 | D9 | 2026-09-29 | No echo canceller; headphones required on B | Owner choice; zero extra CPU |
 | D10 | 2026-09-29 | Test rigs: this Mac + a Windows 10/11 PC + a PipeWire Linux PC on the LAN | Owner has them |
@@ -186,6 +219,7 @@ See `HANDOFF.md` → "Pending owner actions" for the live list. Answers get move
 | Date | Change |
 |---|---|
 | 2026-09-29 | Project started. Master plan written. No Rust toolchain on the Mac yet. |
+| 2026-09-29 | M1 signed off by owner: Mac↔Linux both directions, no clicks, low latency, jitter-sized cushion. |
 | 2026-09-29 | Two-machine tuning (Mac↔Linux): mic permission fix (.app + usage string); Linux ALSA 40 ms bursts → 10 ms capture buffers (0 underruns); ~0.3% clock drift → resampling drift control on low-water cushion. Stats gained levels, target, tx/rx gaps. |
 | 2026-09-29 | M0 tray app landed (Tauri 2.12, single main.rs + ui/index.html). Idle in tray: 0% CPU, 21 MB phys footprint (RSS 84 MB incl. shared WebKit). Window visual check pending owner. |
 | 2026-09-29 | M1 engine landed: cpal 0.18 + opus 0.4 (static libopus via cmake) + ringbuf. Loopback: 0 loss, 0 underruns, 18 MB RSS, 0.2% CPU. Drift controller smoothed (EMA) to avoid per-callback skip/dup. CI added. |
