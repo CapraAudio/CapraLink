@@ -13,7 +13,7 @@ Read `MASTER.md` first. This file is the live position.
 - Test machines: Windows 10/11 PC and PipeWire Linux PC on the LAN (D10).
 
 ## Pending owner actions / questions
-1. Two-machine test: Mac runs target/release/capralink; PC runs capralinkd from CI artifacts (latest: https://github.com/CapraAudio/CapraLink/actions/runs/36627741336). Owner reports sound/latency/stats + window layout.
+1. Two-machine test: Mac runs target/release/capralink; PC runs capralinkd from CI artifacts (latest: https://github.com/CapraAudio/CapraLink/actions/runs/36631810010). Owner reports sound/latency/stats + window layout.
 
 ## Owner test results (2026-09-29, Mac app ↔ Linux capralinkd)
 - Linux mic → Mac headphones: WORKS, latency "not much at all".
@@ -27,5 +27,5 @@ Read `MASTER.md` first. This file is the live position.
 Verify engine build/tests, commit, then build app/ (Tauri tray) against the engine API, add CI.
 
 ## In flight (2026-09-29)
-- M3-Linux (engine/app, Opus agent) and M3-macOS driver (drivers/macos/, Opus agent) running in parallel per MASTER §3.4. Uncommitted until verified. Owner must test Linux devices + run sudo install on Mac.
+- M3 code committed (Linux vdev + drivers/macos). PENDING OWNER: (a) Linux vdev test (capralinkd --list, pactl checks); (b) Mac: build.sh + manual sudo cp to /Library/Audio/Plug-Ins/HAL + killall coreaudiod, check Audio MIDI Setup. install.sh write was blocked by the permission classifier (persistence) — owner ran commands manually; add install.sh only if owner approves. RISK: ad-hoc-signed HAL plug-ins may not load on macOS 15+ → needs Developer ID ($99/yr) or process-tap fallback for Output side.
 If a session resumes and these are missing, re-run them from MASTER §3.2 / §6.
