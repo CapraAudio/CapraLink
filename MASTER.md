@@ -241,6 +241,7 @@ See `HANDOFF.md` → "Pending owner actions" for the live list. Answers get move
 | Date | Change |
 |---|---|
 | 2026-09-29 | Project started. Master plan written. No Rust toolchain on the Mac yet. |
+| 2026-09-29 | End-to-end Discord call through CapraLink virtual devices (Mac=A, Linux=B) works. |
 | 2026-09-29 | M3-macOS: BlackHole v0.7.1-derived HAL plug-ins (drivers/macos, clang build, ad-hoc signed) installed by owner; load fine on macOS 26 without Developer ID. |
 | 2026-09-29 | M3-Linux code: cpal pulseaudio host on Linux; pactl creates capralink_output / capralink_input_feed + remap source capralink_input (reuses leftovers, unloads on shutdown incl. Ctrl-C/SIGTERM); special names mapped in lib.rs; pulse playback requests 10 ms buffers. Untested on Linux — owner test pending. |
 | 2026-09-29 | M2 signed off by owner. Starting M3 (Linux virtual devices first). |
