@@ -13,7 +13,7 @@ Read `MASTER.md` first. This file is the live position.
 - Test machines: Windows 10/11 PC and PipeWire Linux PC on the LAN (D10).
 
 ## Pending owner actions / questions
-1. Two-machine test: run capralinkd or the app on both, report sound/latency/stats. Also eyeball the window layout.
+1. Two-machine test: Mac runs target/release/capralink; PC runs capralinkd from CI artifacts (https://github.com/CapraAudio/CapraLink/actions/runs/36612019404). Owner reports sound/latency/stats + window layout.
 
 ## Next step
 Verify engine build/tests, commit, then build app/ (Tauri tray) against the engine API, add CI.
