@@ -15,3 +15,11 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo test --workspace
       - run: cargo build --release --workspace
+      - uses: actions/upload-artifact@v4
+        with:
+          name: capralink-${{ runner.os }}
+          path: |
+            target/release/capralinkd
+            target/release/capralinkd.exe
+            target/release/capralink
+            target/release/capralink.exe
