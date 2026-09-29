@@ -139,6 +139,27 @@ config, mDNS advertise+browse, a TCP control listener, and at most one `Link` (D
 - **Not in M2:** manual add-by-IP (add if mDNS proves unreliable), multiple simultaneous peers (D7),
   remote config (M6).
 
+### 3.4 Virtual devices (M3 design)
+
+Settings keep using device *names*. Two names are special and mean the virtual devices:
+`Settings.input = "CapraLink Output"` → capture what apps play into CapraLink Output (the A role),
+`Settings.output = "CapraLink Input"` → feed CapraLink Input, which apps record from. The engine maps
+these to the real per-OS device names in one small function; the UI lists them first with a hint.
+
+- **Linux:** cpal `pulseaudio` feature (pure-Rust client; default host when a Pulse/PipeWire-pulse
+  server runs, ALSA fallback). Node start creates, via the Pulse protocol (or `pactl` fallback):
+  `module-null-sink sink_name=capralink_output` (description "CapraLink Output"; we capture its
+  `.monitor`), and `module-null-sink sink_name=capralink_input_feed` (description
+  "CapraLink Input (internal)") + `module-remap-source master=capralink_input_feed.monitor
+  source_name=capralink_input` (description "CapraLink Input"). Modules unloaded on shutdown;
+  leftovers from a crash are reused/replaced on start.
+- **macOS:** BlackHole (GPL-3) built twice as HAL plug-ins "CapraLink Output" / "CapraLink Input",
+  2 ch, 48 kHz, source in `drivers/macos/`, built with clang (no Xcode needed), installed to
+  `/Library/Audio/Plug-Ins/HAL` by a script the owner runs with sudo (+ coreaudiod restart).
+  Device names equal the special names, so no mapping. Directions exposed to apps: as narrow as
+  BlackHole's flags allow while cpal can still open our side.
+- **Windows:** M4 (test-signed VirtualDrivers fork, D4).
+
 ## 4. Feasibility notes (owner asked for honest feedback)
 
 1. **Virtual devices on Windows are the hardest part.** Windows has no user-mode way to create
