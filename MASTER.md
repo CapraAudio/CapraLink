@@ -75,6 +75,35 @@ One Rust program, two modes:
 | Linux virtual device | PipeWire/PulseAudio virtual sink + source, created at runtime | Built into the OS, no driver |
 | Windows virtual device | Existing open-source signed driver (D4) | Requires a kernel driver |
 
+### 3.1 Repo layout
+
+```
+Cargo.toml        workspace: engine, app
+engine/           audio engine library + `capralinkd` headless CLI (service mode, testing)
+app/              Tauri tray app (depends on engine); UI in app/ui/ (plain HTML/JS)
+.github/workflows CI: build + test on macOS, Linux, Windows
+```
+
+### 3.2 Engine data flow (M1)
+
+A node runs one **TX** stream and one **RX** stream. Which devices they use is config:
+
+| Node | TX captures from | RX plays into |
+|---|---|---|
+| A (runs Discord) | CapraLink Output (virtual) | CapraLink Input (virtual) |
+| B (you) | real mic | real speakers/headset |
+
+- **TX:** cpal input callback → f32 → mix to configured channels → resample to 48 kHz if needed →
+  accumulate 10 ms frames → Opus encode (complexity 5, FEC on) → UDP send. All in the callback.
+- **RX:** recv thread → packet seq gap? decode next packet's FEC for the missing one, else PLC →
+  decode → push PCM into lock-free ring. Playback callback pulls from the ring.
+- **Jitter/clock drift:** ring target fill 20 ms. Underrun → silence + re-prebuffer.
+  Fill drifting beyond ±5 ms of target → skip/duplicate single samples (inaudible), which
+  absorbs clock-rate differences between machines.
+- **Packet (M1, unencrypted):** `magic u16 | version u8 | channels u8 | seq u32 | opus bytes`.
+  Encryption wraps this in M2.
+- Default UDP port 47800.
+
 ## 4. Feasibility notes (owner asked for honest feedback)
 
 1. **Virtual devices on Windows are the hardest part.** Windows has no user-mode way to create
@@ -138,4 +167,5 @@ See `HANDOFF.md` → "Pending owner actions" for the live list. Answers get move
 |---|---|
 | 2026-09-29 | Project started. Master plan written. No Rust toolchain on the Mac yet. |
 | 2026-09-29 | Owner answered round 1: D3, D4, D7, D8 recorded. |
+| 2026-09-29 | Private repo created: github.com/CapraAudio/CapraLink. Git identity = Capra Audio (GitHub noreply). |
 | 2026-09-29 | Round 2: GPL-3.0, no AEC, test rigs recorded (D8–D10). Rust install approved. |
