@@ -22,6 +22,17 @@ pub fn output_devices() -> Vec<String> {
     cpal::default_host().output_devices().map(|d| d.map(|d| name(&d)).collect()).unwrap_or_default()
 }
 
+/// Resolves "host:port", or a bare host on the default port (47800).
+pub fn resolve_peer(peer: &str) -> anyhow::Result<SocketAddr> {
+    use std::net::ToSocketAddrs;
+    let peer = peer.trim();
+    peer.to_socket_addrs()
+        .or_else(|_| (peer, Config::default().port).to_socket_addrs())
+        .with_context(|| format!("invalid peer address \"{peer}\""))?
+        .next()
+        .ok_or_else(|| anyhow!("invalid peer address \"{peer}\""))
+}
+
 fn name(d: &cpal::Device) -> String {
     d.description().map(|d| d.name().to_string()).unwrap_or_default()
 }
@@ -309,6 +320,14 @@ fn build_output(dev: &cpal::Device, cons: HeapCons<f32>, shared: Arc<Shared>) ->
         SampleFormat::U16 => dev.build_output_stream(c, move |d: &mut [u16], _: &_| pb.fill(d), err_cb, None)?,
         f => anyhow::bail!("unsupported output sample format {f}"),
     })
+}
+
+#[cfg(test)]
+#[test]
+fn peer_parsing() {
+    assert_eq!(resolve_peer(" 10.0.0.5 ").unwrap(), SocketAddr::from(([10, 0, 0, 5], 47800)));
+    assert_eq!(resolve_peer("10.0.0.5:9000").unwrap(), SocketAddr::from(([10, 0, 0, 5], 9000)));
+    assert!(resolve_peer("").is_err());
 }
 
 #[cfg(test)]

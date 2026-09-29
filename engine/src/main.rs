@@ -2,7 +2,7 @@ use capralink_engine::{input_devices, output_devices, Config, Link};
 use std::time::Duration;
 
 const USAGE: &str = "usage: capralinkd --list
-       capralinkd --peer HOST:PORT [--port N] [--in NAME] [--out NAME] [--bitrate BPS] [--channels 1|2]";
+       capralinkd --peer HOST[:PORT] [--port N] [--in NAME] [--out NAME] [--bitrate BPS] [--channels 1|2]";
 
 fn main() -> anyhow::Result<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -18,7 +18,7 @@ fn main() -> anyhow::Result<()> {
     for pair in args.chunks(2) {
         let [flag, val] = pair else { anyhow::bail!("missing value for {}\n{USAGE}", pair[0]) };
         match flag.as_str() {
-            "--peer" => peer = Some(std::net::ToSocketAddrs::to_socket_addrs(val)?.next().ok_or_else(|| anyhow::anyhow!("bad peer {val}"))?),
+            "--peer" => peer = Some(capralink_engine::resolve_peer(val)?),
             "--port" => cfg.port = val.parse()?,
             "--in" => cfg.input = Some(val.clone()),
             "--out" => cfg.output = Some(val.clone()),

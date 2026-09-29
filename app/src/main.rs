@@ -3,7 +3,6 @@
 
 use capralink_engine::{Config, Link, Stats};
 use serde::Serialize;
-use std::net::ToSocketAddrs;
 use std::sync::Mutex;
 use tauri::menu::{Menu, MenuItem};
 use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
@@ -37,11 +36,7 @@ fn start(
     bitrate: i32,
     channels: u16,
 ) -> Result<(), String> {
-    let addr = peer
-        .to_socket_addrs()
-        .map_err(|e| format!("invalid peer address: {e}"))?
-        .next()
-        .ok_or_else(|| "invalid peer address".to_string())?;
+    let addr = capralink_engine::resolve_peer(&peer).map_err(|e| format!("{e:#}"))?;
     let cfg = Config { peer: addr, port, input, output, bitrate, channels };
     let mut guard = state.link.lock().unwrap();
     *guard = None; // drop any existing link first so its UDP port frees
