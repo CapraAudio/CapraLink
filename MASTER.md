@@ -98,8 +98,6 @@ A node runs one **TX** stream and one **RX** stream. Which devices they use is c
 - **RX:** recv thread → packet seq gap? decode next packet's FEC for the missing one, else PLC →
   decode → push PCM into lock-free ring. Playback callback pulls from the ring.
 - **Jitter/clock drift:** controller steers the ring's low-water cushion (min over 0.5 s, after the callback's take) to an adaptive target: 10 ms start, +10 ms per underrun (max 125 ms), −1 ms per 10 s clean. Drift is absorbed by resampling playback ±≤2% (P-control, τ≈2 s) — no sample skip/dup. Capture requests 10 ms device buffers when the range allows. Underrun → silence + re-prebuffer.
-  Fill drifting beyond ±5 ms of target → skip/duplicate single samples (inaudible), which
-  absorbs clock-rate differences between machines.
 - **Packet (M1, unencrypted):** `magic u16 | version u8 | channels u8 | seq u32 | opus bytes`.
   Encryption wraps this in M2.
 - Default UDP port 47800.
