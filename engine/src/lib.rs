@@ -1,6 +1,9 @@
 //! CapraLink audio engine: capture -> Opus -> UDP -> Opus -> playback.
 
 mod dsp;
+mod node;
+
+pub use node::{Device, Node, NodeState};
 
 use anyhow::{anyhow, Context};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
@@ -22,43 +25,30 @@ pub fn output_devices() -> Vec<String> {
     cpal::default_host().output_devices().map(|d| d.map(|d| name(&d)).collect()).unwrap_or_default()
 }
 
-/// Resolves "host:port", or a bare host on the default port (47800).
-pub fn resolve_peer(peer: &str) -> anyhow::Result<SocketAddr> {
-    use std::net::ToSocketAddrs;
-    let peer = peer.trim();
-    anyhow::ensure!(!peer.is_empty(), "enter the other computer's IP address");
-    peer.to_socket_addrs()
-        .or_else(|_| (peer, Config::default().port).to_socket_addrs())
-        .with_context(|| format!("invalid peer address \"{peer}\""))?
-        .next()
-        .ok_or_else(|| anyhow!("invalid peer address \"{peer}\""))
-}
-
 fn name(d: &cpal::Device) -> String {
     d.description().map(|d| d.name().to_string()).unwrap_or_default()
 }
 
-#[derive(Clone, Debug)]
-pub struct Config {
-    pub peer: SocketAddr,
-    pub port: u16,
+/// Audio settings (saved in the node's config). `None` device = system default.
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
+pub struct Settings {
     pub input: Option<String>,
     pub output: Option<String>,
     pub bitrate: i32,
     pub channels: u16,
 }
 
-impl Default for Config {
+impl Default for Settings {
     fn default() -> Self {
-        Config {
-            peer: SocketAddr::from(([127, 0, 0, 1], 47800)),
-            port: 47800,
-            input: None,
-            output: None,
-            bitrate: 64_000,
-            channels: 1,
-        }
+        Settings { input: None, output: None, bitrate: 64_000, channels: 1 }
     }
+}
+
+/// Per-session audio keys (ChaCha20-Poly1305): one per direction.
+pub struct Keys {
+    pub send: [u8; 32],
+    pub recv: [u8; 32],
 }
 
 #[derive(Clone, Debug, Default, serde::Serialize)]
@@ -103,7 +93,8 @@ pub struct Link {
 }
 
 impl Link {
-    pub fn start(cfg: Config) -> anyhow::Result<Link> {
+    /// Streams to/from `peer` over UDP `port`; only packets from exactly `peer` are accepted.
+    pub fn start(cfg: &Settings, port: u16, peer: SocketAddr, keys: &Keys) -> anyhow::Result<Link> {
         anyhow::ensure!(matches!(cfg.channels, 1 | 2), "channels must be 1 or 2");
         let host = cpal::default_host();
         let find = |want: &Option<String>, list: Option<Vec<cpal::Device>>, default: Option<cpal::Device>| match want {
@@ -113,23 +104,28 @@ impl Link {
         let in_dev = find(&cfg.input, host.input_devices().ok().map(|d| d.collect()), host.default_input_device())?;
         let out_dev = find(&cfg.output, host.output_devices().ok().map(|d| d.collect()), host.default_output_device())?;
 
-        let sock = UdpSocket::bind(("0.0.0.0", cfg.port)).with_context(|| format!("bind UDP port {}", cfg.port))?;
+        let sock = UdpSocket::bind(("0.0.0.0", port)).with_context(|| format!("bind UDP port {port}"))?;
         sock.set_read_timeout(Some(Duration::from_millis(200)))?;
         let shared = Arc::new(Shared::default());
         let stop = Arc::new(AtomicBool::new(false));
         let (mut prod, cons) = HeapRb::<f32>::new(RATE as usize).split(); // 500 ms of stereo
 
-        let input = build_input(&in_dev, &cfg, sock.try_clone()?, shared.clone())?;
+        let input = build_input(&in_dev, cfg, Packetizer::new(cfg.channels, cfg.bitrate, &keys.send)?, sock.try_clone()?, peer, shared.clone())?;
         let output = build_output(&out_dev, cons, shared.clone())?;
 
         let rx = {
-            let (shared, stop) = (shared.clone(), stop.clone());
+            let (shared, stop, mut rx) = (shared.clone(), stop.clone(), Rx::new(&keys.recv));
             std::thread::Builder::new().name("capralink-rx".into()).spawn(move || {
-                let (mut rx, mut buf, mut last, mut jitter) = (Rx::default(), [0u8; 2048], None, Jitter::default());
+                let (mut buf, mut last, mut jitter) = ([0u8; 2048], None, Jitter::default());
                 while !stop.load(Relaxed) {
                     // Errors are timeouts (checked above) or transient (e.g. ICMP resets on Windows).
-                    let Ok((n, _)) = sock.recv_from(&mut buf) else { continue };
-                    if let Some(ch) = rx.handle(&buf[..n], &shared.c, &mut |pcm: &[f32]| {
+                    // ponytail: exact source match; a multi-homed peer replying from another
+                    // interface is ignored — relax to IP-only (packets are authenticated) if seen.
+                    let Ok((n, from)) = sock.recv_from(&mut buf) else { continue };
+                    if from != peer {
+                        continue;
+                    }
+                    if let Some(ch) = rx.handle(&mut buf[..n], &shared.c, &mut |pcm: &[f32]| {
                         prod.push_slice(pcm);
                     }) {
                         let g = gap(&mut last, &shared.rx_gap_us);
@@ -255,14 +251,14 @@ impl Tx {
     }
 }
 
-fn build_input(dev: &cpal::Device, cfg: &Config, sock: UdpSocket, shared: Arc<Shared>) -> anyhow::Result<cpal::Stream> {
+fn build_input(dev: &cpal::Device, cfg: &Settings, pk: Packetizer, sock: UdpSocket, peer: SocketAddr, shared: Arc<Shared>) -> anyhow::Result<cpal::Stream> {
     let sc = pick_config(dev.default_input_config()?, dev.supported_input_configs()?);
     let (dev_ch, rate, fmt) = (sc.channels() as usize, sc.sample_rate(), sc.sample_format());
     let ch = cfg.channels as usize;
     let mut tx = Tx {
-        pk: Packetizer::new(cfg.channels, cfg.bitrate)?,
+        pk,
         sock,
-        peer: cfg.peer,
+        peer,
         dev_ch,
         rs: (rate != RATE).then(|| Resampler::new(rate, RATE, ch)),
         mixed: Vec::with_capacity(16_384 * ch),
@@ -370,14 +366,6 @@ fn build_output(dev: &cpal::Device, cons: HeapCons<f32>, shared: Arc<Shared>) ->
         SampleFormat::U16 => dev.build_output_stream(c, move |d: &mut [u16], _: &_| pb.fill(d), err_cb, None)?,
         f => anyhow::bail!("unsupported output sample format {f}"),
     })
-}
-
-#[cfg(test)]
-#[test]
-fn peer_parsing() {
-    assert_eq!(resolve_peer(" 10.0.0.5 ").unwrap(), SocketAddr::from(([10, 0, 0, 5], 47800)));
-    assert_eq!(resolve_peer("10.0.0.5:9000").unwrap(), SocketAddr::from(([10, 0, 0, 5], 9000)));
-    assert!(resolve_peer("").is_err());
 }
 
 #[cfg(test)]

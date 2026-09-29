@@ -1,0 +1,769 @@
+//! One node per process: config, mDNS discovery, PIN pairing (SPAKE2), the Noise control
+//! channel and the single active `Link` (MASTER.md §3.3).
+
+use crate::{Keys, Link, Settings, Stats};
+use anyhow::{anyhow, bail, ensure, Context, Result};
+use hkdf::Hkdf;
+use hmac::{Hmac, KeyInit, Mac};
+use mdns_sd::{IfKind, ServiceDaemon, ServiceEvent, ServiceInfo};
+use serde::{Deserialize, Serialize};
+use sha2::Sha256;
+use spake2::{Ed25519Group, Identity, Password, Spake2};
+use std::collections::HashMap;
+use std::io::{self, Read, Write};
+use std::net::{Ipv4Addr, Shutdown, SocketAddr, TcpListener, TcpStream};
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex, MutexGuard};
+use std::time::{Duration, Instant};
+
+const SERVICE: &str = "_capralink._udp.local.";
+const NOISE: &str = "Noise_NNpsk0_25519_ChaChaPoly_SHA256";
+const IO_TIMEOUT: Duration = Duration::from_secs(5);
+const DIAL_TIMEOUT: Duration = Duration::from_secs(1); // per advertised address
+const LINK_TIMEOUT: Duration = Duration::from_secs(10); // peer may be opening audio devices
+const PING: Duration = Duration::from_secs(5);
+const DEAD: Duration = Duration::from_secs(15);
+const MAX_FAILURES: u32 = 5;
+
+#[derive(Serialize)]
+pub struct NodeState {
+    pub name: String,
+    pub pin: String,
+    pub devices: Vec<Device>,
+    pub stats: Option<Stats>,
+    pub settings: Settings,
+    pub error: Option<String>,
+}
+
+#[derive(Serialize)]
+pub struct Device {
+    pub id: String,
+    pub name: String,
+    pub paired: bool,
+    pub online: bool,
+    pub connected: bool,
+}
+
+#[derive(Serialize, Deserialize)]
+struct Config {
+    device_id: String,
+    name: String,
+    #[serde(flatten)]
+    settings: Settings,
+    #[serde(default)]
+    peers: Vec<Peer>,
+}
+
+#[derive(Serialize, Deserialize)]
+struct Peer {
+    id: String,
+    name: String,
+    secret: String, // 32-byte hex
+}
+
+/// Control messages. Pair/Hello/Session travel in clear; the rest inside Noise.
+#[derive(Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "lowercase")]
+enum Msg {
+    Pair { id: String, name: String },
+    Hello { id: String, name: String },
+    Session { id: String },
+    Link { channels: u16, port: u16 },
+    Ok,
+    Error { message: String },
+    Stop,
+    Ping,
+}
+
+struct Found {
+    name: String,
+    addrs: Vec<SocketAddr>, // best first (see `rank`)
+    fullname: String,
+}
+
+struct Session {
+    peer_id: String,
+    addr: SocketAddr, // peer's control/UDP address
+    link: Option<Link>,
+    ctl: Arc<Ctl>,
+}
+
+struct St {
+    cfg: Config,
+    pin: String,
+    failures: u32,
+    found: HashMap<String, Found>,
+    session: Option<Session>,
+    error: Option<String>,
+}
+
+struct Inner {
+    dir: PathBuf,
+    port: u16,
+    mdns: Option<ServiceDaemon>,
+    st: Mutex<St>,
+}
+
+#[derive(Clone)]
+pub struct Node(Arc<Inner>);
+
+impl Node {
+    /// Loads (or creates) the config, listens on TCP `port` (0 = any free port), and
+    /// advertises + browses via mDNS when `mdns` is set. `None` = OS config dir.
+    pub fn start(config_dir: Option<PathBuf>, port: u16, mdns: bool) -> Result<Node> {
+        let dir = match config_dir {
+            Some(d) => d,
+            None => dirs::config_dir().ok_or_else(|| anyhow!("no config directory"))?.join("CapraLink"),
+        };
+        let cfg = load(&dir)?;
+        let listener = TcpListener::bind(("0.0.0.0", port)).with_context(|| format!("port {port} is in use"))?;
+        let port = listener.local_addr()?.port();
+        let (daemon, browse) = if mdns {
+            let d = ServiceDaemon::new()?;
+            // IPv4 only (the link is IPv4); with enable_addr_auto every remaining interface
+            // address is advertised, and the dialer picks the one that answers.
+            d.disable_interface(vec![IfKind::IPv6, IfKind::LoopbackV4])?;
+            let props = [("id", cfg.device_id.as_str()), ("name", cfg.name.as_str()), ("v", "2")];
+            let host = format!("{}.local.", cfg.device_id);
+            d.register(ServiceInfo::new(SERVICE, &cfg.device_id, &host, "", port, &props[..])?.enable_addr_auto())?;
+            let rx = d.browse(SERVICE)?;
+            (Some(d), Some(rx))
+        } else {
+            (None, None)
+        };
+        let st = St { cfg, pin: new_pin(), failures: 0, found: HashMap::new(), session: None, error: None };
+        let node = Node(Arc::new(Inner { dir, port, mdns: daemon, st: Mutex::new(st) }));
+        if let Some(rx) = browse {
+            let n = node.clone();
+            std::thread::Builder::new().name("capralink-mdns".into()).spawn(move || {
+                while let Ok(ev) = rx.recv() {
+                    n.on_mdns(ev);
+                }
+            })?;
+        }
+        let n = node.clone();
+        std::thread::Builder::new().name("capralink-ctl".into()).spawn(move || n.accept(listener))?;
+        Ok(node)
+    }
+
+    /// Clean exit: stops the session and tells the network we're gone.
+    pub fn shutdown(&self) {
+        self.disconnect();
+        if let Some(d) = &self.0.mdns {
+            let id = self.st().cfg.device_id.clone();
+            if let Ok(rx) = d.unregister(&format!("{id}.{SERVICE}")) {
+                let _ = rx.recv_timeout(Duration::from_secs(1));
+            }
+        }
+    }
+
+    pub fn port(&self) -> u16 {
+        self.0.port
+    }
+
+    fn st(&self) -> MutexGuard<'_, St> {
+        self.0.st.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    pub fn state(&self) -> NodeState {
+        let st = self.st();
+        let conn = st.session.as_ref().map(|s| s.peer_id.as_str());
+        let mut devices: Vec<Device> = st
+            .cfg
+            .peers
+            .iter()
+            .map(|p| Device {
+                id: p.id.clone(),
+                name: st.found.get(&p.id).map_or(&p.name, |f| &f.name).clone(),
+                paired: true,
+                online: st.found.contains_key(&p.id) || conn == Some(&p.id),
+                connected: conn == Some(&p.id),
+            })
+            .collect();
+        for (id, f) in &st.found {
+            if !st.cfg.peers.iter().any(|p| p.id == *id) {
+                devices.push(Device { id: id.clone(), name: f.name.clone(), paired: false, online: true, connected: false });
+            }
+        }
+        devices.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()).then(a.id.cmp(&b.id)));
+        NodeState {
+            name: st.cfg.name.clone(),
+            pin: st.pin.clone(),
+            devices,
+            stats: st.session.as_ref().and_then(|s| s.link.as_ref()).map(Link::stats),
+            settings: st.cfg.settings.clone(),
+            error: st.error.clone(),
+        }
+    }
+
+    /// Address of a device seen on the network. A failed attempt asks mDNS to re-check it.
+    fn addrs(&self, id: &str) -> Result<(Vec<SocketAddr>, String)> {
+        let st = self.st();
+        let f = st.found.get(id).ok_or_else(|| anyhow!("that device is offline"))?;
+        Ok((f.addrs.clone(), f.fullname.clone()))
+    }
+
+    fn recheck<T>(&self, fullname: String, r: Result<T>) -> Result<T> {
+        if r.is_err() {
+            if let Some(d) = &self.0.mdns {
+                let _ = d.verify(fullname, IO_TIMEOUT);
+            }
+        }
+        r
+    }
+
+    pub fn pair(&self, id: &str, pin: &str) -> Result<()> {
+        let (addrs, fullname) = self.addrs(id)?;
+        let r = self.pair_addr(&addrs, pin).map(drop);
+        self.recheck(fullname, r)
+    }
+
+    /// Pairs with the node at the first of `addrs` that answers, using its PIN; returns the peer's device id.
+    pub fn pair_addr(&self, addrs: &[SocketAddr], pin: &str) -> Result<String> {
+        let pin = pin.trim();
+        ensure!(pin.len() == 6 && pin.bytes().all(|b| b.is_ascii_digit()), "the PIN is 6 digits");
+        let (my_id, my_name) = {
+            let st = self.st();
+            (st.cfg.device_id.clone(), st.cfg.name.clone())
+        };
+        let mut s = dial(addrs)?;
+        send_msg(&mut s, &Msg::Pair { id: my_id.clone(), name: my_name })?;
+        let Msg::Hello { id, name } = recv_msg(&mut s)? else { bail!("unexpected reply") };
+        check_id(&id)?;
+        let secret = pake(&mut s, pin, true, &my_id, &id).map_err(|_| anyhow!("pairing failed — check the PIN"))?;
+        let mut st = self.st();
+        add_peer(&mut st.cfg, &id, &name, &secret);
+        save(&self.0.dir, &st.cfg)?;
+        st.error = None;
+        Ok(id)
+    }
+
+    pub fn connect(&self, id: &str) -> Result<()> {
+        let (addrs, fullname) = self.addrs(id)?;
+        let r = self.connect_to(id, &addrs);
+        self.recheck(fullname, r)
+    }
+
+    /// Starts a session with paired device `id` at the first of `addrs` that answers,
+    /// replacing any current one.
+    pub fn connect_to(&self, id: &str, addrs: &[SocketAddr]) -> Result<()> {
+        self.disconnect(); // one link at a time; also frees our UDP port
+        let (my_id, secret, channels) = {
+            let st = self.st();
+            (st.cfg.device_id.clone(), secret(&st.cfg, id).ok_or_else(|| anyhow!("not paired with that device"))?, st.cfg.settings.channels)
+        };
+        let mut s = dial(addrs)?;
+        let addr = s.peer_addr()?;
+        send_msg(&mut s, &Msg::Session { id: my_id })?;
+        let (ctl, keys) = handshake(&mut s, &secret, true).context("secure connection failed (try pairing again)")?;
+        ctl.send(&Msg::Link { channels, port: self.0.port })?;
+        s.set_read_timeout(Some(LINK_TIMEOUT))?;
+        match ctl.recv()? {
+            Some(Msg::Ok) => {}
+            Some(Msg::Error { message }) => bail!("other computer: {message}"),
+            _ => bail!("unexpected reply"),
+        }
+        self.activate(id, addr, &keys, ctl)
+    }
+
+    pub fn disconnect(&self) {
+        let old = self.st().session.take();
+        if let Some(s) = old {
+            s.ctl.close();
+        }
+    }
+
+    pub fn forget(&self, id: &str) -> Result<()> {
+        if self.st().session.as_ref().is_some_and(|s| s.peer_id == id) {
+            self.disconnect();
+        }
+        let mut st = self.st();
+        st.cfg.peers.retain(|p| p.id != id);
+        save(&self.0.dir, &st.cfg)
+    }
+
+    /// Saves the audio settings; a running link reconnects (fresh keys) to apply them.
+    pub fn set_settings(&self, s: Settings) -> Result<()> {
+        ensure!(matches!(s.channels, 1 | 2), "channels must be 1 or 2");
+        let running = {
+            let mut st = self.st();
+            st.cfg.settings = s;
+            save(&self.0.dir, &st.cfg)?;
+            st.session.as_ref().map(|s| (s.peer_id.clone(), s.addr))
+        };
+        match running {
+            Some((id, addr)) => self.connect_to(&id, &[addr]),
+            None => Ok(()),
+        }
+    }
+
+    /// Installs a new session: stops the old one, starts the Link, watches the control channel.
+    fn activate(&self, id: &str, addr: SocketAddr, keys: &Keys, ctl: Arc<Ctl>) -> Result<()> {
+        let mut st = self.st();
+        if let Some(old) = st.session.take() {
+            old.ctl.close(); // Link drop below frees the UDP port before the new bind
+        }
+        let link = match start_link(&st.cfg.settings, self.0.port, addr, keys) {
+            Ok(l) => l,
+            Err(e) => {
+                drop(st);
+                ctl.close();
+                return Err(e);
+            }
+        };
+        st.session = Some(Session { peer_id: id.to_string(), addr, link, ctl: ctl.clone() });
+        st.error = None;
+        drop(st);
+        let n = self.clone();
+        std::thread::Builder::new().name("capralink-session".into()).spawn(move || n.serve(ctl))?;
+        Ok(())
+    }
+
+    /// Session control loop: pings, and tears the session down on stop / close / silence.
+    fn serve(&self, ctl: Arc<Ctl>) {
+        let _ = ctl.stream.set_read_timeout(Some(Duration::from_secs(1)));
+        let (mut last_rx, mut last_tx) = (Instant::now(), Instant::now());
+        let lost = loop {
+            match ctl.recv() {
+                Ok(Some(Msg::Stop)) => break false,
+                Ok(_) => last_rx = Instant::now(),
+                Err(e) if matches!(e.kind(), io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut) => {
+                    if last_rx.elapsed() > DEAD {
+                        break true;
+                    }
+                }
+                Err(_) => break false,
+            }
+            if last_tx.elapsed() >= PING {
+                last_tx = Instant::now();
+                let _ = ctl.send(&Msg::Ping);
+            }
+        };
+        ctl.close();
+        let mut st = self.st();
+        if st.session.as_ref().is_some_and(|s| Arc::ptr_eq(&s.ctl, &ctl)) {
+            let s = st.session.take();
+            if lost {
+                let name = s.and_then(|s| st.cfg.peers.iter().find(|p| p.id == s.peer_id).map(|p| p.name.clone()));
+                st.error = Some(format!("lost connection to {}", name.unwrap_or_default()));
+            }
+        }
+    }
+
+    // ponytail: handshakes run one at a time on the accept thread (which also serializes PIN
+    // guesses); a stalled peer delays others by up to IO_TIMEOUT. Thread per connection if that bites.
+    fn accept(&self, l: TcpListener) {
+        for s in l.incoming().flatten() {
+            let from = s.peer_addr().map(|a| a.ip().to_string()).unwrap_or_default();
+            if let Err(e) = setup(&s).map_err(Into::into).and_then(|_| self.incoming(s)) {
+                self.st().error = Some(format!("incoming connection from {from}: {e:#}"));
+            }
+        }
+    }
+
+    fn incoming(&self, mut s: TcpStream) -> Result<()> {
+        match recv_msg(&mut s)? {
+            Msg::Pair { id, name } => self.on_pair(s, &id, &name),
+            Msg::Session { id } => self.on_session(s, &id),
+            _ => bail!("unexpected hello"),
+        }
+    }
+
+    fn on_pair(&self, mut s: TcpStream, id: &str, name: &str) -> Result<()> {
+        check_id(id)?;
+        let (my_id, my_name, pin) = {
+            let st = self.st();
+            (st.cfg.device_id.clone(), st.cfg.name.clone(), st.pin.clone())
+        };
+        send_msg(&mut s, &Msg::Hello { id: my_id.clone(), name: my_name })?;
+        let r = pake(&mut s, &pin, false, id, &my_id);
+        let mut st = self.st();
+        match r {
+            Ok(secret) => {
+                add_peer(&mut st.cfg, id, name, &secret);
+                (st.pin, st.failures, st.error) = (new_pin(), 0, None);
+                save(&self.0.dir, &st.cfg)
+            }
+            Err(e) => {
+                st.failures += 1;
+                if st.failures >= MAX_FAILURES {
+                    (st.pin, st.failures) = (new_pin(), 0);
+                }
+                Err(e.context("pairing failed (wrong PIN?)"))
+            }
+        }
+    }
+
+    fn on_session(&self, mut s: TcpStream, id: &str) -> Result<()> {
+        let secret = secret(&self.st().cfg, id).ok_or_else(|| anyhow!("unknown device"))?;
+        let (ctl, keys) = handshake(&mut s, &secret, false)?;
+        let Some(Msg::Link { port, .. }) = ctl.recv()? else { bail!("expected link request") };
+        let addr = SocketAddr::new(s.peer_addr()?.ip(), port);
+        if let Err(e) = self.activate(id, addr, &keys, ctl.clone()) {
+            let _ = ctl.send(&Msg::Error { message: format!("{e:#}") });
+            return Err(e);
+        }
+        ctl.send(&Msg::Ok)?;
+        Ok(())
+    }
+
+    fn on_mdns(&self, ev: ServiceEvent) {
+        let mut st = self.st();
+        match ev {
+            ServiceEvent::ServiceResolved(info) => {
+                let (Some(id), Some(name)) = (info.get_property_val_str("id"), info.get_property_val_str("name")) else { return };
+                let addrs = order(info.get_addresses_v4().into_iter().map(|ip| SocketAddr::from((ip, info.get_port()))).collect());
+                if addrs.is_empty() {
+                    return;
+                }
+                if info.get_property_val_str("v") != Some("2") || id == st.cfg.device_id || check_id(id).is_err() {
+                    return;
+                }
+                let found = Found { name: clean_name(name), addrs, fullname: info.get_fullname().to_string() };
+                st.found.insert(id.to_string(), found);
+            }
+            ServiceEvent::ServiceRemoved(_, fullname) => st.found.retain(|_, f| f.fullname != fullname),
+            _ => {}
+        }
+    }
+}
+
+/// In tests there are no audio devices: the session runs without a Link.
+fn start_link(s: &Settings, port: u16, peer: SocketAddr, keys: &Keys) -> Result<Option<Link>> {
+    if cfg!(test) {
+        return Ok(None);
+    }
+    Link::start(s, port, peer, keys).map(Some)
+}
+
+// ---------- config ----------
+
+fn load(dir: &Path) -> Result<Config> {
+    let path = dir.join("config.json");
+    match std::fs::read(&path) {
+        Ok(b) => serde_json::from_slice(&b).with_context(|| format!("invalid config file {}", path.display())),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {
+            let cfg = Config { device_id: hex(&random::<16>()), name: hostname(), settings: Settings::default(), peers: vec![] };
+            save(dir, &cfg)?;
+            Ok(cfg)
+        }
+        Err(e) => Err(e).with_context(|| format!("read {}", path.display())),
+    }
+}
+
+/// Atomic write (temp file + rename); owner-only on Unix since it holds pairing secrets.
+fn save(dir: &Path, cfg: &Config) -> Result<()> {
+    std::fs::create_dir_all(dir)?;
+    let tmp = dir.join("config.json.tmp");
+    let mut o = std::fs::OpenOptions::new();
+    o.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    std::os::unix::fs::OpenOptionsExt::mode(&mut o, 0o600);
+    let mut f = o.open(&tmp)?;
+    f.write_all(&serde_json::to_vec_pretty(cfg)?)?;
+    f.sync_all()?;
+    std::fs::rename(&tmp, dir.join("config.json")).context("save config")
+}
+
+fn add_peer(cfg: &mut Config, id: &str, name: &str, secret: &[u8; 32]) {
+    cfg.peers.retain(|p| p.id != id);
+    cfg.peers.push(Peer { id: id.to_string(), name: clean_name(name), secret: hex(secret) });
+}
+
+fn secret(cfg: &Config, id: &str) -> Option<[u8; 32]> {
+    let s = &cfg.peers.iter().find(|p| p.id == id)?.secret;
+    let mut out = [0u8; 32];
+    (s.len() == 64).then_some(())?;
+    for (i, o) in out.iter_mut().enumerate() {
+        *o = u8::from_str_radix(s.get(2 * i..2 * i + 2)?, 16).ok()?;
+    }
+    Some(out)
+}
+
+fn hostname() -> String {
+    let n = std::env::var("COMPUTERNAME").ok().or_else(|| {
+        let o = std::process::Command::new("hostname").output().ok()?;
+        Some(String::from_utf8_lossy(&o.stdout).into_owned())
+    });
+    let n = n.unwrap_or_default();
+    let n = n.trim().trim_end_matches(".local");
+    if n.is_empty() { "CapraLink".into() } else { clean_name(n) }
+}
+
+// ---------- crypto + wire ----------
+
+fn random<const N: usize>() -> [u8; N] {
+    let mut b = [0u8; N];
+    getrandom::fill(&mut b).expect("OS random number generator");
+    b
+}
+
+fn new_pin() -> String {
+    format!("{:06}", u32::from_le_bytes(random()) % 1_000_000)
+}
+
+fn hex(b: &[u8]) -> String {
+    b.iter().map(|x| format!("{x:02x}")).collect()
+}
+
+fn check_id(id: &str) -> Result<()> {
+    ensure!(id.len() == 32 && id.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')), "bad device id");
+    Ok(())
+}
+
+fn clean_name(n: &str) -> String {
+    n.chars().filter(|c| !c.is_control()).take(64).collect()
+}
+
+fn hkdf(ikm: &[u8], info: &[u8]) -> [u8; 32] {
+    let mut k = [0u8; 32];
+    Hkdf::<Sha256>::new(None, ikm).expand(info, &mut k).expect("32 bytes is a valid HKDF length");
+    k
+}
+
+fn confirm(k: &[u8], role: &[u8], init_id: &str, resp_id: &str) -> Hmac<Sha256> {
+    let mut m = <Hmac<Sha256> as KeyInit>::new_from_slice(k).expect("HMAC takes any key length");
+    for part in [b"confirm", role, init_id.as_bytes(), resp_id.as_bytes()] {
+        m.update(part);
+    }
+    m
+}
+
+/// SPAKE2 on the responder's PIN + key confirmation; returns the pairing secret.
+/// The responder only confirms after checking the initiator's MAC, so a guesser learns nothing.
+fn pake(s: &mut TcpStream, pin: &str, initiator: bool, init_id: &str, resp_id: &str) -> Result<[u8; 32]> {
+    let (st, msg) = Spake2::<Ed25519Group>::start_symmetric(&Password::new(pin.as_bytes()), &Identity::new(b"capralink-pair-v1"));
+    send(s, &msg)?;
+    let k = st.finish(&recv(s)?).map_err(|_| anyhow!("bad SPAKE2 message"))?;
+    let (i, r) = (confirm(&k, b"initiator", init_id, resp_id), confirm(&k, b"responder", init_id, resp_id));
+    if initiator {
+        send(s, &i.finalize().into_bytes())?;
+        r.verify_slice(&recv(s)?).map_err(|_| anyhow!("key confirmation failed"))?;
+    } else {
+        i.verify_slice(&recv(s)?).map_err(|_| anyhow!("key confirmation failed"))?;
+        send(s, &r.finalize().into_bytes())?;
+    }
+    Ok(hkdf(&k, b"capralink pairing secret"))
+}
+
+/// Noise NNpsk0 over the open connection. Audio keys come from the raw split keys (which
+/// include the ephemeral DH, so recorded audio stays safe if the pairing secret leaks later),
+/// salted with the handshake hash.
+fn handshake(s: &mut TcpStream, secret: &[u8; 32], initiator: bool) -> Result<(Arc<Ctl>, Keys)> {
+    let b = snow::Builder::new(NOISE.parse()?).psk(0, secret)?;
+    let mut hs = if initiator { b.build_initiator()? } else { b.build_responder()? };
+    let mut buf = [0u8; 256];
+    if initiator {
+        let n = hs.write_message(&[], &mut buf)?;
+        send(s, &buf[..n])?;
+        hs.read_message(&recv(s)?, &mut buf)?;
+    } else {
+        hs.read_message(&recv(s)?, &mut buf)?;
+        let n = hs.write_message(&[], &mut buf)?;
+        send(s, &buf[..n])?;
+    }
+    let hh = hs.get_handshake_hash().to_vec();
+    let (i2r, r2i) = hs.dangerously_get_raw_split();
+    let key = |ikm: &[u8]| {
+        let mut k = [0u8; 32];
+        Hkdf::<Sha256>::new(Some(&hh), ikm).expand(b"capralink audio v2", &mut k).expect("32 bytes is a valid HKDF length");
+        k
+    };
+    let (i2r, r2i) = (key(&i2r), key(&r2i));
+    let keys = if initiator { Keys { send: i2r, recv: r2i } } else { Keys { send: r2i, recv: i2r } };
+    Ok((Arc::new(Ctl { stream: s.try_clone()?, noise: Mutex::new(hs.into_transport_mode()?) }), keys))
+}
+
+/// The encrypted control channel of a session.
+struct Ctl {
+    stream: TcpStream,
+    noise: Mutex<snow::TransportState>,
+}
+
+impl Ctl {
+    fn send(&self, m: &Msg) -> Result<()> {
+        let pt = serde_json::to_vec(m)?;
+        let mut ct = vec![0u8; pt.len() + 16];
+        let mut noise = self.noise.lock().unwrap_or_else(|e| e.into_inner()); // held across the write to keep nonce order
+        let n = noise.write_message(&pt, &mut ct)?;
+        send(&mut &self.stream, &ct[..n])
+    }
+
+    /// `Ok(None)` = authentic but unknown message (newer peer).
+    fn recv(&self) -> io::Result<Option<Msg>> {
+        let ct = recv(&mut &self.stream)?;
+        let mut pt = vec![0u8; ct.len()];
+        let n = self.noise.lock().unwrap_or_else(|e| e.into_inner()).read_message(&ct, &mut pt).map_err(io::Error::other)?;
+        Ok(serde_json::from_slice(&pt[..n]).ok())
+    }
+
+    fn close(&self) {
+        let _ = self.send(&Msg::Stop);
+        let _ = self.stream.shutdown(Shutdown::Both);
+    }
+}
+
+/// Preference for advertised addresses: home/office LAN ranges first, virtual/odd ones later.
+fn rank(ip: Ipv4Addr) -> u8 {
+    match ip.octets() {
+        [192, 168, ..] => 0,
+        [10, ..] => 1,
+        [172, b, ..] if (16..32).contains(&b) => 2,
+        _ if ip.is_loopback() || ip.is_link_local() => 4,
+        _ => 3,
+    }
+}
+
+/// Sorts by `rank`, dropping loopback/link-local unless nothing else is left.
+fn order(mut addrs: Vec<SocketAddr>) -> Vec<SocketAddr> {
+    let r = |a: &SocketAddr| match a.ip() {
+        std::net::IpAddr::V4(ip) => rank(ip),
+        _ => 4,
+    };
+    addrs.sort_by_key(|a| (r(a), *a));
+    if addrs.iter().any(|a| r(a) < 4) {
+        addrs.retain(|a| r(a) < 4);
+    }
+    addrs
+}
+
+/// Connects to the first address that answers.
+fn dial(addrs: &[SocketAddr]) -> Result<TcpStream> {
+    let mut err = anyhow!("no address for that device");
+    for a in addrs {
+        match TcpStream::connect_timeout(a, DIAL_TIMEOUT) {
+            Ok(s) => {
+                setup(&s)?;
+                return Ok(s);
+            }
+            Err(e) => err = anyhow!(e).context(format!("can't reach {a}")),
+        }
+    }
+    Err(err)
+}
+
+fn setup(s: &TcpStream) -> io::Result<()> {
+    s.set_nodelay(true)?;
+    s.set_read_timeout(Some(IO_TIMEOUT))?;
+    s.set_write_timeout(Some(IO_TIMEOUT))
+}
+
+/// Frame: `u16 length | payload`.
+fn send(s: &mut impl Write, b: &[u8]) -> Result<()> {
+    let len = u16::try_from(b.len())?;
+    s.write_all(&[&len.to_be_bytes()[..], b].concat())?;
+    Ok(())
+}
+
+// ponytail: a read timeout landing mid-frame desyncs the stream and ends the session; frames
+// are tiny so it hasn't been seen. Buffer partial frames if it ever is.
+fn recv(s: &mut impl Read) -> io::Result<Vec<u8>> {
+    let mut len = [0u8; 2];
+    s.read_exact(&mut len)?;
+    let mut b = vec![0u8; u16::from_be_bytes(len) as usize];
+    s.read_exact(&mut b)?;
+    Ok(b)
+}
+
+fn send_msg(s: &mut TcpStream, m: &Msg) -> Result<()> {
+    send(s, &serde_json::to_vec(m)?)
+}
+
+fn recv_msg(s: &mut TcpStream) -> Result<Msg> {
+    Ok(serde_json::from_slice(&recv(s)?)?)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn node() -> (Node, PathBuf) {
+        let dir = std::env::temp_dir().join(format!("capralink-test-{}", hex(&random::<8>())));
+        (Node::start(Some(dir.clone()), 0, false).unwrap(), dir)
+    }
+
+    fn addr(n: &Node) -> SocketAddr {
+        SocketAddr::from(([127, 0, 0, 1], n.port()))
+    }
+
+    fn peers(dir: &Path) -> Vec<Peer> {
+        load(dir).unwrap().peers
+    }
+
+    fn wait(mut f: impl FnMut() -> bool) {
+        let t = Instant::now();
+        while !f() {
+            assert!(t.elapsed() < Duration::from_secs(5), "timed out");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    #[test]
+    fn pairing() {
+        let ((a, adir), (b, bdir)) = (node(), node());
+        let pin = b.state().pin;
+        let wrong = format!("{:06}", (pin.parse::<u32>().unwrap() + 1) % 1_000_000);
+        assert!(a.pair_addr(&[addr(&b)], &wrong).is_err());
+        assert!(peers(&adir).is_empty() && peers(&bdir).is_empty());
+        assert_eq!(b.state().pin, pin, "one failure keeps the PIN");
+        for _ in 0..4 {
+            assert!(a.pair_addr(&[addr(&b)], &wrong).is_err());
+        }
+        assert_ne!(b.state().pin, pin, "5 failures rotate the PIN");
+
+        let pin = b.state().pin;
+        let bid = a.pair_addr(&[addr(&b)], &pin).unwrap();
+        wait(|| peers(&bdir).len() == 1); // the responder saves just after sending its confirmation
+        let (pa, pb) = (peers(&adir), peers(&bdir));
+        assert_eq!((pa.len(), pb.len()), (1, 1));
+        assert_eq!(pa[0].id, bid);
+        assert_eq!(pb[0].id, load(&adir).unwrap().device_id);
+        assert_eq!(pa[0].secret, pb[0].secret);
+        assert_ne!(b.state().pin, pin, "PIN rotates after pairing");
+
+        // session: both sides show connected; a disconnect reaches the other side
+        a.connect_to(&bid, &[addr(&b)]).unwrap();
+        wait(|| b.state().devices.iter().any(|d| d.connected));
+        assert!(a.state().devices.iter().any(|d| d.id == bid && d.connected && d.paired));
+        a.disconnect();
+        wait(|| !b.state().devices.iter().any(|d| d.connected));
+        // after forgetting, the other side rejects the session
+        b.forget(&pb[0].id).unwrap();
+        assert!(a.connect_to(&bid, &[addr(&b)]).is_err());
+        let _ = std::fs::remove_dir_all(adir);
+        let _ = std::fs::remove_dir_all(bdir);
+    }
+
+    #[test]
+    fn address_order() {
+        let a = |s: &str| s.parse::<SocketAddr>().unwrap();
+        let got = order(vec![a("172.17.0.1:1"), a("8.8.8.8:1"), a("169.254.1.1:1"), a("10.0.0.2:1"), a("192.168.1.5:1"), a("127.0.0.1:1")]);
+        assert_eq!(got, vec![a("192.168.1.5:1"), a("10.0.0.2:1"), a("172.17.0.1:1"), a("8.8.8.8:1")]);
+        assert_eq!(order(vec![a("127.0.0.1:1"), a("169.254.1.1:1")]), vec![a("127.0.0.1:1"), a("169.254.1.1:1")]);
+        assert!(dial(&[]).is_err());
+    }
+
+    #[test]
+    fn session_keys_match() {
+        let l = TcpListener::bind("127.0.0.1:0").unwrap();
+        let at = l.local_addr().unwrap();
+        let secret = [9u8; 32];
+        let resp = std::thread::spawn(move || {
+            let next = || handshake(&mut l.accept().unwrap().0, &secret, false);
+            (next().unwrap(), next().unwrap(), next().is_err())
+        });
+        let dial = |k: &[u8; 32]| handshake(&mut TcpStream::connect(at).unwrap(), k, true);
+        let (ctl_a, ka) = dial(&secret).unwrap();
+        let (_, ka2) = dial(&secret).unwrap();
+        let wrong = dial(&[8u8; 32]);
+        let ((ctl_b, kb), (_, kb2), bad_rejected) = resp.join().unwrap();
+        assert_eq!(ka.send, kb.recv);
+        assert_eq!(ka.recv, kb.send);
+        assert_eq!((ka2.send, ka2.recv), (kb2.recv, kb2.send));
+        assert_ne!(ka.send, ka.recv);
+        assert!(ka.send != ka2.send && ka.recv != ka2.recv, "same pairing secret, new session: fresh keys");
+        assert!(wrong.is_err() && bad_rejected, "wrong pairing secret must fail the handshake");
+        ctl_a.send(&Msg::Ping).unwrap();
+        assert!(matches!(ctl_b.recv().unwrap(), Some(Msg::Ping)));
+    }
+}

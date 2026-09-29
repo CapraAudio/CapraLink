@@ -3,7 +3,7 @@
 Read `MASTER.md` first. This file is the live position.
 
 ## Current position
-- Phase: M0 + M1 done and owner-validated (Mac↔Linux, no clicks). M2 (discovery + PIN pairing + encryption, MASTER §3.3) in progress.
+- Phase: M0 + M1 done and owner-validated (Mac↔Linux, no clicks). M2 code committed + verified locally (MASTER §3.3). Next: owner pairs Mac↔Linux from UI; Linux needs new capralinkd (v1/v2 packets incompatible). Config dir override: $CAPRALINK_CONFIG_DIR. Then M3 virtual devices.
 
 ## Machine facts
 - GitHub: private repo CapraAudio/CapraLink, branch main. Repo-local git identity set.
@@ -27,5 +27,4 @@ Read `MASTER.md` first. This file is the live position.
 Verify engine build/tests, commit, then build app/ (Tauri tray) against the engine API, add CI.
 
 ## In flight (2026-09-29)
-- M2 delegated to an Opus agent (brief = MASTER §3.3 + UI spec). Uncommitted until verified by main session. If lost: re-delegate from §3.3.
 If a session resumes and these are missing, re-run them from MASTER §3.2 / §6.

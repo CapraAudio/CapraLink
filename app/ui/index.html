@@ -41,11 +41,25 @@
   .seg button.active { background: var(--accent); color: white; }
   input[type=range] { padding: 0; margin-bottom: 4px; }
   .bitrate-val { font-size: 11px; color: var(--sub); text-align: right; margin-bottom: 8px; }
-  #startStop {
-    width: 100%; padding: 10px; border: none; border-radius: 8px; font-size: 15px; font-weight: 600;
-    background: var(--accent); color: white; cursor: pointer;
+  h2 { font-size: 11px; color: var(--sub); font-weight: 600; margin: 0 0 6px; text-transform: uppercase; letter-spacing: .04em; }
+  .me-name { font-weight: 600; margin-bottom: 4px; }
+  .pin { font-size: 30px; font-weight: 700; letter-spacing: .12em; font-variant-numeric: tabular-nums; }
+  .hint { font-size: 11px; color: var(--sub); margin-bottom: 8px; }
+  .dev { display: flex; align-items: center; gap: 8px; padding: 6px 0; border-top: 1px solid var(--border); }
+  .dev:first-of-type { border-top: none; }
+  .dev .info { flex: 1; min-width: 0; }
+  .dev .name { font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .dev .st { font-size: 11px; color: var(--sub); }
+  .btn {
+    padding: 5px 12px; border: none; border-radius: 6px; font-size: 12px; font-weight: 600;
+    background: var(--accent); color: white; cursor: pointer; width: auto; margin: 0;
   }
-  #startStop.stop { background: var(--danger); }
+  .btn.stop { background: var(--danger); }
+  .btn:disabled { opacity: .5; cursor: default; }
+  .link { border: none; background: none; color: var(--sub); font-size: 11px; cursor: pointer; padding: 2px 4px; text-decoration: underline; }
+  .pairbox { display: flex; gap: 6px; align-items: center; padding: 0 0 8px; }
+  .pairbox input { margin: 0; letter-spacing: .2em; font-variant-numeric: tabular-nums; }
+  .empty { color: var(--sub); font-size: 12px; padding: 4px 0 10px; }
   #error { color: var(--danger); font-size: 11px; margin-top: 6px; min-height: 14px; }
   #stats { font-size: 11px; color: var(--sub); text-align: center; }
   .meters { display: grid; grid-template-columns: auto 1fr; gap: 4px 8px; align-items: center; font-size: 11px; color: var(--sub); margin-top: 10px; }
@@ -59,10 +73,15 @@
   </header>
 
   <section>
-    <div class="row">
-      <div style="flex:2"><label>Peer</label><input id="peer" placeholder="192.168.1.20" /></div>
-      <div><label>Local port</label><input id="port" type="number" value="47800" /></div>
-    </div>
+    <h2>This device</h2>
+    <div class="me-name" id="myName"></div>
+    <div class="pin" id="pin">––– –––</div>
+    <div class="hint">Enter this PIN on the other computer to pair</div>
+  </section>
+
+  <section>
+    <h2>Devices</h2>
+    <div id="devices"><div class="empty">Looking for other CapraLink computers on this network…</div></div>
   </section>
 
   <section>
@@ -83,7 +102,6 @@
     <div class="bitrate-val" id="bitrateVal">64 kbps</div>
   </section>
 
-  <button id="startStop">Start</button>
   <div class="meters">
     <span>Sending</span><meter id="inLevel" min="-60" max="0" low="-20" high="-6" optimum="-30" value="-60"></meter>
     <span>Receiving</span><meter id="outLevel" min="-60" max="0" low="-20" high="-6" optimum="-30" value="-60"></meter>
@@ -94,120 +112,155 @@
 
 <script>
 const { invoke } = window.__TAURI__.core;
-
+const $ = (id) => document.getElementById(id);
 const els = {
-  peer: document.getElementById('peer'),
-  port: document.getElementById('port'),
-  input: document.getElementById('input'),
-  output: document.getElementById('output'),
-  channels: document.getElementById('channels'),
-  bitrate: document.getElementById('bitrate'),
-  bitrateVal: document.getElementById('bitrateVal'),
-  startStop: document.getElementById('startStop'),
-  error: document.getElementById('error'),
-  status: document.getElementById('status'),
-  stats: document.getElementById('stats'),
+  input: $('input'), output: $('output'), channels: $('channels'), bitrate: $('bitrate'),
+  bitrateVal: $('bitrateVal'), error: $('error'), status: $('status'), stats: $('stats'), devices: $('devices'),
 };
 
 let channels = 1;
-let running = false;
-let statsTimer = null;
-
-function save() {
-  try {
-    localStorage.setItem('capralink.form', JSON.stringify({
-      peer: els.peer.value, port: els.port.value,
-      input: els.input.value, output: els.output.value,
-      channels, bitrate: els.bitrate.value,
-    }));
-  } catch (_) {}
-}
-
-function restore() {
-  let f = null;
-  try { f = JSON.parse(localStorage.getItem('capralink.form')); } catch (_) {}
-  if (!f) return;
-  if (f.peer) els.peer.value = f.peer;
-  if (f.port) els.port.value = f.port;
-  if (f.input) els.input.value = f.input;
-  if (f.output) els.output.value = f.output;
-  if (f.bitrate) { els.bitrate.value = f.bitrate; els.bitrateVal.textContent = f.bitrate + ' kbps'; }
-  if (f.channels) setChannels(f.channels);
-}
+let settingsLoaded = false;
+let actionError = '';
+let busy = false;
+let pairingId = null;   // device whose PIN box is open
+let pinDraft = '';
+let lastDevices = '';
+let devices = [];
 
 function setChannels(v) {
   channels = v;
   for (const b of els.channels.children) b.classList.toggle('active', Number(b.dataset.v) === v);
 }
 
+// ---- actions ----
+async function act(cmd, args) {
+  busy = true; actionError = ''; lastDevices = ''; render();
+  try { await invoke(cmd, args); } catch (e) { actionError = String(e); }
+  busy = false; lastDevices = '';
+  await poll();
+}
+
+function saveSettings() {
+  act('set_settings', { settings: {
+    input: els.input.value || null, output: els.output.value || null,
+    bitrate: Number(els.bitrate.value) * 1000, channels,
+  }});
+}
+
 els.channels.addEventListener('click', (e) => {
   if (e.target.tagName !== 'BUTTON') return;
   setChannels(Number(e.target.dataset.v));
-  save();
+  saveSettings();
 });
+els.bitrate.addEventListener('input', () => { els.bitrateVal.textContent = els.bitrate.value + ' kbps'; });
+els.bitrate.addEventListener('change', saveSettings);
+els.input.addEventListener('change', saveSettings);
+els.output.addEventListener('change', saveSettings);
 
-els.bitrate.addEventListener('input', () => {
-  els.bitrateVal.textContent = els.bitrate.value + ' kbps';
-  save();
-});
-
-for (const id of ['peer', 'port', 'input', 'output']) {
-  els[id].addEventListener('change', save);
+// ---- devices list ----
+function el(tag, cls, text) {
+  const e = document.createElement(tag);
+  if (cls) e.className = cls;
+  if (text !== undefined) e.textContent = text;
+  return e;
 }
 
-function setRunning(v) {
-  running = v;
-  els.startStop.textContent = v ? 'Stop' : 'Start';
-  els.startStop.classList.toggle('stop', v);
-  els.status.textContent = v ? 'Streaming' : 'Idle';
-  els.status.classList.toggle('on', v);
-  if (v) {
-    if (!statsTimer) statsTimer = setInterval(refreshStats, 1000);
-  } else {
-    clearInterval(statsTimer);
-    statsTimer = null;
-    els.stats.textContent = '';
-    inLevel.value = outLevel.value = -60;
-  }
+function button(text, cls, onclick) {
+  const b = el('button', cls, text);
+  b.disabled = busy;
+  b.addEventListener('click', onclick);
+  return b;
 }
 
-async function refreshStats() {
-  const s = await invoke('stats');
-  if (!s) { setRunning(false); return; }
-  const db = (p) => Math.max(-60, 20 * Math.log10(p));
-  inLevel.value = db(s.in_peak);
-  outLevel.value = db(s.out_peak);
-  els.stats.textContent =
-    `sent ${s.sent} · recv ${s.received} · lost ${s.lost} · fec ${s.fec_recovered} · underruns ${s.underruns} · buf ${s.buffer_ms.toFixed(0)}/${s.target_ms.toFixed(0)}ms · gap tx ${s.tx_gap_ms.toFixed(0)} rx ${s.rx_gap_ms.toFixed(0)}ms`;
-}
-
-els.startStop.addEventListener('click', async () => {
-  els.error.textContent = '';
-  if (running) {
-    await invoke('stop');
-    setRunning(false);
+function render() {
+  // rebuild only when something changed, so a half-typed PIN survives the 1 s poll
+  const sig = JSON.stringify([devices, pairingId, busy]);
+  if (sig === lastDevices) return;
+  lastDevices = sig;
+  const list = els.devices;
+  list.innerHTML = '';
+  if (!devices.length) {
+    list.appendChild(el('div', 'empty', 'Looking for other CapraLink computers on this network…'));
     return;
   }
-  try {
-    await invoke('start', {
-      peer: els.peer.value,
-      port: Number(els.port.value) || 47800,
-      input: els.input.value || null,
-      output: els.output.value || null,
-      bitrate: Number(els.bitrate.value) * 1000,
-      channels,
-    });
-    setRunning(true);
-    save();
-  } catch (e) {
-    els.error.textContent = String(e);
+  for (const d of devices) {
+    const row = el('div', 'dev');
+    const info = el('div', 'info');
+    info.appendChild(el('div', 'name', d.name));
+    info.appendChild(el('div', 'st', d.connected ? 'Paired · Connected' : d.paired ? (d.online ? 'Paired · Online' : 'Paired · Offline') : 'Not paired'));
+    row.appendChild(info);
+    if (d.paired) row.appendChild(button('Forget', 'link', () => act('forget', { id: d.id })));
+    if (!d.paired) {
+      row.appendChild(button('Pair', 'btn', () => { pairingId = pairingId === d.id ? null : d.id; pinDraft = ''; render(); }));
+    } else if (d.connected) {
+      row.appendChild(button('Disconnect', 'btn stop', () => act('disconnect')));
+    } else if (d.online) {
+      row.appendChild(button('Connect', 'btn', () => act('connect', { id: d.id })));
+    }
+    list.appendChild(row);
+    if (pairingId === d.id && !d.paired) {
+      const box = el('div', 'pairbox');
+      const pin = el('input');
+      pin.maxLength = 6; pin.inputMode = 'numeric'; pin.placeholder = '6-digit PIN'; pin.value = pinDraft;
+      const confirm = () => { const p = pin.value; pairingId = null; act('pair', { id: d.id, pin: p }); };
+      pin.addEventListener('input', () => { pin.value = pin.value.replace(/\D/g, ''); pinDraft = pin.value; });
+      pin.addEventListener('keydown', (e) => { if (e.key === 'Enter') confirm(); });
+      box.appendChild(pin);
+      box.appendChild(button('Confirm', 'btn', confirm));
+      list.appendChild(box);
+      setTimeout(() => pin.focus());
+    }
   }
-});
+}
+
+// keeps a saved device selectable even while it is unplugged
+function setSel(sel, v) {
+  if (v && ![...sel.options].some((o) => o.value === v)) {
+    const o = document.createElement('option');
+    o.value = v; o.textContent = v + ' (not found)';
+    sel.appendChild(o);
+  }
+  sel.value = v || '';
+}
+
+// ---- polling ----
+const db = (p) => Math.max(-60, 20 * Math.log10(p));
+
+async function poll() {
+  let st;
+  try { st = await invoke('state'); } catch (e) { els.error.textContent = String(e); return; }
+  $('myName').textContent = st.name;
+  $('pin').textContent = st.pin.slice(0, 3) + ' ' + st.pin.slice(3);
+  if (!settingsLoaded) {
+    settingsLoaded = true;
+    const s = st.settings;
+    setSel(els.input, s.input);
+    setSel(els.output, s.output);
+    els.bitrate.value = Math.round(s.bitrate / 1000);
+    els.bitrateVal.textContent = els.bitrate.value + ' kbps';
+    setChannels(s.channels);
+  }
+  devices = st.devices;
+  render();
+  const peer = devices.find((d) => d.connected);
+  els.status.textContent = peer ? 'Streaming — ' + peer.name : 'Idle';
+  els.status.classList.toggle('on', !!peer);
+  const s = st.stats;
+  if (s) {
+    inLevel.value = db(s.in_peak);
+    outLevel.value = db(s.out_peak);
+    els.stats.textContent =
+      `sent ${s.sent} · recv ${s.received} · lost ${s.lost} · fec ${s.fec_recovered} · underruns ${s.underruns} · buf ${s.buffer_ms.toFixed(0)}/${s.target_ms.toFixed(0)}ms · gap tx ${s.tx_gap_ms.toFixed(0)} rx ${s.rx_gap_ms.toFixed(0)}ms`;
+  } else {
+    inLevel.value = outLevel.value = -60;
+    els.stats.textContent = '';
+  }
+  els.error.textContent = actionError || st.error || '';
+}
 
 async function loadDevices() {
   const d = await invoke('devices');
   const fill = (sel, list) => {
-    const prev = sel.value;
     sel.innerHTML = '';
     const def = document.createElement('option');
     def.value = ''; def.textContent = 'System default';
@@ -217,7 +270,6 @@ async function loadDevices() {
       o.value = name; o.textContent = name;
       sel.appendChild(o);
     }
-    if (prev) sel.value = prev;
   };
   fill(els.input, d.inputs);
   fill(els.output, d.outputs);
@@ -225,10 +277,8 @@ async function loadDevices() {
 
 (async function init() {
   await loadDevices(); // options must exist before saved selections can apply
-  restore();
-  const s = await invoke('stats');
-  setRunning(!!s);
-  if (s) refreshStats();
+  await poll();
+  setInterval(() => { if (!busy) poll(); }, 1000);
 })();
 </script>
 </body>

@@ -130,8 +130,9 @@ config, mDNS advertise+browse, a TCP control listener, and at most one `Link` (D
   own `Link` back to the initiator's address, replies `{"type":"ok"}`. Either side sends
   `{"type":"stop"}` or closes TCP → both stop. Control connection stays open for the session
   (M6 remote config rides on it).
-- **Audio encryption:** per-session keys from the Noise handshake hash: key_dir = HKDF-SHA256(hh,
-  info "capralink audio " + sender id). ChaCha20-Poly1305, nonce = 8 zero bytes | seq u32 BE.
+- **Audio encryption:** per-session keys from Noise's raw split (includes ephemeral DH → forward
+  secrecy): key_dir = HKDF-SHA256(ikm = split key for that direction, salt = handshake hash,
+  info "capralink audio v2"). (Originally derived from hh alone — no forward secrecy; fixed 2026-09-29.) ChaCha20-Poly1305, nonce = 8 zero bytes | seq u32 BE.
   Fresh keys every session → seq-as-nonce never repeats. Packet v2:
   `magic u16 | version u8 (2) | seq u32 | AEAD(channels u8 | opus)` with the 7-byte header as AAD.
   Packets failing auth are dropped silently. UDP from any address other than the session peer ignored.
@@ -203,7 +204,7 @@ config, mDNS advertise+browse, a TCP control listener, and at most one `Link` (D
 |---|---|---|
 | M0 | Toolchain, repo, Tauri tray skeleton on macOS | Tray icon runs on this Mac |
 | M1 | Engine: mic → Opus → UDP → speaker, two hard-coded peers | Hear yourself across two machines; latency measured |
-| M2 | mDNS discovery, PIN pairing, encryption, saved pairings | Pair two machines from the UI |
+| M2 | mDNS discovery, PIN pairing, encryption, saved pairings | Pair two machines from the UI — code done 2026-09-29, owner test pending |
 | M3 | Virtual devices: Linux, then macOS HAL plug-in | Discord on A can pick CapraLink Input/Output |
 | M4 | Virtual devices: Windows — fork + rename + test-sign VirtualDrivers driver, built in CI (D4) | Same, on Windows |
 | M5 | Adaptive bitrate (loss/RTT/CPU), jitter tuning | Holds quality on Wi-Fi; CPU target met |
@@ -219,6 +220,7 @@ See `HANDOFF.md` → "Pending owner actions" for the live list. Answers get move
 | Date | Change |
 |---|---|
 | 2026-09-29 | Project started. Master plan written. No Rust toolchain on the Mac yet. |
+| 2026-09-29 | M2 landed (engine/src/node.rs): mDNS discovery (all LAN IPv4 addrs, ranked dialing), SPAKE2 PIN pairing w/ rate limit, Noise NNpsk0 control + keepalive, forward-secret per-session ChaCha20-Poly1305 audio (packet v2), config.json (0600, atomic). App UI: PIN, device list, pair/connect/forget, settings in node. CLI = headless node. 8 tests; 2-process smoke test OK. Awaiting owner 2-machine test. |
 | 2026-09-29 | M1 signed off by owner: Mac↔Linux both directions, no clicks, low latency, jitter-sized cushion. |
 | 2026-09-29 | Two-machine tuning (Mac↔Linux): mic permission fix (.app + usage string); Linux ALSA 40 ms bursts → 10 ms capture buffers (0 underruns); ~0.3% clock drift → resampling drift control on low-water cushion. Stats gained levels, target, tx/rx gaps. |
 | 2026-09-29 | M0 tray app landed (Tauri 2.12, single main.rs + ui/index.html). Idle in tray: 0% CPU, 21 MB phys footprint (RSS 84 MB incl. shared WebKit). Window visual check pending owner. |

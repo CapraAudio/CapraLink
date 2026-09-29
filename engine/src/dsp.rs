@@ -1,13 +1,16 @@
 //! Socket- and device-free pieces of the engine: packet format, RX loss handling,
 //! playout (jitter/drift) decisions and the resampler. Kept here so they can be unit tested.
 
+use chacha20poly1305::aead::AeadInOut;
+use chacha20poly1305::{ChaCha20Poly1305, KeyInit, Nonce, Tag};
 use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 
 pub const RATE: u32 = 48_000;
 pub const FRAME: usize = 480; // 10 ms per channel at 48 kHz
 const MAGIC: u16 = 0xCA1A;
-const VERSION: u8 = 1;
-const HEADER: usize = 8;
+const VERSION: u8 = 2;
+const HEADER: usize = 7; // magic | version | seq, sent in clear and authenticated as AAD
+const TAG: usize = 16;
 pub const MAX_PACKET: usize = 1500;
 const MAX_PLC: u32 = 5;
 const MAX_OPUS_FRAME: usize = 5760; // 120 ms, the largest frame Opus can emit
@@ -25,16 +28,29 @@ fn inc(c: &AtomicU64, n: u64) {
     c.fetch_add(n, Relaxed);
 }
 
-/// TX side: 10 ms interleaved f32 frames in, finished UDP payloads out.
+fn cipher(key: &[u8; 32]) -> ChaCha20Poly1305 {
+    ChaCha20Poly1305::new(&(*key).into())
+}
+
+/// 8 zero bytes | seq. Keys are fresh per session, so a seq never repeats under one key.
+fn nonce(seq: u32) -> Nonce {
+    let mut n = [0u8; 12];
+    n[8..].copy_from_slice(&seq.to_be_bytes());
+    n.into()
+}
+
+/// TX side: 10 ms interleaved f32 frames in, finished (encrypted) UDP payloads out.
+/// Packet v2: `magic u16 | version u8 | seq u32 | AEAD(channels u8 | opus)`.
 pub struct Packetizer {
     enc: opus::Encoder,
+    aead: ChaCha20Poly1305,
     channels: u8,
     seq: u32,
     buf: [u8; MAX_PACKET],
 }
 
 impl Packetizer {
-    pub fn new(channels: u16, bitrate: i32) -> anyhow::Result<Self> {
+    pub fn new(channels: u16, bitrate: i32, key: &[u8; 32]) -> anyhow::Result<Self> {
         let ch = if channels == 1 { opus::Channels::Mono } else { opus::Channels::Stereo };
         let mut enc = opus::Encoder::new(RATE, ch, opus::Application::Audio)?;
         enc.set_complexity(5)?;
@@ -44,8 +60,7 @@ impl Packetizer {
         let mut buf = [0; MAX_PACKET];
         buf[..2].copy_from_slice(&MAGIC.to_be_bytes());
         buf[2] = VERSION;
-        buf[3] = channels as u8;
-        Ok(Packetizer { enc, channels: channels as u8, seq: 0, buf })
+        Ok(Packetizer { enc, aead: cipher(key), channels: channels as u8, seq: 0, buf })
     }
 
     pub fn channels(&self) -> usize {
@@ -54,39 +69,53 @@ impl Packetizer {
 
     /// `pcm` must be exactly one 10 ms frame (FRAME * channels samples).
     pub fn packet(&mut self, pcm: &[f32]) -> anyhow::Result<&[u8]> {
-        self.buf[4..HEADER].copy_from_slice(&self.seq.to_be_bytes());
-        self.seq = self.seq.wrapping_add(1);
-        let n = self.enc.encode_float(pcm, &mut self.buf[HEADER..])?;
-        Ok(&self.buf[..HEADER + n])
+        // ponytail: u32 seq wraps after ~497 days of one session (nonce reuse); rekey by reconnecting before then
+        let seq = self.seq;
+        self.seq = seq.wrapping_add(1);
+        self.buf[3..HEADER].copy_from_slice(&seq.to_be_bytes());
+        self.buf[HEADER] = self.channels;
+        let n = self.enc.encode_float(pcm, &mut self.buf[HEADER + 1..MAX_PACKET - TAG])?;
+        let end = HEADER + 1 + n;
+        let (hdr, body) = self.buf.split_at_mut(HEADER);
+        let tag = self.aead.encrypt_inout_detached(&nonce(seq), hdr, (&mut body[..1 + n]).into()).map_err(|_| anyhow::anyhow!("encrypt failed"))?;
+        self.buf[end..end + TAG].copy_from_slice(&tag);
+        Ok(&self.buf[..end + TAG])
     }
 }
 
-/// Returns (channels, seq, opus payload) for a well-formed packet.
-fn parse(p: &[u8]) -> Option<(u8, u32, &[u8])> {
-    if p.len() <= HEADER || p[..2] != MAGIC.to_be_bytes() || p[2] != VERSION || !matches!(p[3], 1 | 2) {
+/// Authenticates and decrypts a packet in place; returns (channels, seq, opus payload).
+fn open<'a>(aead: &ChaCha20Poly1305, p: &'a mut [u8]) -> Option<(u8, u32, &'a [u8])> {
+    if p.len() < HEADER + 1 + TAG || p[..2] != MAGIC.to_be_bytes() || p[2] != VERSION {
         return None;
     }
-    Some((p[3], u32::from_be_bytes([p[4], p[5], p[6], p[7]]), &p[HEADER..]))
+    let seq = u32::from_be_bytes([p[3], p[4], p[5], p[6]]);
+    let (hdr, rest) = p.split_at_mut(HEADER);
+    let (body, tag) = rest.split_at_mut(rest.len() - TAG);
+    let tag = Tag::try_from(&*tag).ok()?;
+    aead.decrypt_inout_detached(&nonce(seq), hdr, (&mut *body).into(), &tag).ok()?;
+    matches!(body[0], 1 | 2).then(|| (body[0], seq, &body[1..]))
 }
 
 /// RX side: packets in, 48 kHz stereo-interleaved PCM out (mono is duplicated to both sides).
 pub struct Rx {
+    aead: ChaCha20Poly1305,
     dec: Option<(u8, opus::Decoder)>,
     expected: Option<u32>,
     pcm: Vec<f32>,
     stereo: Vec<f32>,
 }
 
-impl Default for Rx {
-    fn default() -> Self {
-        Rx { dec: None, expected: None, pcm: vec![0.0; MAX_OPUS_FRAME * 2], stereo: vec![0.0; MAX_OPUS_FRAME * 2] }
-    }
-}
-
 impl Rx {
-    /// Returns the stream's channel count for valid packets, None for junk.
-    pub fn handle(&mut self, packet: &[u8], c: &Counters, out: &mut impl FnMut(&[f32])) -> Option<u8> {
-        let (ch, seq, opus) = parse(packet)?;
+    pub fn new(key: &[u8; 32]) -> Self {
+        Rx { aead: cipher(key), dec: None, expected: None, pcm: vec![0.0; MAX_OPUS_FRAME * 2], stereo: vec![0.0; MAX_OPUS_FRAME * 2] }
+    }
+
+    /// Returns the stream's channel count for authentic packets, None for junk (dropped silently).
+    /// Decrypts `packet` in place.
+    // ponytail: an authentic packet replayed from far back makes the seq logic resync (a glitch);
+    // add a replay window if spoofed-source replays ever matter on the LAN.
+    pub fn handle(&mut self, packet: &mut [u8], c: &Counters, out: &mut impl FnMut(&[f32])) -> Option<u8> {
+        let (ch, seq, opus) = open(&self.aead, packet)?;
         inc(&c.received, 1);
         if self.dec.as_ref().is_none_or(|(dch, _)| *dch != ch) {
             let chans = if ch == 1 { opus::Channels::Mono } else { opus::Channels::Stereo };
@@ -279,7 +308,8 @@ mod tests {
 
     #[test]
     fn round_trip_with_fec() {
-        let mut tx = Packetizer::new(1, 64_000).unwrap();
+        let key = [7u8; 32];
+        let mut tx = Packetizer::new(1, 64_000, &key).unwrap();
         let packets: Vec<Vec<u8>> = (0..50)
             .map(|f| {
                 let pcm: Vec<f32> = (0..FRAME)
@@ -288,14 +318,23 @@ mod tests {
                 tx.packet(&pcm).unwrap().to_vec()
             })
             .collect();
-        let (mut rx, c, mut pcm) = (Rx::default(), Counters::default(), Vec::new());
-        assert_eq!(rx.handle(b"junk-junk-junk", &c, &mut |_: &[f32]| {}), None);
+        let (mut rx, c, mut pcm) = (Rx::new(&key), Counters::default(), Vec::new());
+        let never = &mut |_: &[f32]| panic!("must be dropped");
+        assert_eq!(rx.handle(&mut b"junk-junk-junk-junk-junk-junk".to_vec(), &c, never), None);
+        // any flipped bit (header = AAD, body, or tag) fails authentication
+        for i in [2, 4, HEADER, packets[0].len() - 1] {
+            let mut p = packets[0].clone();
+            p[i] ^= 1;
+            assert_eq!(rx.handle(&mut p, &c, never), None);
+        }
+        assert_eq!(Rx::new(&[8u8; 32]).handle(&mut packets[0].clone(), &c, never), None, "wrong key");
+        assert_eq!(c.received.load(Relaxed), 0);
         for (i, p) in packets.iter().enumerate() {
             if i != 20 {
-                rx.handle(p, &c, &mut |s: &[f32]| pcm.extend_from_slice(s));
+                rx.handle(&mut p.clone(), &c, &mut |s: &[f32]| pcm.extend_from_slice(s));
             }
         }
-        rx.handle(&packets[10], &c, &mut |_: &[f32]| panic!("late packet must be dropped"));
+        rx.handle(&mut packets[10].clone(), &c, never); // late packet
         assert_eq!(c.fec_recovered.load(Relaxed), 1);
         assert_eq!(c.lost.load(Relaxed), 0);
         assert_eq!(c.received.load(Relaxed), 50);
