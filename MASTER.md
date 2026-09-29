@@ -184,6 +184,7 @@ See `HANDOFF.md` → "Pending owner actions" for the live list. Answers get move
 | Date | Change |
 |---|---|
 | 2026-09-29 | Project started. Master plan written. No Rust toolchain on the Mac yet. |
+| 2026-09-29 | M1 engine landed: cpal 0.18 + opus 0.4 (static libopus via cmake) + ringbuf. Loopback: 0 loss, 0 underruns, 18 MB RSS, 0.2% CPU. Drift controller smoothed (EMA) to avoid per-callback skip/dup. CI added. |
 | 2026-09-29 | Owner answered round 1: D3, D4, D7, D8 recorded. |
 | 2026-09-29 | Private repo created: github.com/CapraAudio/CapraLink. Git identity = Capra Audio (GitHub noreply). |
 | 2026-09-29 | Round 2: GPL-3.0, no AEC, test rigs recorded (D8–D10). Rust install approved. |

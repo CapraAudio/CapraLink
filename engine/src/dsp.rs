@@ -144,21 +144,26 @@ pub enum Plan {
 }
 
 /// Jitter/drift controller for the playback ring. All counts are 48 kHz frames.
+/// Raw fill swings by a whole packet (10 ms) on every arrival, so drift decisions use a
+/// smoothed fill (~1 s time constant at 10 ms callbacks); only real clock drift moves it.
 #[derive(Default)]
 pub struct Playout {
     playing: bool,
+    avg: f32,
 }
 
 impl Playout {
-    // ponytail: raw fill jitters by one packet (10 ms) against a ±5 ms band, so skip/dup
-    // chatter is expected; smooth the fill (EMA) if it ever becomes audible.
     pub fn plan(&mut self, fill: usize, need: usize) -> Plan {
         let discard = fill.saturating_sub(TARGET) * (fill > CEILING) as usize;
         let fill = fill - discard;
         if !self.playing && fill < TARGET {
             return Plan::Silence { underrun: false };
         }
-        let consume = match fill {
+        if !self.playing || discard > 0 {
+            self.avg = fill as f32;
+        }
+        self.avg += (fill as f32 - self.avg) * 0.01;
+        let consume = match self.avg as usize {
             _ if need < 2 => need,
             f if f > TARGET + BAND => need + 1,
             f if f < TARGET - BAND => need - 1,
@@ -241,8 +246,13 @@ mod tests {
         let mut p = Playout::default();
         assert_eq!(p.plan(TARGET - 1, 480), Plan::Silence { underrun: false }); // prebuffering
         assert_eq!(p.plan(TARGET, 480), Plan::Play { discard: 0, consume: 480 });
-        assert_eq!(p.plan(TARGET + BAND + 1, 480), Plan::Play { discard: 0, consume: 481 });
-        assert_eq!(p.plan(TARGET - BAND - 1, 480), Plan::Play { discard: 0, consume: 479 });
+        // one packet of jitter must not trigger a correction
+        assert_eq!(p.plan(TARGET + 480, 480), Plan::Play { discard: 0, consume: 480 });
+        // a sustained offset (clock drift) does
+        let last = (0..500).map(|_| p.plan(TARGET + BAND * 2, 240)).last().unwrap();
+        assert_eq!(last, Plan::Play { discard: 0, consume: 241 });
+        let last = (0..500).map(|_| p.plan(TARGET - BAND * 2, 240)).last().unwrap();
+        assert_eq!(last, Plan::Play { discard: 0, consume: 239 });
         assert_eq!(p.plan(CEILING + 10, 480), Plan::Play { discard: CEILING + 10 - TARGET, consume: 480 });
         assert_eq!(p.plan(300, 480), Plan::Silence { underrun: true });
         assert_eq!(p.plan(TARGET - 1, 480), Plan::Silence { underrun: false }); // re-prebuffer
