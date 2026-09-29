@@ -27,4 +27,5 @@ Read `MASTER.md` first. This file is the live position.
 Verify engine build/tests, commit, then build app/ (Tauri tray) against the engine API, add CI.
 
 ## In flight (2026-09-29)
+- M2 delegated to an Opus agent (brief = MASTER §3.3 + UI spec). Uncommitted until verified by main session. If lost: re-delegate from §3.3.
 If a session resumes and these are missing, re-run them from MASTER §3.2 / §6.
