@@ -5,7 +5,7 @@ use capralink_engine::{Config, Link, Stats};
 use serde::Serialize;
 use std::sync::Mutex;
 use tauri::menu::{Menu, MenuItem};
-use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
+use tauri::tray::TrayIconBuilder;
 use tauri::{
     AppHandle, Manager, RunEvent, WebviewUrl, WebviewWindowBuilder,
 };
@@ -85,16 +85,10 @@ fn main() {
                 .icon(app.default_window_icon().cloned().unwrap())
                 .icon_as_template(true)
                 .menu(&menu)
-                .show_menu_on_left_click(false)
                 .on_menu_event(|app, event| match event.id().as_ref() {
                     "open" => toggle_window(app),
                     "quit" => app.exit(0),
                     _ => {}
-                })
-                .on_tray_icon_event(|tray, event| {
-                    if let TrayIconEvent::Click { button: MouseButton::Left, button_state: MouseButtonState::Up, .. } = event {
-                        toggle_window(tray.app_handle());
-                    }
                 })
                 .build(app)?;
 
