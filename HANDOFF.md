@@ -17,10 +17,11 @@ Read `MASTER.md` first. This file is the live position.
 
 ## Owner test results (2026-09-29, Mac app ↔ Linux capralinkd)
 - Linux mic → Mac headphones: WORKS, latency "not much at all".
-- Mac mic → Linux speakers: SILENT. Suspect macOS mic permission (app launched from a terminal → TCC attributes to the terminal's host app; unbundled binary has no NSMicrophoneUsageDescription → silence).
+- Mac mic → Linux speakers: was SILENT; FIXED by bundled .app + NSMicrophoneUsageDescription (retest 2026-09-29: both directions work, Sending meter moves).
+- (orig note) Mac mic → Linux speakers: SILENT. Suspect macOS mic permission (app launched from a terminal → TCC attributes to the terminal's host app; unbundled binary has no NSMicrophoneUsageDescription → silence).
 - Occasional slight click. Cause unknown (underrun vs drift skip/dup vs resampler) — need stats.
 - Mac window: stats line + error text cut off at bottom (body fixed 540px, overflow hidden).
-- Fixed 2026-09-29: in/out peak meters (stats + UI + CLI dB), window 600px tall + scrollable, app/Info.plist with NSMicrophoneUsageDescription; .app built via `cargo tauri build --bundles app` (tauri-cli 2.12 installed in ~/.cargo/bin) → target/release/bundle/macos/CapraLink.app. Awaiting owner retest.
+- Fixed 2026-09-29: in/out peak meters (stats + UI + CLI dB), window 600px tall + scrollable, app/Info.plist with NSMicrophoneUsageDescription; .app built via `cargo tauri build --bundles app` (tauri-cli 2.12 installed in ~/.cargo/bin) → target/release/bundle/macos/CapraLink.app. Retest done: bidirectional OK. Open: Mac stats line not visible to owner; clicks still undiagnosed.
 
 ## Next step
 Verify engine build/tests, commit, then build app/ (Tauri tray) against the engine API, add CI.
