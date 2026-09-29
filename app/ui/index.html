@@ -250,7 +250,7 @@ async function poll() {
     inLevel.value = db(s.in_peak);
     outLevel.value = db(s.out_peak);
     els.stats.textContent =
-      `sent ${s.sent} · recv ${s.received} · lost ${s.lost} · fec ${s.fec_recovered} · underruns ${s.underruns} · buf ${s.buffer_ms.toFixed(0)}/${s.target_ms.toFixed(0)}ms · gap tx ${s.tx_gap_ms.toFixed(0)} rx ${s.rx_gap_ms.toFixed(0)}ms`;
+      `sent ${s.sent} · recv ${s.received} · lost ${s.lost} · fec ${s.fec_recovered} · underruns ${s.underruns} · buf ${s.buffer_ms.toFixed(0)}/${s.target_ms.toFixed(0)}ms · gap tx ${s.tx_gap_ms.toFixed(0)} rx ${s.rx_gap_ms.toFixed(0)}ms · ${Math.round(s.bitrate / 1000)} kbps · cx ${s.complexity}`;
   } else {
     inLevel.value = outLevel.value = -60;
     els.stats.textContent = '';

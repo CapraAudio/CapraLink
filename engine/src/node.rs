@@ -1,6 +1,7 @@
 //! One node per process: config, mDNS discovery, PIN pairing (SPAKE2), the Noise control
 //! channel and the single active `Link` (MASTER.md §3.3).
 
+use crate::dsp::RateControl;
 use crate::vdev::Virtual;
 use crate::{Keys, Link, Settings, Stats};
 use anyhow::{anyhow, bail, ensure, Context, Result};
@@ -22,7 +23,7 @@ const NOISE: &str = "Noise_NNpsk0_25519_ChaChaPoly_SHA256";
 const IO_TIMEOUT: Duration = Duration::from_secs(5);
 const DIAL_TIMEOUT: Duration = Duration::from_secs(1); // per advertised address
 const LINK_TIMEOUT: Duration = Duration::from_secs(10); // peer may be opening audio devices
-const PING: Duration = Duration::from_secs(5);
+const REPORT: Duration = Duration::from_secs(1); // also doubles as the session keepalive
 const DEAD: Duration = Duration::from_secs(15);
 const MAX_FAILURES: u32 = 5;
 
@@ -76,6 +77,9 @@ enum Msg {
     Error { message: String },
     Stop,
     Ping,
+    /// Deltas (since this node's previous report) of its own Link's receive-side counters,
+    /// sent every second so the peer's sender can steer bitrate/FEC (MASTER.md §3.5).
+    Report { received: u64, lost: u64, underruns: u64, jitter_ms: f32 },
 }
 
 struct Found {
@@ -325,13 +329,23 @@ impl Node {
         Ok(())
     }
 
-    /// Session control loop: pings, and tears the session down on stop / close / silence.
+    /// Session control loop: exchanges 1 s reports (which double as keepalive), steers this
+    /// node's own sender from the peer's reports, and tears the session down on stop / close /
+    /// silence.
     fn serve(&self, ctl: Arc<Ctl>) {
         let _ = ctl.stream.set_read_timeout(Some(Duration::from_secs(1)));
-        let (mut last_rx, mut last_tx) = (Instant::now(), Instant::now());
+        let ceiling = self.st().cfg.settings.bitrate;
+        let mut rate = RateControl::new(ceiling);
+        let mut last_counts = (0u64, 0u64, 0u64);
+        let (mut last_rx, mut last_report) = (Instant::now(), Instant::now());
         let lost = loop {
             match ctl.recv() {
                 Ok(Some(Msg::Stop)) => break false,
+                Ok(Some(Msg::Report { received, lost, underruns, .. })) => {
+                    last_rx = Instant::now();
+                    let (bitrate, loss_perc) = rate.on_report(received, lost, underruns);
+                    self.apply_rate(&ctl, bitrate, loss_perc);
+                }
                 Ok(_) => last_rx = Instant::now(),
                 Err(e) if matches!(e.kind(), io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut) => {
                     if last_rx.elapsed() > DEAD {
@@ -340,9 +354,16 @@ impl Node {
                 }
                 Err(_) => break false,
             }
-            if last_tx.elapsed() >= PING {
-                last_tx = Instant::now();
-                let _ = ctl.send(&Msg::Ping);
+            if last_report.elapsed() >= REPORT {
+                last_report = Instant::now();
+                match self.link_delta(&ctl, &mut last_counts) {
+                    Some((received, lost, underruns, jitter_ms)) => {
+                        let _ = ctl.send(&Msg::Report { received, lost, underruns, jitter_ms });
+                    }
+                    None => {
+                        let _ = ctl.send(&Msg::Ping); // no link (e.g. tests): keepalive only
+                    }
+                }
             }
         };
         ctl.close();
@@ -353,6 +374,25 @@ impl Node {
                 let name = s.and_then(|s| st.cfg.peers.iter().find(|p| p.id == s.peer_id).map(|p| p.name.clone()));
                 st.error = Some(format!("lost connection to {}", name.unwrap_or_default()));
             }
+        }
+    }
+
+    /// This session's own receive-side counters, as deltas since `last` (updated in place).
+    /// `None` if the session moved on (or has no Link, e.g. under test).
+    fn link_delta(&self, ctl: &Arc<Ctl>, last: &mut (u64, u64, u64)) -> Option<(u64, u64, u64, f32)> {
+        let st = self.st();
+        let link = st.session.as_ref().filter(|s| Arc::ptr_eq(&s.ctl, ctl))?.link.as_ref()?;
+        let (r, l, u, jitter_ms) = link.report_counters();
+        let delta = (r.saturating_sub(last.0), l.saturating_sub(last.1), u.saturating_sub(last.2));
+        *last = (r, l, u);
+        Some((delta.0, delta.1, delta.2, jitter_ms))
+    }
+
+    /// Applies a new bitrate/loss% to this session's own sender, if it's still the current one.
+    fn apply_rate(&self, ctl: &Arc<Ctl>, bitrate: i32, loss_perc: u8) {
+        let st = self.st();
+        if let Some(link) = st.session.as_ref().filter(|s| Arc::ptr_eq(&s.ctl, ctl)).and_then(|s| s.link.as_ref()) {
+            link.set_rate(bitrate, loss_perc);
         }
     }
 

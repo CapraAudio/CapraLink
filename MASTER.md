@@ -245,7 +245,7 @@ these to the real per-OS device names in one small function; the UI lists them f
 | M2 | mDNS discovery, PIN pairing, encryption, saved pairings | Pair two machines from the UI — **done 2026-09-29**, owner-verified Mac↔Linux (pair, connect, audio both ways, disconnect/reconnect) |
 | M3 | Virtual devices: Linux, then macOS HAL plug-in | Discord on A can pick CapraLink Input/Output |
 | M4 | Virtual devices: Windows — fork + rename + test-sign VirtualDrivers driver, built in CI (D4) | Same, on Windows |
-| M5 | Adaptive bitrate (loss/RTT/CPU), jitter tuning | Holds quality on Wi-Fi; CPU target met |
+| M5 | Adaptive bitrate (loss/RTT/CPU), jitter tuning | Holds quality on Wi-Fi; CPU target met — code done 2026-09-29, field test pending |
 | M6 | Service mode + remote configuration | Configure a headless machine from another |
 | M7 | Installers + signing for all 3 OSes | One-click install per OS |
 
@@ -258,6 +258,7 @@ See `HANDOFF.md` → "Pending owner actions" for the live list. Answers get move
 | Date | Change |
 |---|---|
 | 2026-09-29 | Project started. Master plan written. No Rust toolchain on the Mac yet. |
+| 2026-09-29 | M5 landed: 1 s receiver reports over the control channel (replace 5 s ping as keepalive); AIMD RateControl (slider = ceiling), loss-driven FEC %, encode-time Complexity controller; stats show kbps + cx. 12 tests. |
 | 2026-09-29 | End-to-end Discord call through CapraLink virtual devices (Mac=A, Linux=B) works. |
 | 2026-09-29 | M3-macOS: BlackHole v0.7.1-derived HAL plug-ins (drivers/macos, clang build, ad-hoc signed) installed by owner; load fine on macOS 26 without Developer ID. |
 | 2026-09-29 | M3-Linux code: cpal pulseaudio host on Linux; pactl creates capralink_output / capralink_input_feed + remap source capralink_input (reuses leftovers, unloads on shutdown incl. Ctrl-C/SIGTERM); special names mapped in lib.rs; pulse playback requests 10 ms buffers. Untested on Linux — owner test pending. |

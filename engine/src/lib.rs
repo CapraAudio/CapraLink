@@ -9,11 +9,11 @@ pub use node::{Device, Node, NodeState};
 use anyhow::{anyhow, Context};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::{FromSample, Sample, SampleFormat, SizedSample};
-use dsp::{Counters, Jitter, Packetizer, Plan, Playout, Resampler, Rx, FRAME, RATE, TARGET};
+use dsp::{Complexity, Counters, Jitter, Packetizer, Plan, Playout, Resampler, Rx, FRAME, RATE, TARGET};
 use ringbuf::traits::{Consumer, Observer, Producer, Split};
 use ringbuf::{HeapCons, HeapRb};
 use std::net::{SocketAddr, UdpSocket};
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU8, Ordering::Relaxed};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, AtomicU8, Ordering::Relaxed};
 use std::sync::Arc;
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
@@ -96,6 +96,9 @@ pub struct Stats {
     /// Even ~10 ms means a smooth link; big gaps show where bursts come from.
     pub tx_gap_ms: f32,
     pub rx_gap_ms: f32,
+    /// Currently applied Opus bitrate (bps) and complexity (MASTER.md §3.5).
+    pub bitrate: i32,
+    pub complexity: u8,
 }
 
 #[derive(Default)]
@@ -109,6 +112,10 @@ struct Shared {
     tx_gap_us: AtomicU32, // reset on read
     rx_gap_us: AtomicU32, // reset on read
     jitter_us: AtomicU32, // worst recent packet lateness
+    target_bitrate: AtomicI32,   // written by the session thread from peer reports
+    target_loss_perc: AtomicU8,
+    bitrate: AtomicI32, // currently applied, for Stats
+    complexity: AtomicU8,
 }
 
 /// A running TX + RX link. Dropping it stops everything.
@@ -135,6 +142,11 @@ impl Link {
         let sock = UdpSocket::bind(("0.0.0.0", port)).with_context(|| format!("bind UDP port {port}"))?;
         sock.set_read_timeout(Some(Duration::from_millis(200)))?;
         let shared = Arc::new(Shared::default());
+        let initial_bitrate = cfg.bitrate.clamp(8_000, 96_000);
+        shared.target_bitrate.store(initial_bitrate, Relaxed);
+        shared.bitrate.store(initial_bitrate, Relaxed);
+        shared.target_loss_perc.store(5, Relaxed);
+        shared.complexity.store(5, Relaxed);
         let stop = Arc::new(AtomicBool::new(false));
         let (mut prod, cons) = HeapRb::<f32>::new(RATE as usize).split(); // 500 ms of stereo
 
@@ -182,7 +194,22 @@ impl Link {
             out_peak: f32::from_bits(self.shared.out_peak.swap(0, Relaxed)),
             tx_gap_ms: self.shared.tx_gap_us.swap(0, Relaxed) as f32 / 1000.0,
             rx_gap_ms: self.shared.rx_gap_us.swap(0, Relaxed) as f32 / 1000.0,
+            bitrate: self.shared.bitrate.load(Relaxed),
+            complexity: self.shared.complexity.load(Relaxed),
         }
+    }
+
+    /// Sets the sender's target bitrate/loss%, applied by the capture callback (MASTER.md §3.5).
+    pub fn set_rate(&self, bitrate: i32, loss_perc: u8) {
+        self.shared.target_bitrate.store(bitrate, Relaxed);
+        self.shared.target_loss_perc.store(loss_perc, Relaxed);
+    }
+
+    /// This link's own receive-side counters (cumulative) plus current jitter, for building
+    /// the periodic peer report. Doesn't reset anything (unlike `stats()`).
+    pub fn report_counters(&self) -> (u64, u64, u64, f32) {
+        let c = &self.shared.c;
+        (c.received.load(Relaxed), c.lost.load(Relaxed), c.underruns.load(Relaxed), self.shared.jitter_us.load(Relaxed) as f32 / 1000.0)
     }
 }
 
@@ -234,6 +261,9 @@ struct Tx {
     frame: Vec<f32>,
     last_send: Option<Instant>,
     shared: Arc<Shared>,
+    last_bitrate: i32,
+    last_loss_perc: u8,
+    cx: Complexity,
 }
 
 impl Tx {
@@ -243,6 +273,7 @@ impl Tx {
     where
         f32: FromSample<T>,
     {
+        self.apply_rate();
         let (dev_ch, out_ch) = (self.dev_ch, self.pk.channels());
         self.mixed.clear();
         for f in data.chunks_exact(dev_ch) {
@@ -266,15 +297,35 @@ impl Tx {
             let take = chunk.len().min(FRAME * out_ch - self.frame.len());
             self.frame.extend_from_slice(&chunk[..take]);
             if self.frame.len() == FRAME * out_ch {
+                let t0 = Instant::now();
                 if let Ok(p) = self.pk.packet(&self.frame) {
                     if self.sock.send_to(p, self.peer).is_ok() {
                         self.shared.c.sent.fetch_add(1, Relaxed);
                         gap(&mut self.last_send, &self.shared.tx_gap_us);
                     }
                 }
+                let us = t0.elapsed().as_micros() as f32;
+                if let Some(level) = self.cx.on_encode(us) {
+                    if self.pk.set_complexity(level).is_ok() {
+                        self.shared.complexity.store(level, Relaxed);
+                    }
+                }
                 self.frame.clear();
                 self.frame.extend_from_slice(&chunk[take..]);
             }
+        }
+    }
+
+    /// Applies the session thread's latest bitrate/loss% target, only when it actually changed.
+    fn apply_rate(&mut self) {
+        let bitrate = self.shared.target_bitrate.load(Relaxed);
+        if bitrate != self.last_bitrate && self.pk.set_bitrate(bitrate).is_ok() {
+            self.last_bitrate = bitrate;
+            self.shared.bitrate.store(bitrate, Relaxed);
+        }
+        let loss_perc = self.shared.target_loss_perc.load(Relaxed);
+        if loss_perc != self.last_loss_perc && self.pk.set_packet_loss_perc(loss_perc).is_ok() {
+            self.last_loss_perc = loss_perc;
         }
     }
 }
@@ -283,6 +334,7 @@ fn build_input(dev: &cpal::Device, cfg: &Settings, pk: Packetizer, sock: UdpSock
     let sc = pick_config(dev.default_input_config()?, dev.supported_input_configs()?);
     let (dev_ch, rate, fmt) = (sc.channels() as usize, sc.sample_rate(), sc.sample_format());
     let ch = cfg.channels as usize;
+    let (last_bitrate, last_loss_perc) = (shared.bitrate.load(Relaxed), shared.target_loss_perc.load(Relaxed));
     let mut tx = Tx {
         pk,
         sock,
@@ -294,6 +346,9 @@ fn build_input(dev: &cpal::Device, cfg: &Settings, pk: Packetizer, sock: UdpSock
         frame: Vec::with_capacity(FRAME * ch),
         last_send: None,
         shared,
+        last_bitrate,
+        last_loss_perc,
+        cx: Complexity::default(),
     };
     let mut c = sc.config();
     // Ask for 10 ms capture buffers so packets leave evenly instead of in bursts

@@ -67,6 +67,18 @@ impl Packetizer {
         self.channels as usize
     }
 
+    pub fn set_bitrate(&mut self, bitrate: i32) -> anyhow::Result<()> {
+        Ok(self.enc.set_bitrate(opus::Bitrate::Bits(bitrate.clamp(8_000, 96_000)))?)
+    }
+
+    pub fn set_packet_loss_perc(&mut self, perc: u8) -> anyhow::Result<()> {
+        Ok(self.enc.set_packet_loss_perc(perc.min(30).into())?)
+    }
+
+    pub fn set_complexity(&mut self, level: u8) -> anyhow::Result<()> {
+        Ok(self.enc.set_complexity(level.min(10).into())?)
+    }
+
     /// `pcm` must be exactly one 10 ms frame (FRAME * channels samples).
     pub fn packet(&mut self, pcm: &[f32]) -> anyhow::Result<&[u8]> {
         // ponytail: u32 seq wraps after ~497 days of one session (nonce reuse); rekey by reconnecting before then
@@ -270,6 +282,79 @@ impl Jitter {
     }
 }
 
+/// AIMD bitrate controller (MASTER.md §3.5): the sender's reaction to the peer's periodic
+/// receive-side reports. `ceiling` tracks the user's Bitrate setting.
+pub struct RateControl {
+    bitrate: i32,
+    ceiling: i32,
+}
+
+impl RateControl {
+    pub fn new(ceiling: i32) -> Self {
+        let ceiling = ceiling.clamp(8_000, 96_000);
+        RateControl { bitrate: ceiling, ceiling }
+    }
+
+    /// Feeds one peer report (deltas since its last report). Returns the bitrate to apply and
+    /// the loss% to hand Opus (`packet_loss_perc`, so FEC scales with measured loss).
+    /// A report with no packets (peer silent) leaves everything unchanged.
+    pub fn on_report(&mut self, received: u64, lost: u64, underruns: u64) -> (i32, u8) {
+        let total = received + lost;
+        if total == 0 {
+            return (self.bitrate, 0);
+        }
+        let loss_pct = lost as f64 * 100.0 / total as f64;
+        if loss_pct > 5.0 || underruns > 0 {
+            self.bitrate = (self.bitrate * 7 / 10).max(8_000);
+        } else if loss_pct < 1.0 {
+            self.bitrate = (self.bitrate + 8_000).min(self.ceiling);
+        }
+        (self.bitrate, loss_pct.round().clamp(0.0, 30.0) as u8)
+    }
+}
+
+/// CPU-driven Opus complexity controller (MASTER.md §3.5): an EMA of encode time per frame,
+/// dropping complexity fast under load and only raising it back after a sustained quiet spell.
+pub struct Complexity {
+    level: u8,
+    ema_us: f32,
+    hold: u32,
+}
+
+const COMPLEXITY_HOLD_FRAMES: u32 = 500; // ~5 s of 10 ms frames
+
+impl Default for Complexity {
+    fn default() -> Self {
+        Complexity { level: 5, ema_us: 0.0, hold: 0 }
+    }
+}
+
+impl Complexity {
+    /// Feeds one frame's encode time (µs). Returns the new level when it changes.
+    pub fn on_encode(&mut self, us: f32) -> Option<u8> {
+        self.ema_us += 0.05 * (us - self.ema_us);
+        if self.ema_us > 1500.0 {
+            self.hold = 0;
+            if self.level > 0 {
+                self.level -= 1;
+                return Some(self.level);
+            }
+        } else if self.ema_us < 300.0 {
+            self.hold += 1;
+            if self.hold >= COMPLEXITY_HOLD_FRAMES {
+                self.hold = 0;
+                if self.level < 5 {
+                    self.level += 1;
+                    return Some(self.level);
+                }
+            }
+        } else {
+            self.hold = 0;
+        }
+        None
+    }
+}
+
 /// Streaming linear resampler for interleaved audio, state carried across calls.
 // ponytail: linear resampler, swap for a windowed-sinc (rubato) if aliasing is audible
 pub struct Resampler {
@@ -390,6 +475,63 @@ mod tests {
             j.push(10_000); // 10 s of smooth packets ages the spike out
         }
         assert_eq!(j.push(10_000), 0);
+    }
+
+    #[test]
+    fn rate_control() {
+        let mut r = RateControl::new(64_000);
+        assert_eq!(r.on_report(0, 0, 0), (64_000, 0), "zero-packet report is a no-op");
+        // a lossy report cuts x0.7 off the ceiling-starting bitrate
+        let (bitrate, loss) = r.on_report(90, 10, 0); // 10% loss
+        assert_eq!(bitrate, 44_800);
+        assert_eq!(loss, 10);
+        // clean reports then ramp back up by 8k, clamped at the ceiling
+        assert_eq!(r.on_report(100, 0, 0), (52_800, 0));
+        assert_eq!(r.on_report(100, 0, 0), (60_800, 0));
+        for _ in 0..10 {
+            r.on_report(100, 0, 0);
+        }
+        assert_eq!(r.on_report(100, 0, 0), (64_000, 0), "stops at the ceiling");
+        // underruns cut even with clean loss
+        let (bitrate, _) = r.on_report(100, 0, 1);
+        assert_eq!(bitrate, 64_000 * 7 / 10);
+        // floor holds
+        let mut r = RateControl::new(8_000);
+        for _ in 0..5 {
+            r.on_report(0, 100, 0);
+        }
+        assert_eq!(r.on_report(0, 100, 0).0, 8_000);
+        // loss_perc clamps to 30
+        let mut r = RateControl::new(64_000);
+        assert_eq!(r.on_report(1, 99, 0).1, 30);
+        // ceiling change (M5: applied by restarting the link with a fresh controller) clamps
+        assert_eq!(RateControl::new(96_000).on_report(0, 0, 0).0, 96_000);
+        assert_eq!(RateControl::new(16_000).on_report(0, 0, 0).0, 16_000, "starting bitrate is the new ceiling");
+    }
+
+    #[test]
+    fn complexity_control() {
+        let mut c = Complexity::default();
+        // sustained high encode time steps all the way down to 0
+        for _ in 0..400 {
+            c.on_encode(3000.0);
+        }
+        assert_eq!(c.level, 0);
+        // let the EMA decay well under the 300 us threshold, then start the hold count fresh
+        for _ in 0..80 {
+            c.on_encode(50.0);
+        }
+        c.hold = 0;
+        // sustained low time doesn't move it until the hold period elapses
+        for _ in 0..COMPLEXITY_HOLD_FRAMES - 1 {
+            assert_eq!(c.on_encode(50.0), None);
+        }
+        assert_eq!(c.on_encode(50.0), Some(1), "steps up only after the hold period");
+        // never rises above 5
+        for _ in 0..COMPLEXITY_HOLD_FRAMES * 20 {
+            c.on_encode(50.0);
+        }
+        assert_eq!(c.level, 5);
     }
 
     #[test]
