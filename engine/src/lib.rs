@@ -286,7 +286,8 @@ fn build_input(dev: &cpal::Device, cfg: &Config, sock: UdpSocket, shared: Arc<Sh
 struct Playback {
     cons: HeapCons<f32>,
     plan: Playout,
-    rs: Option<Resampler>,
+    rs: Resampler, // 48 kHz -> device rate, speed nudged by the drift controller
+    base_step: f64,
     scratch: Vec<f32>, // 48 kHz stereo pulled from the ring
     staged: Vec<f32>,  // device-rate stereo waiting to be written
     dev_ch: usize,
@@ -300,30 +301,27 @@ impl Playback {
         self.shared.buffer_ms.store(fill_ms.to_bits(), Relaxed);
         while self.staged.len() / 2 < frames {
             let missing = frames - self.staged.len() / 2;
-            let need = self.rs.as_ref().map_or(missing, |r| (missing as f64 * r.step).ceil() as usize + 1);
+            let avail = self.cons.occupied_len() / 2;
             self.scratch.clear();
-            self.scratch.resize(need * 2, 0.0);
-            match self.plan.plan(self.cons.occupied_len() / 2, need) {
-                Plan::Silence { underrun } => {
-                    if underrun {
-                        self.shared.c.underruns.fetch_add(1, Relaxed);
+            let base_need = (missing as f64 * self.base_step).ceil() as usize + 1;
+            match self.plan.plan(avail, base_need) {
+                Plan::Play { discard, ratio } => {
+                    self.rs.step = self.base_step * ratio;
+                    let need = (missing as f64 * self.rs.step).ceil() as usize + 1;
+                    if avail - discard >= need {
+                        self.cons.skip(discard * 2);
+                        self.scratch.resize(need * 2, 0.0);
+                        self.cons.pop_slice(&mut self.scratch);
+                        self.rs.process(&self.scratch, &mut self.staged);
+                        continue;
                     }
+                    self.plan.underrun();
+                    self.shared.c.underruns.fetch_add(1, Relaxed);
                 }
-                Plan::Play { discard, consume } => {
-                    self.cons.skip(discard * 2);
-                    let got = self.cons.pop_slice(&mut self.scratch[..consume.min(need) * 2]) / 2;
-                    if consume < need && got > 0 {
-                        // duplicate the last frame to stretch by one sample
-                        self.scratch.copy_within((got - 1) * 2..got * 2, got * 2);
-                    } else if consume > need {
-                        self.cons.skip(2); // drop one frame
-                    }
-                }
+                Plan::Silence => {}
             }
-            match self.rs.as_mut() {
-                Some(rs) => rs.process(&self.scratch, &mut self.staged),
-                None => self.staged.extend_from_slice(&self.scratch),
-            }
+            // silence goes straight to the device, bypassing the resampler
+            self.staged.resize(frames * 2, 0.0);
         }
         meter(&self.shared.out_peak, &self.staged[..frames * 2]);
         let target_ms = self.plan.target as f32 * 1000.0 / RATE as f32;
@@ -353,7 +351,8 @@ fn build_output(dev: &cpal::Device, cons: HeapCons<f32>, shared: Arc<Shared>) ->
     let mut pb = Playback {
         cons,
         plan: Playout::default(),
-        rs: (rate != RATE).then(|| Resampler::new(RATE, rate, 2)),
+        rs: Resampler::new(RATE, rate, 2),
+        base_step: RATE as f64 / rate as f64,
         scratch: Vec::with_capacity(TARGET * 40),
         staged: Vec::with_capacity(TARGET * 40),
         dev_ch: sc.channels() as usize,

@@ -131,71 +131,79 @@ impl Rx {
     }
 }
 
-pub const TARGET: usize = RATE as usize / 50; // 20 ms in frames: starting / minimum target
-const BAND: usize = RATE as usize / 200; // 5 ms
-const HEADROOM: usize = RATE as usize / 10; // fill beyond target + 100 ms is discarded
+pub const TARGET: usize = RATE as usize / 100; // 10 ms: starting / minimum cushion
+const HEADROOM: usize = RATE as usize / 10; // fill beyond need + target + 100 ms is discarded
 const GROW: usize = RATE as usize / 100; // +10 ms target per underrun
 const SHRINK: usize = RATE as usize / 1000; // -1 ms target ...
 const RELAX: usize = RATE as usize * 10; // ... per 10 s of clean playback
 const MAX_TARGET: usize = RATE as usize / 8; // 125 ms
+const WINDOW: usize = RATE as usize / 2; // low-water mark measured over 0.5 s
+const TAU: f32 = 2.0 * RATE as f32; // drift controller: remove a cushion error over ~2 s ...
+const MAX_ADJ: f32 = 0.02; // ... playing at most 2% fast/slow (inaudible)
 
 #[derive(Debug, PartialEq)]
 pub enum Plan {
-    /// Output silence; `underrun` is true when playback just ran dry.
-    Silence { underrun: bool },
-    /// Drop `discard` frames, then pop `consume` frames and stretch/squash them to the requested length.
-    Play { discard: usize, consume: usize },
+    /// Output silence while prebuffering.
+    Silence,
+    /// Drop `discard` frames, then play at `ratio` × normal speed (resampled, so no clicks).
+    Play { discard: usize, ratio: f64 },
 }
 
 /// Jitter/drift controller for the playback ring. All counts are 48 kHz frames.
-/// Raw fill swings by a whole packet (10 ms) on every arrival, so drift decisions use a
-/// smoothed fill (~1 s time constant at 10 ms callbacks); only real clock drift moves it.
-/// The target adapts to the link: each underrun (bursty sender, Wi-Fi) adds 10 ms, and it
-/// creeps back down while playback stays clean.
+///
+/// The "cushion" is what is left in the ring after a callback takes its frames. Packets
+/// arrive in 10 ms steps (more on bursty links), so the fill is a sawtooth; the controller
+/// steers the sawtooth's low point (min cushion over 0.5 s) to `target` by playing very
+/// slightly fast or slow, which also absorbs clock drift between machines. Each underrun
+/// adds 10 ms to the target; it creeps back down while playback stays clean.
 pub struct Playout {
     playing: bool,
-    avg: f32,
     pub target: usize,
     clean: usize,
+    low: usize,
+    span: usize,
+    adj: f32,
 }
 
 impl Default for Playout {
     fn default() -> Self {
-        Playout { playing: false, avg: 0.0, target: TARGET, clean: 0 }
+        Playout { playing: false, target: TARGET, clean: 0, low: usize::MAX, span: 0, adj: 0.0 }
     }
 }
 
 impl Playout {
+    /// `need`: 48 kHz frames the next callback will take from the ring.
     pub fn plan(&mut self, fill: usize, need: usize) -> Plan {
         let target = self.target;
-        let discard = fill.saturating_sub(target) * (fill > target + HEADROOM) as usize;
+        let excess = fill.saturating_sub(need + target);
+        let discard = excess * (excess > HEADROOM) as usize;
         let fill = fill - discard;
-        if !self.playing && fill < target {
-            return Plan::Silence { underrun: false };
+        if !self.playing && fill < need + target {
+            return Plan::Silence;
         }
         if !self.playing || discard > 0 {
-            self.avg = fill as f32;
-        }
-        self.avg += (fill as f32 - self.avg) * 0.01;
-        let consume = match self.avg as usize {
-            _ if need < 2 => need,
-            f if f > target + BAND => need + 1,
-            f if f < target - BAND => need - 1,
-            _ => need,
-        };
-        if fill < consume {
-            self.playing = false;
-            self.target = (target + GROW).min(MAX_TARGET);
-            self.clean = 0;
-            return Plan::Silence { underrun: true };
+            (self.low, self.span, self.adj) = (usize::MAX, 0, 0.0);
         }
         self.playing = true;
+        self.low = self.low.min(fill.saturating_sub(need));
+        self.span += need;
+        if self.span >= WINDOW {
+            self.adj = ((self.low as f32 - target as f32) / TAU).clamp(-MAX_ADJ, MAX_ADJ);
+            (self.low, self.span) = (usize::MAX, 0);
+        }
         self.clean += need;
         if self.clean >= RELAX {
             self.target = (target - SHRINK).max(TARGET);
             self.clean = 0;
         }
-        Plan::Play { discard, consume }
+        Plan::Play { discard, ratio: 1.0 + self.adj as f64 }
+    }
+
+    /// The ring ran dry mid-playback: re-prebuffer against a deeper target.
+    pub fn underrun(&mut self) {
+        self.playing = false;
+        self.target = (self.target + GROW).min(MAX_TARGET);
+        self.clean = 0;
     }
 }
 
@@ -265,25 +273,32 @@ mod tests {
     #[test]
     fn drift_controller() {
         let mut p = Playout::default();
-        assert_eq!(p.plan(TARGET - 1, 480), Plan::Silence { underrun: false }); // prebuffering
-        assert_eq!(p.plan(TARGET, 480), Plan::Play { discard: 0, consume: 480 });
-        // one packet of jitter must not trigger a correction
-        assert_eq!(p.plan(TARGET + 480, 480), Plan::Play { discard: 0, consume: 480 });
-        // a sustained offset (clock drift) does
-        let last = (0..500).map(|_| p.plan(TARGET + BAND * 2, 240)).last().unwrap();
-        assert_eq!(last, Plan::Play { discard: 0, consume: 241 });
-        let last = (0..500).map(|_| p.plan(TARGET - BAND * 2, 240)).last().unwrap();
-        assert_eq!(last, Plan::Play { discard: 0, consume: 239 });
-        let over = TARGET + HEADROOM + 10;
-        assert_eq!(p.plan(over, 480), Plan::Play { discard: over - TARGET, consume: 480 });
-        assert_eq!(p.plan(300, 480), Plan::Silence { underrun: true });
-        // the underrun grew the target: prebuffer now waits for 30 ms
+        let ratio = |plan| match plan {
+            Plan::Play { ratio, .. } => ratio,
+            other => panic!("expected Play, got {other:?}"),
+        };
+        let n = 480; // 10 ms callbacks
+        assert_eq!(p.plan(n + TARGET - 1, n), Plan::Silence); // prebuffering
+        assert_eq!(p.plan(n + TARGET, n), Plan::Play { discard: 0, ratio: 1.0 });
+        // low point held on target: normal speed
+        let r = (0..200).map(|i| ratio(p.plan(n + TARGET + (i % 2) * n, n))).last().unwrap();
+        assert!((r - 1.0).abs() < 1e-6, "{r}");
+        // cushion never dips (sender clock fast, excess piling up): play faster, bounded
+        let fast = (0..200).map(|_| ratio(p.plan(n + TARGET + 960, n))).last().unwrap();
+        assert!(fast > 1.004 && fast <= 1.02, "{fast}");
+        // cushion running thin (sender clock slow): play slower, bounded
+        let slow = (0..200).map(|_| ratio(p.plan(n + TARGET / 2, n))).last().unwrap();
+        assert!((0.98..1.0).contains(&slow), "{slow}");
+        let over = n + TARGET + HEADROOM + 10;
+        assert!(matches!(p.plan(over, n), Plan::Play { discard, .. } if discard == HEADROOM + 10));
+        // an underrun grows the target: prebuffer now waits for a 20 ms cushion
+        p.underrun();
         assert_eq!(p.target, TARGET + GROW);
-        assert_eq!(p.plan(TARGET, 480), Plan::Silence { underrun: false });
-        assert_eq!(p.plan(TARGET + GROW, 480), Plan::Play { discard: 0, consume: 480 });
+        assert_eq!(p.plan(n + TARGET, n), Plan::Silence);
+        ratio(p.plan(n + TARGET + GROW, n));
         // 10 s of clean playback gives 1 ms back
-        for _ in 0..RELAX / 480 {
-            p.plan(TARGET + GROW, 480);
+        for _ in 0..RELAX / n {
+            p.plan(n + TARGET + GROW, n);
         }
         assert_eq!(p.target, TARGET + GROW - SHRINK);
     }

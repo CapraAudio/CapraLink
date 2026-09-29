@@ -97,8 +97,7 @@ A node runs one **TX** stream and one **RX** stream. Which devices they use is c
   accumulate 10 ms frames → Opus encode (complexity 5, FEC on) → UDP send. All in the callback.
 - **RX:** recv thread → packet seq gap? decode next packet's FEC for the missing one, else PLC →
   decode → push PCM into lock-free ring. Playback callback pulls from the ring.
-- **Jitter/clock drift:** adaptive ring target, starts 20 ms, +10 ms per underrun (max 125 ms), −1 ms per 10 s clean. Capture requests 10 ms device buffers when the range allows.
-  (orig) ring target fill 20 ms. Underrun → silence + re-prebuffer.
+- **Jitter/clock drift:** controller steers the ring's low-water cushion (min over 0.5 s, after the callback's take) to an adaptive target: 10 ms start, +10 ms per underrun (max 125 ms), −1 ms per 10 s clean. Drift is absorbed by resampling playback ±≤2% (P-control, τ≈2 s) — no sample skip/dup. Capture requests 10 ms device buffers when the range allows. Underrun → silence + re-prebuffer.
   Fill drifting beyond ±5 ms of target → skip/duplicate single samples (inaudible), which
   absorbs clock-rate differences between machines.
 - **Packet (M1, unencrypted):** `magic u16 | version u8 | channels u8 | seq u32 | opus bytes`.
@@ -185,6 +184,7 @@ See `HANDOFF.md` → "Pending owner actions" for the live list. Answers get move
 | Date | Change |
 |---|---|
 | 2026-09-29 | Project started. Master plan written. No Rust toolchain on the Mac yet. |
+| 2026-09-29 | Two-machine tuning (Mac↔Linux): mic permission fix (.app + usage string); Linux ALSA 40 ms bursts → 10 ms capture buffers (0 underruns); ~0.3% clock drift → resampling drift control on low-water cushion. Stats gained levels, target, tx/rx gaps. |
 | 2026-09-29 | M0 tray app landed (Tauri 2.12, single main.rs + ui/index.html). Idle in tray: 0% CPU, 21 MB phys footprint (RSS 84 MB incl. shared WebKit). Window visual check pending owner. |
 | 2026-09-29 | M1 engine landed: cpal 0.18 + opus 0.4 (static libopus via cmake) + ringbuf. Loopback: 0 loss, 0 underruns, 18 MB RSS, 0.2% CPU. Drift controller smoothed (EMA) to avoid per-callback skip/dup. CI added. |
 | 2026-09-29 | Owner answered round 1: D3, D4, D7, D8 recorded. |
