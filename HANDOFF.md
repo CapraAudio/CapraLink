@@ -3,6 +3,7 @@
 Read `MASTER.md` first. This file is the live position.
 
 ## Current position
+- Linux tray app (owner request 2026-09-29): CI now builds AppImage/deb/rpm (app/, npx @tauri-apps/cli@2); single-instance plugin added. Pending owner test on Linux (distro? GNOME needs AppIndicator extension for tray).
 - Phase: M0 + M1 done and owner-validated (Mac↔Linux, no clicks). M2 code committed + verified locally (MASTER §3.3). Owner test 2026-09-29: discovery + PIN pairing Mac(app)↔Linux(capralinkd) WORKS. Connect/audio/disconnect verified → M2 DONE. Linux needs new capralinkd (v1/v2 packets incompatible). Config dir override: $CAPRALINK_CONFIG_DIR. Now: M3 virtual devices (Linux first).
 
 ## Machine facts

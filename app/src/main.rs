@@ -84,6 +84,8 @@ fn show_window(app: &AppHandle) {
 
 fn main() {
     tauri::Builder::default()
+        // a second launch (no tray on stock GNOME, Start menu on Windows) brings this window back
+        .plugin(tauri_plugin_single_instance::init(|app, _, _| show_window(app)))
         .manage(App(Node::start(None, 47800, true).map_err(|e| format!("{e:#}"))))
         .invoke_handler(tauri::generate_handler![devices, state, pair, connect, disconnect, forget, set_settings])
         .setup(|app| {
