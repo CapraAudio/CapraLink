@@ -15,6 +15,13 @@ Read `MASTER.md` first. This file is the live position.
 ## Pending owner actions / questions
 1. Two-machine test: Mac runs target/release/capralink; PC runs capralinkd from CI artifacts (https://github.com/CapraAudio/CapraLink/actions/runs/36612019404). Owner reports sound/latency/stats + window layout.
 
+## Owner test results (2026-09-29, Mac app ↔ Linux capralinkd)
+- Linux mic → Mac headphones: WORKS, latency "not much at all".
+- Mac mic → Linux speakers: SILENT. Suspect macOS mic permission (app launched from a terminal → TCC attributes to the terminal's host app; unbundled binary has no NSMicrophoneUsageDescription → silence).
+- Occasional slight click. Cause unknown (underrun vs drift skip/dup vs resampler) — need stats.
+- Mac window: stats line + error text cut off at bottom (body fixed 540px, overflow hidden).
+- Fixes in progress: level meters in stats, window layout, bundled .app with mic usage string.
+
 ## Next step
 Verify engine build/tests, commit, then build app/ (Tauri tray) against the engine API, add CI.
 
