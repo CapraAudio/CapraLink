@@ -27,4 +27,5 @@ Read `MASTER.md` first. This file is the live position.
 Verify engine build/tests, commit, then build app/ (Tauri tray) against the engine API, add CI.
 
 ## In flight (2026-09-29)
+- M3-Linux (engine/app, Opus agent) and M3-macOS driver (drivers/macos/, Opus agent) running in parallel per MASTER §3.4. Uncommitted until verified. Owner must test Linux devices + run sudo install on Mac.
 If a session resumes and these are missing, re-run them from MASTER §3.2 / §6.
