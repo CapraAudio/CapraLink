@@ -69,6 +69,8 @@ pub struct Stats {
     pub fec_recovered: u64,
     pub underruns: u64,
     pub buffer_ms: f32,
+    /// Current adaptive playout target; grows when the link is bursty.
+    pub target_ms: f32,
     /// Peak sample (0..1) captured / played since the previous `stats()` call.
     pub in_peak: f32,
     pub out_peak: f32,
@@ -78,6 +80,7 @@ pub struct Stats {
 struct Shared {
     c: Counters,
     buffer_ms: AtomicU32, // f32 bits
+    target_ms: AtomicU32, // f32 bits
     in_peak: AtomicU32,   // f32 bits, reset on read
     out_peak: AtomicU32,  // f32 bits, reset on read
     rx_channels: AtomicU8,
@@ -141,6 +144,7 @@ impl Link {
             fec_recovered: c.fec_recovered.load(Relaxed),
             underruns: c.underruns.load(Relaxed),
             buffer_ms: f32::from_bits(self.shared.buffer_ms.load(Relaxed)),
+            target_ms: f32::from_bits(self.shared.target_ms.load(Relaxed)),
             in_peak: f32::from_bits(self.shared.in_peak.swap(0, Relaxed)),
             out_peak: f32::from_bits(self.shared.out_peak.swap(0, Relaxed)),
         }
@@ -244,7 +248,12 @@ fn build_input(dev: &cpal::Device, cfg: &Config, sock: UdpSocket, shared: Arc<Sh
         frame: Vec::with_capacity(FRAME * ch),
         shared,
     };
-    let c = sc.config();
+    let mut c = sc.config();
+    // Ask for 10 ms capture buffers so packets leave evenly instead of in bursts
+    // (ALSA/PipeWire default to ~40 ms periods, which forces a deeper jitter buffer on the peer).
+    if let cpal::SupportedBufferSize::Range { min, max } = *sc.buffer_size() {
+        c.buffer_size = cpal::BufferSize::Fixed((rate / 100).clamp(min, max));
+    }
     Ok(match fmt {
         SampleFormat::F32 => dev.build_input_stream(c, move |d: &[f32], _: &_| tx.process(d), err_cb, None)?,
         SampleFormat::I16 => dev.build_input_stream(c, move |d: &[i16], _: &_| tx.process(d), err_cb, None)?,
@@ -297,6 +306,8 @@ impl Playback {
             }
         }
         meter(&self.shared.out_peak, &self.staged[..frames * 2]);
+        let target_ms = self.plan.target as f32 * 1000.0 / RATE as f32;
+        self.shared.target_ms.store(target_ms.to_bits(), Relaxed);
         let mono = self.shared.rx_channels.load(Relaxed) == 1;
         for (f, s) in out.chunks_exact_mut(self.dev_ch).zip(self.staged.as_chunks::<2>().0) {
             if self.dev_ch == 1 {

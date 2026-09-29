@@ -97,7 +97,8 @@ A node runs one **TX** stream and one **RX** stream. Which devices they use is c
   accumulate 10 ms frames → Opus encode (complexity 5, FEC on) → UDP send. All in the callback.
 - **RX:** recv thread → packet seq gap? decode next packet's FEC for the missing one, else PLC →
   decode → push PCM into lock-free ring. Playback callback pulls from the ring.
-- **Jitter/clock drift:** ring target fill 20 ms. Underrun → silence + re-prebuffer.
+- **Jitter/clock drift:** adaptive ring target, starts 20 ms, +10 ms per underrun (max 125 ms), −1 ms per 10 s clean. Capture requests 10 ms device buffers when the range allows.
+  (orig) ring target fill 20 ms. Underrun → silence + re-prebuffer.
   Fill drifting beyond ±5 ms of target → skip/duplicate single samples (inaudible), which
   absorbs clock-rate differences between machines.
 - **Packet (M1, unencrypted):** `magic u16 | version u8 | channels u8 | seq u32 | opus bytes`.
