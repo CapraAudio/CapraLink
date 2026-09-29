@@ -3,7 +3,7 @@
 Read `MASTER.md` first. This file is the live position.
 
 ## Current position
-- Linux tray app (owner request 2026-09-29): CI now builds AppImage/deb/rpm (app/, npx @tauri-apps/cli@2); single-instance plugin added. Pending owner test on Linux (distro? GNOME needs AppIndicator extension for tray).
+- Linux tray app (owner request 2026-09-29): CI now builds AppImage/deb/rpm (app/, npx @tauri-apps/cli@2); single-instance plugin added. Owner's Linux = SteamOS (KDE desktop mode, read-only root → use AppImage). Pending owner test. Game Mode needs M6 service.
 - Phase: M0 + M1 done and owner-validated (Mac↔Linux, no clicks). M2 code committed + verified locally (MASTER §3.3). Owner test 2026-09-29: discovery + PIN pairing Mac(app)↔Linux(capralinkd) WORKS. Connect/audio/disconnect verified → M2 DONE. Linux needs new capralinkd (v1/v2 packets incompatible). Config dir override: $CAPRALINK_CONFIG_DIR. Now: M3 virtual devices (Linux first).
 
 ## Machine facts
@@ -14,7 +14,7 @@ Read `MASTER.md` first. This file is the live position.
 - Test machines: Windows 10/11 PC and PipeWire Linux PC on the LAN (D10).
 
 ## Pending owner actions / questions
-1. Two-machine test: Mac runs target/release/capralink; PC runs capralinkd from CI artifacts (latest: https://github.com/CapraAudio/CapraLink/actions/runs/36631810010). Owner reports sound/latency/stats + window layout.
+1. Two-machine test: Mac runs target/release/capralink; PC runs capralinkd from CI artifacts (latest: https://github.com/CapraAudio/CapraLink/actions/runs/36637320052). Owner reports sound/latency/stats + window layout.
 
 ## Owner test results (2026-09-29, Mac app ↔ Linux capralinkd)
 - Linux mic → Mac headphones: WORKS, latency "not much at all".
