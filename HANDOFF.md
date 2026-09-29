@@ -3,7 +3,7 @@
 Read `MASTER.md` first. This file is the live position.
 
 ## Current position
-- Phase: M0 + M1 done and owner-validated (Mac↔Linux, no clicks). M2 code committed + verified locally (MASTER §3.3). Next: owner pairs Mac↔Linux from UI; Linux needs new capralinkd (v1/v2 packets incompatible). Config dir override: $CAPRALINK_CONFIG_DIR. Then M3 virtual devices.
+- Phase: M0 + M1 done and owner-validated (Mac↔Linux, no clicks). M2 code committed + verified locally (MASTER §3.3). Owner test 2026-09-29: discovery + PIN pairing Mac(app)↔Linux(capralinkd) WORKS. Pending: Connect + audio over encrypted link. Linux needs new capralinkd (v1/v2 packets incompatible). Config dir override: $CAPRALINK_CONFIG_DIR. Then M3 virtual devices.
 
 ## Machine facts
 - GitHub: private repo CapraAudio/CapraLink, branch main. Repo-local git identity set.
