@@ -11,10 +11,13 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - if: runner.os == 'Linux'
-        run: sudo apt-get update && sudo apt-get install -y libasound2-dev libwebkit2gtk-4.1-dev libayatana-appindicator3-dev librsvg2-dev libxdo-dev libssl-dev
+        run: sudo apt-get update && sudo apt-get install -y libasound2-dev libwebkit2gtk-4.1-dev libayatana-appindicator3-dev librsvg2-dev libxdo-dev libssl-dev libfuse2t64 rpm
       - uses: Swatinem/rust-cache@v2
       - run: cargo test --workspace
       - run: cargo build --release --workspace
+      - if: runner.os == 'Linux'
+        working-directory: app
+        run: npx --yes @tauri-apps/cli@2 build --bundles appimage,deb,rpm
       - uses: actions/upload-artifact@v4
         with:
           name: capralink-${{ runner.os }}
@@ -23,3 +26,6 @@ jobs:
             target/release/capralinkd.exe
             target/release/capralink
             target/release/capralink.exe
+            target/release/bundle/appimage/*.AppImage
+            target/release/bundle/deb/*.deb
+            target/release/bundle/rpm/*.rpm
