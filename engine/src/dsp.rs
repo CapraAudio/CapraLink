@@ -131,11 +131,12 @@ impl Rx {
     }
 }
 
-pub const TARGET: usize = RATE as usize / 100; // 10 ms: starting / minimum cushion
+pub const TARGET: usize = RATE as usize / 100; // 10 ms: minimum cushion
+const MARGIN: usize = RATE as usize / 200; // 5 ms on top of measured jitter
 const HEADROOM: usize = RATE as usize / 10; // fill beyond need + target + 100 ms is discarded
-const GROW: usize = RATE as usize / 100; // +10 ms target per underrun
-const SHRINK: usize = RATE as usize / 1000; // -1 ms target ...
-const RELAX: usize = RATE as usize * 10; // ... per 10 s of clean playback
+const GROW: usize = RATE as usize / 100; // +10 ms boost per underrun (spike jitter missed) ...
+const SHRINK: usize = RATE as usize / 1000; // ... fading 1 ms ...
+const RELAX: usize = RATE as usize; // ... per second of clean playback
 const MAX_TARGET: usize = RATE as usize / 8; // 125 ms
 const WINDOW: usize = RATE as usize / 2; // low-water mark measured over 0.5 s
 const TAU: f32 = 2.0 * RATE as f32; // drift controller: remove a cushion error over ~2 s ...
@@ -153,12 +154,13 @@ pub enum Plan {
 ///
 /// The "cushion" is what is left in the ring after a callback takes its frames. Packets
 /// arrive in 10 ms steps (more on bursty links), so the fill is a sawtooth; the controller
-/// steers the sawtooth's low point (min cushion over 0.5 s) to `target` by playing very
-/// slightly fast or slow, which also absorbs clock drift between machines. Each underrun
-/// adds 10 ms to the target; it creeps back down while playback stays clean.
+/// steers the sawtooth's low point (min cushion over 0.5 s) to `target()` by playing very
+/// slightly fast or slow, which also absorbs clock drift between machines. The target is
+/// sized from measured packet jitter (`set_jitter`); an underrun adds a boost that fades.
 pub struct Playout {
     playing: bool,
-    pub target: usize,
+    jitter: usize,
+    boost: usize,
     clean: usize,
     low: usize,
     span: usize,
@@ -167,14 +169,23 @@ pub struct Playout {
 
 impl Default for Playout {
     fn default() -> Self {
-        Playout { playing: false, target: TARGET, clean: 0, low: usize::MAX, span: 0, adj: 0.0 }
+        Playout { playing: false, jitter: 0, boost: 0, clean: 0, low: usize::MAX, span: 0, adj: 0.0 }
     }
 }
 
 impl Playout {
+    /// Worst recent packet lateness, in frames (from `Jitter`).
+    pub fn set_jitter(&mut self, frames: usize) {
+        self.jitter = frames;
+    }
+
+    pub fn target(&self) -> usize {
+        (TARGET.max(self.jitter + MARGIN) + self.boost).min(MAX_TARGET)
+    }
+
     /// `need`: 48 kHz frames the next callback will take from the ring.
     pub fn plan(&mut self, fill: usize, need: usize) -> Plan {
-        let target = self.target;
+        let target = self.target();
         let excess = fill.saturating_sub(need + target);
         let discard = excess * (excess > HEADROOM) as usize;
         let fill = fill - discard;
@@ -193,7 +204,7 @@ impl Playout {
         }
         self.clean += need;
         if self.clean >= RELAX {
-            self.target = (target - SHRINK).max(TARGET);
+            self.boost = self.boost.saturating_sub(SHRINK);
             self.clean = 0;
         }
         Plan::Play { discard, ratio: 1.0 + self.adj as f64 }
@@ -202,8 +213,31 @@ impl Playout {
     /// The ring ran dry mid-playback: re-prebuffer against a deeper target.
     pub fn underrun(&mut self) {
         self.playing = false;
-        self.target = (self.target + GROW).min(MAX_TARGET);
+        self.boost = (self.boost + GROW).min(MAX_TARGET);
         self.clean = 0;
+    }
+}
+
+/// Worst packet lateness (arrival gap beyond the 10 ms packet period) seen over the last
+/// 5–10 s, in µs: how much cushion the link needs to ride out its bursts.
+#[derive(Default)]
+pub struct Jitter {
+    cur: u32,
+    prev: u32,
+    elapsed: u32,
+}
+
+impl Jitter {
+    pub fn push(&mut self, gap_us: u32) -> u32 {
+        // a pause this long is a peer restart or a stopped stream, not jitter
+        if gap_us < 500_000 {
+            self.cur = self.cur.max(gap_us.saturating_sub(10_000));
+            self.elapsed += gap_us;
+            if self.elapsed >= 5_000_000 {
+                (self.prev, self.cur, self.elapsed) = (self.cur, 0, 0);
+            }
+        }
+        self.cur.max(self.prev)
     }
 }
 
@@ -291,16 +325,32 @@ mod tests {
         assert!((0.98..1.0).contains(&slow), "{slow}");
         let over = n + TARGET + HEADROOM + 10;
         assert!(matches!(p.plan(over, n), Plan::Play { discard, .. } if discard == HEADROOM + 10));
-        // an underrun grows the target: prebuffer now waits for a 20 ms cushion
+        // measured jitter sizes the target: 18 ms late packets -> 23 ms cushion
+        p.set_jitter(RATE as usize * 18 / 1000);
+        assert_eq!(p.target(), RATE as usize * 23 / 1000);
+        p.set_jitter(0);
+        // an underrun boosts the target: prebuffer now waits for a 20 ms cushion
         p.underrun();
-        assert_eq!(p.target, TARGET + GROW);
+        assert_eq!(p.target(), TARGET + GROW);
         assert_eq!(p.plan(n + TARGET, n), Plan::Silence);
         ratio(p.plan(n + TARGET + GROW, n));
-        // 10 s of clean playback gives 1 ms back
+        // each second of clean playback fades the boost by 1 ms
         for _ in 0..RELAX / n {
             p.plan(n + TARGET + GROW, n);
         }
-        assert_eq!(p.target, TARGET + GROW - SHRINK);
+        assert_eq!(p.target(), TARGET + GROW - SHRINK);
+    }
+
+    #[test]
+    fn jitter_window() {
+        let mut j = Jitter::default();
+        assert_eq!(j.push(10_000), 0); // on time
+        assert_eq!(j.push(28_000), 18_000); // 18 ms late
+        assert_eq!(j.push(3_000_000), 18_000); // restart pause ignored
+        for _ in 0..1000 {
+            j.push(10_000); // 10 s of smooth packets ages the spike out
+        }
+        assert_eq!(j.push(10_000), 0);
     }
 
     #[test]

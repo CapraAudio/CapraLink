@@ -97,7 +97,11 @@ A node runs one **TX** stream and one **RX** stream. Which devices they use is c
   accumulate 10 ms frames → Opus encode (complexity 5, FEC on) → UDP send. All in the callback.
 - **RX:** recv thread → packet seq gap? decode next packet's FEC for the missing one, else PLC →
   decode → push PCM into lock-free ring. Playback callback pulls from the ring.
-- **Jitter/clock drift:** controller steers the ring's low-water cushion (min over 0.5 s, after the callback's take) to an adaptive target: 10 ms start, +10 ms per underrun (max 125 ms), −1 ms per 10 s clean. Drift is absorbed by resampling playback ±≤2% (P-control, τ≈2 s) — no sample skip/dup. Capture requests 10 ms device buffers when the range allows. Underrun → silence + re-prebuffer.
+- **Jitter/clock drift:** controller steers the ring's low-water cushion (min over 0.5 s, after the
+  callback's take) to a target = max(10 ms, measured jitter + 5 ms) + underrun boost. Jitter = worst
+  packet lateness (arrival gap − 10 ms) over the last 5–10 s, measured in the RX thread. Underrun adds
+  a 10 ms boost that fades 1 ms/s. Drift absorbed by resampling playback ±≤2% (P-control, τ≈2 s) —
+  no sample skip/dup. Capture requests 10 ms device buffers when the range allows.
 - **Packet (M1, unencrypted):** `magic u16 | version u8 | channels u8 | seq u32 | opus bytes`.
   Encryption wraps this in M2.
 - Default UDP port 47800.

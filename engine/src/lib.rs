@@ -5,7 +5,7 @@ mod dsp;
 use anyhow::{anyhow, Context};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::{FromSample, Sample, SampleFormat, SizedSample};
-use dsp::{Counters, Packetizer, Plan, Playout, Resampler, Rx, FRAME, RATE, TARGET};
+use dsp::{Counters, Jitter, Packetizer, Plan, Playout, Resampler, Rx, FRAME, RATE, TARGET};
 use ringbuf::traits::{Consumer, Observer, Producer, Split};
 use ringbuf::{HeapCons, HeapRb};
 use std::net::{SocketAddr, UdpSocket};
@@ -90,6 +90,7 @@ struct Shared {
     rx_channels: AtomicU8,
     tx_gap_us: AtomicU32, // reset on read
     rx_gap_us: AtomicU32, // reset on read
+    jitter_us: AtomicU32, // worst recent packet lateness
 }
 
 /// A running TX + RX link. Dropping it stops everything.
@@ -124,14 +125,15 @@ impl Link {
         let rx = {
             let (shared, stop) = (shared.clone(), stop.clone());
             std::thread::Builder::new().name("capralink-rx".into()).spawn(move || {
-                let (mut rx, mut buf, mut last) = (Rx::default(), [0u8; 2048], None);
+                let (mut rx, mut buf, mut last, mut jitter) = (Rx::default(), [0u8; 2048], None, Jitter::default());
                 while !stop.load(Relaxed) {
                     // Errors are timeouts (checked above) or transient (e.g. ICMP resets on Windows).
                     let Ok((n, _)) = sock.recv_from(&mut buf) else { continue };
                     if let Some(ch) = rx.handle(&buf[..n], &shared.c, &mut |pcm: &[f32]| {
                         prod.push_slice(pcm);
                     }) {
-                        gap(&mut last, &shared.rx_gap_us);
+                        let g = gap(&mut last, &shared.rx_gap_us);
+                        shared.jitter_us.store(jitter.push(g), Relaxed);
                         shared.rx_channels.store(ch, Relaxed);
                     }
                 }
@@ -179,11 +181,12 @@ fn pick_config(def: cpal::SupportedStreamConfig, mut all: impl Iterator<Item = c
 }
 
 /// Records the time since `last` into a reset-on-read max-gap meter.
-fn gap(last: &mut Option<Instant>, max_us: &AtomicU32) {
+/// Returns the gap in µs (0 for the first call).
+fn gap(last: &mut Option<Instant>, max_us: &AtomicU32) -> u32 {
     let now = Instant::now();
-    if let Some(prev) = last.replace(now) {
-        max_us.fetch_max((now - prev).as_micros() as u32, Relaxed);
-    }
+    let us = last.replace(now).map_or(0, |prev| (now - prev).as_micros() as u32);
+    max_us.fetch_max(us, Relaxed);
+    us
 }
 
 /// Raises a reset-on-read peak meter. Positive f32 bit patterns order like the floats.
@@ -304,6 +307,7 @@ impl Playback {
             let avail = self.cons.occupied_len() / 2;
             self.scratch.clear();
             let base_need = (missing as f64 * self.base_step).ceil() as usize + 1;
+            self.plan.set_jitter(self.shared.jitter_us.load(Relaxed) as usize * RATE as usize / 1_000_000);
             match self.plan.plan(avail, base_need) {
                 Plan::Play { discard, ratio } => {
                     self.rs.step = self.base_step * ratio;
@@ -324,7 +328,7 @@ impl Playback {
             self.staged.resize(frames * 2, 0.0);
         }
         meter(&self.shared.out_peak, &self.staged[..frames * 2]);
-        let target_ms = self.plan.target as f32 * 1000.0 / RATE as f32;
+        let target_ms = self.plan.target() as f32 * 1000.0 / RATE as f32;
         self.shared.target_ms.store(target_ms.to_bits(), Relaxed);
         let mono = self.shared.rx_channels.load(Relaxed) == 1;
         for (f, s) in out.chunks_exact_mut(self.dev_ch).zip(self.staged.as_chunks::<2>().0) {
