@@ -224,6 +224,7 @@ Music Mode when **either** side has it on (both directions switch together — o
 | Bitrate floor on bad network | 8 kbps (AIMD) | same — stay smooth (owner choice) |
 | Encoder complexity max | 5 | 10, same CPU back-off under load |
 | Receive cushion minimum | 10 ms | 40 ms (+30 ms; owner accepted +40–60 ms total) |
+| Playback speed correction (drift/cushion) | ≤ 2% | ≤ 0.5% (music is pitch-sensitive; owner heard 2% as "slower") |
 | Cushion ceiling / stall memory / step per hiccup | 125 ms / 5–10 s / +10 ms | 300 ms / 30–60 s / +30 ms (owner: prefer more delay over touching Wi-Fi settings; Deck Wi-Fi stalls 100–150 ms every ~12 s) |
 
 **Signalling:** a new control message `{"type":"mode","music":bool}` sent at session start and whenever
@@ -323,6 +324,7 @@ See `HANDOFF.md` → "Pending owner actions" for the live list. Answers get move
 | Date | Change |
 |---|---|
 | 2026-09-29 | Project started. Master plan written. No Rust toolchain on the Mac yet. |
+| 2026-09-29 | Music sounded slow: cushion refills played up to 2% slow → capped at 0.5% in Music Mode. Wi-Fi at the time: stalls 548–892 ms, 15 lost packets. |
 | 2026-09-29 | UI polish: status pill just Streaming/Idle; VU gradient blends green→yellow→red; window auto-fits content height (self-correcting for title bar); tray double-click (Windows). |
 | 2026-09-29 | Music Mode field test: occasional hiccups = Deck Wi-Fi stalls 100–150 ms every ~12 s (iwd re-enables power save; owner declined iwd config). Music Mode buffer now remembers stalls 30–60 s, ceiling 300 ms, +30 ms per hiccup. |
 | 2026-09-29 | Music Mode landed (D15): live link-wide switch via `mode` message, encoder rebuilt in-callback with continuing seq, 20 ms/stereo/160k/cx10, 40 ms min cushion; tray check item. Encode cost 0.65% of a core (vs 0.23% normal). 22 tests. Known: old remote configurers reset music_mode on save; no FEC at music bitrates. |

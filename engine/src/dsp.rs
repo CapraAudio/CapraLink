@@ -235,7 +235,10 @@ pub const JITTER_WINDOW_US: u32 = 5_000_000; // stall memory 5–10 s ...
 pub const MUSIC_JITTER_WINDOW_US: u32 = 30_000_000; // ... 30–60 s in Music Mode
 const WINDOW: usize = RATE as usize / 2; // low-water mark measured over 0.5 s
 const TAU: f32 = 2.0 * RATE as f32; // drift controller: remove a cushion error over ~2 s ...
-const MAX_ADJ: f32 = 0.02; // ... playing at most 2% fast/slow (inaudible)
+const MAX_ADJ: f32 = 0.02; // ... playing at most 2% fast/slow (inaudible on speech)
+// Music is pitch-sensitive: 2% is ~1/3 semitone. 0.5% (~9 cents) is below most listeners'
+// threshold and still covers real clock drift between machines (~0.3% measured).
+const MUSIC_MAX_ADJ: f32 = 0.005;
 
 #[derive(Debug, PartialEq)]
 pub enum Plan {
@@ -256,6 +259,7 @@ pub struct Playout {
     min: usize,
     max: usize,
     grow: usize,
+    max_adj: f32,
     playing: bool,
     jitter: usize,
     boost: usize,
@@ -267,7 +271,7 @@ pub struct Playout {
 
 impl Default for Playout {
     fn default() -> Self {
-        Playout { min: TARGET, max: MAX_TARGET, grow: GROW, playing: false, jitter: 0, boost: 0, clean: 0, low: usize::MAX, span: 0, adj: 0.0 }
+        Playout { min: TARGET, max: MAX_TARGET, grow: GROW, max_adj: MAX_ADJ, playing: false, jitter: 0, boost: 0, clean: 0, low: usize::MAX, span: 0, adj: 0.0 }
     }
 }
 
@@ -278,9 +282,10 @@ impl Playout {
     }
 
     /// Normal: 10 ms minimum, 125 ms ceiling, +10 ms per underrun.
-    /// Music Mode: 40 ms minimum, 300 ms ceiling, +30 ms per underrun.
+    /// Music Mode: 40 ms minimum, 300 ms ceiling, +30 ms per underrun, speed change ≤ 0.5%.
     pub fn set_music(&mut self, music: bool) {
-        (self.min, self.max, self.grow) = if music { (MUSIC_TARGET, MUSIC_MAX_TARGET, MUSIC_GROW) } else { (TARGET, MAX_TARGET, GROW) };
+        (self.min, self.max, self.grow, self.max_adj) =
+            if music { (MUSIC_TARGET, MUSIC_MAX_TARGET, MUSIC_GROW, MUSIC_MAX_ADJ) } else { (TARGET, MAX_TARGET, GROW, MAX_ADJ) };
     }
 
     pub fn target(&self) -> usize {
@@ -303,7 +308,7 @@ impl Playout {
         self.low = self.low.min(fill.saturating_sub(need));
         self.span += need;
         if self.span >= WINDOW {
-            self.adj = ((self.low as f32 - target as f32) / TAU).clamp(-MAX_ADJ, MAX_ADJ);
+            self.adj = ((self.low as f32 - target as f32) / TAU).clamp(-self.max_adj, self.max_adj);
             (self.low, self.span) = (usize::MAX, 0);
         }
         self.clean += need;
@@ -563,6 +568,12 @@ mod tests {
             j.push(20_000, 20_000, MUSIC_JITTER_WINDOW_US); // 30 s
         }
         assert_eq!(j.push(20_000, 20_000, MUSIC_JITTER_WINDOW_US), 130_000);
+        // cushion far below target: Music Mode slows by at most 0.5% (pitch-safe)
+        let mut m = Playout::default();
+        m.set_music(true);
+        assert!(matches!(m.plan(480 + MUSIC_TARGET, 480), Plan::Play { .. }), "starts once 40 ms is buffered");
+        let r = (0..200).map(|_| m.plan(480 + MUSIC_TARGET / 2, 480)).last().unwrap();
+        assert!(matches!(r, Plan::Play { ratio, .. } if (0.995..1.0).contains(&ratio)), "{r:?}");
         p.set_music(false);
         assert_eq!(p.target(), TARGET + MUSIC_GROW, "the stall boost carries over and fades as usual");
     }
