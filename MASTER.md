@@ -235,7 +235,7 @@ change and must size PLC/FEC to the incoming frame duration (10 or 20 ms).
 
 **UI:** "Music Mode" checkbox in the main window (next to Channels/Bitrate; the Mono/Stereo control and
 bitrate label show the forced values while it's on), in the remote Configure panel, and as a checkable
-item in the tray menu. Status pill shows "Streaming — <peer> · Music" when active.
+item in the tray menu. Status pill just says "Streaming" / "Idle" (owner request).
 
 ## 4. Feasibility notes (owner asked for honest feedback)
 

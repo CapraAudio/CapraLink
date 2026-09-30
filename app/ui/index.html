@@ -446,7 +446,7 @@ async function poll() {
   devices = st.devices;
   render();
   const peer = devices.find((d) => d.connected);
-  els.status.textContent = peer ? 'Streaming — ' + peer.name + (effectiveMusic ? ' · Music' : '') : 'Idle';
+  els.status.textContent = peer ? 'Streaming' : 'Idle';
   els.status.classList.toggle('on', !!peer);
   const s = st.stats;
   if (s) {
