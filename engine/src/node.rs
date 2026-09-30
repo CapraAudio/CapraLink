@@ -27,7 +27,7 @@ const REPORT: Duration = Duration::from_secs(1); // also doubles as the session 
 const DEAD: Duration = Duration::from_secs(15);
 const MAX_FAILURES: u32 = 5;
 
-#[derive(Serialize)]
+#[derive(Serialize, Deserialize)]
 pub struct NodeState {
     pub name: String,
     pub pin: String,
@@ -39,7 +39,7 @@ pub struct NodeState {
     pub virtual_error: Option<String>,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, Deserialize)]
 pub struct Device {
     pub id: String,
     pub name: String,
@@ -119,12 +119,9 @@ impl Node {
     /// Loads (or creates) the config, listens on TCP `port` (0 = any free port), and
     /// advertises + browses via mDNS when `mdns` is set. `None` = OS config dir.
     pub fn start(config_dir: Option<PathBuf>, port: u16, mdns: bool) -> Result<Node> {
-        let dir = match config_dir {
-            Some(d) => d,
-            None => dirs::config_dir().ok_or_else(|| anyhow!("no config directory"))?.join("CapraLink"),
-        };
+        let dir = config_dir_or_default(config_dir)?;
         let cfg = load(&dir)?;
-        let listener = TcpListener::bind(("0.0.0.0", port)).with_context(|| format!("port {port} is in use"))?;
+        let listener = TcpListener::bind(("0.0.0.0", port)).with_context(|| format!("port {port} is in use (is CapraLink already running?)"))?;
         let port = listener.local_addr()?.port();
         let (daemon, browse) = if mdns {
             let d = ServiceDaemon::new()?;
@@ -168,6 +165,10 @@ impl Node {
 
     pub fn port(&self) -> u16 {
         self.0.port
+    }
+
+    pub(crate) fn dir(&self) -> &Path {
+        &self.0.dir
     }
 
     fn st(&self) -> MutexGuard<'_, St> {
@@ -292,14 +293,20 @@ impl Node {
         save(&self.0.dir, &st.cfg)
     }
 
-    /// Saves the audio settings; a running link reconnects (fresh keys) to apply them.
+    /// Saves the settings; a running link reconnects (fresh keys) to apply audio changes.
+    /// A change to `service` installs/removes the login agent first.
     pub fn set_settings(&self, s: Settings) -> Result<()> {
         ensure!(matches!(s.channels, 1 | 2), "channels must be 1 or 2");
+        let old = self.st().cfg.settings.clone();
+        if old.service != s.service {
+            crate::rpc::login_agent(s.service).context("background service")?;
+        }
         let running = {
             let mut st = self.st();
+            let audio_changed = Settings { service: s.service, ..old } != s;
             st.cfg.settings = s;
             save(&self.0.dir, &st.cfg)?;
-            st.session.as_ref().map(|s| (s.peer_id.clone(), s.addr))
+            st.session.as_ref().filter(|_| audio_changed).map(|s| (s.peer_id.clone(), s.addr))
         };
         match running {
             Some((id, addr)) => self.connect_to(&id, &[addr]),
@@ -484,6 +491,14 @@ fn start_link(s: &Settings, port: u16, peer: SocketAddr, keys: &Keys) -> Result<
 
 // ---------- config ----------
 
+/// `None` = the OS config dir's CapraLink folder.
+pub(crate) fn config_dir_or_default(dir: Option<PathBuf>) -> Result<PathBuf> {
+    match dir {
+        Some(d) => Ok(d),
+        None => Ok(dirs::config_dir().ok_or_else(|| anyhow!("no config directory"))?.join("CapraLink")),
+    }
+}
+
 fn load(dir: &Path) -> Result<Config> {
     let path = dir.join("config.json");
     match std::fs::read(&path) {
@@ -504,18 +519,23 @@ fn load(dir: &Path) -> Result<Config> {
     }
 }
 
-/// Atomic write (temp file + rename); owner-only on Unix since it holds pairing secrets.
 fn save(dir: &Path, cfg: &Config) -> Result<()> {
+    write_private(dir, "config.json", &serde_json::to_vec_pretty(cfg)?).context("save config")
+}
+
+/// Atomic write (temp file + rename); owner-only on Unix since it holds secrets.
+pub(crate) fn write_private(dir: &Path, name: &str, data: &[u8]) -> Result<()> {
     std::fs::create_dir_all(dir)?;
-    let tmp = dir.join("config.json.tmp");
+    let tmp = dir.join(format!("{name}.tmp"));
     let mut o = std::fs::OpenOptions::new();
     o.write(true).create(true).truncate(true);
     #[cfg(unix)]
     std::os::unix::fs::OpenOptionsExt::mode(&mut o, 0o600);
     let mut f = o.open(&tmp)?;
-    f.write_all(&serde_json::to_vec_pretty(cfg)?)?;
+    f.write_all(data)?;
     f.sync_all()?;
-    std::fs::rename(&tmp, dir.join("config.json")).context("save config")
+    std::fs::rename(&tmp, dir.join(name))?;
+    Ok(())
 }
 
 fn add_peer(cfg: &mut Config, id: &str, name: &str, secret: &[u8; 32]) {
@@ -546,7 +566,7 @@ fn hostname() -> String {
 
 // ---------- crypto + wire ----------
 
-fn random<const N: usize>() -> [u8; N] {
+pub(crate) fn random<const N: usize>() -> [u8; N] {
     let mut b = [0u8; N];
     getrandom::fill(&mut b).expect("OS random number generator");
     b
@@ -556,7 +576,7 @@ fn new_pin() -> String {
     format!("{:06}", u32::from_le_bytes(random()) % 1_000_000)
 }
 
-fn hex(b: &[u8]) -> String {
+pub(crate) fn hex(b: &[u8]) -> String {
     b.iter().map(|x| format!("{x:02x}")).collect()
 }
 

@@ -2,9 +2,11 @@
 
 mod dsp;
 mod node;
+mod rpc;
 mod vdev;
 
 pub use node::{Device, Node, NodeState};
+pub use rpc::{daemon, daemon_exe, serve_rpc, Client, Devices};
 
 use anyhow::{anyhow, Context};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
@@ -65,11 +67,13 @@ pub struct Settings {
     pub output: Option<String>,
     pub bitrate: i32,
     pub channels: u16,
+    /// Start `capralink --daemon` at login (MASTER.md §3.6).
+    pub service: bool,
 }
 
 impl Default for Settings {
     fn default() -> Self {
-        Settings { input: None, output: None, bitrate: 64_000, channels: 1 }
+        Settings { input: None, output: None, bitrate: 64_000, channels: 1, service: false }
     }
 }
 
@@ -79,7 +83,7 @@ pub struct Keys {
     pub recv: [u8; 32],
 }
 
-#[derive(Clone, Debug, Default, serde::Serialize)]
+#[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
 pub struct Stats {
     pub sent: u64,
     pub received: u64,

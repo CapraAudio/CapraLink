@@ -1,71 +1,119 @@
-// CapraLink tray app: hosts the engine and a small settings window shown on demand.
+// CapraLink: `capralink --daemon` runs the headless engine; plain `capralink` is the tray app,
+// a client of that engine (MASTER.md §3.6).
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
-use capralink_engine::{Node, NodeState, Settings};
-use serde::Serialize;
+use capralink_engine::{Client, Devices, NodeState, Settings};
+use std::path::PathBuf;
+use std::process::{Command, Stdio};
+use std::sync::Mutex;
+use std::time::{Duration, Instant};
 use tauri::menu::{Menu, MenuItem};
 use tauri::tray::TrayIconBuilder;
-use tauri::{
-    AppHandle, Manager, RunEvent, State, WebviewUrl, WebviewWindowBuilder,
-};
+use tauri::{AppHandle, Manager, RunEvent, State, WebviewUrl, WebviewWindowBuilder};
 
-/// The node, created once at startup so pairing and incoming links work with the window closed.
-/// Holds the startup error instead (e.g. port in use) so the window can show it.
-struct App(Result<Node, String>);
+/// Connection to the engine daemon, (re)made on demand.
+struct App {
+    dir: Option<PathBuf>,
+    port: u16,
+    client: Mutex<Option<Client>>,
+}
 
 impl App {
-    fn node(&self) -> Result<&Node, String> {
-        self.0.as_ref().map_err(Clone::clone)
+    fn client(&self) -> Result<Client, String> {
+        let mut c = self.client.lock().unwrap_or_else(|e| e.into_inner());
+        if c.is_none() {
+            *c = Some(self.connect().map_err(|e| format!("Can't reach the CapraLink engine: {e:#}"))?);
+        }
+        Ok(c.clone().expect("set above"))
     }
 
-    fn run(&self, f: impl FnOnce(&Node) -> anyhow::Result<()>) -> Result<(), String> {
-        f(self.node()?).map_err(|e| format!("{e:#}"))
+    /// Connects to the running daemon, starting one if none answers.
+    fn connect(&self) -> anyhow::Result<Client> {
+        let local = || Client::local(self.dir.clone(), self.port + 1);
+        if let Ok(c) = local() {
+            return Ok(c);
+        }
+        spawn_daemon()?;
+        let t = Instant::now();
+        loop {
+            std::thread::sleep(Duration::from_millis(100));
+            match local() {
+                Ok(c) => return Ok(c),
+                Err(e) if t.elapsed() > Duration::from_secs(5) => return Err(e),
+                Err(_) => {}
+            }
+        }
+    }
+
+    fn run<T>(&self, f: impl FnOnce(&Client) -> anyhow::Result<T>) -> Result<T, String> {
+        f(&self.client()?).map_err(|e| {
+            if e.downcast_ref::<std::io::Error>().is_none() && e.to_string() != "unauthorized" {
+                return format!("{e:#}");
+            }
+            *self.client.lock().unwrap_or_else(|e| e.into_inner()) = None; // reconnect next time
+            format!("Can't reach the CapraLink engine: {e:#}")
+        })
     }
 }
 
-#[derive(Serialize)]
-struct Devices {
-    inputs: Vec<String>,
-    outputs: Vec<String>,
+/// Starts `<self> --daemon` detached from this process and its terminal.
+fn spawn_daemon() -> std::io::Result<()> {
+    let mut c = Command::new(capralink_engine::daemon_exe()?);
+    c.arg("--daemon").stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null());
+    #[cfg(unix)]
+    std::os::unix::process::CommandExt::process_group(&mut c, 0);
+    #[cfg(windows)]
+    std::os::windows::process::CommandExt::creation_flags(&mut c, 0x0800_0000 | 0x0000_0008); // CREATE_NO_WINDOW | DETACHED_PROCESS
+    let mut child = c.spawn()?;
+    std::thread::spawn(move || child.wait()); // reap it if it exits while the UI runs
+    Ok(())
 }
 
-#[tauri::command]
-fn devices() -> Devices {
-    Devices { inputs: capralink_engine::input_devices(), outputs: capralink_engine::output_devices() }
+// Every command may wait for the engine to start: `async` keeps them off the UI thread.
+#[tauri::command(async)]
+fn devices(app: State<App>) -> Result<Devices, String> {
+    app.run(Client::devices)
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn state(app: State<App>) -> Result<NodeState, String> {
-    Ok(app.node()?.state())
+    app.run(Client::state)
 }
 
-// Network actions block for up to a few seconds: `async` keeps them off the UI thread.
 #[tauri::command(async)]
 fn pair(app: State<App>, id: String, pin: String) -> Result<(), String> {
-    app.run(|n| n.pair(&id, &pin))
+    app.run(|c| c.pair(&id, &pin))
 }
 
 #[tauri::command(async)]
 fn connect(app: State<App>, id: String) -> Result<(), String> {
-    app.run(|n| n.connect(&id))
+    app.run(|c| c.connect(&id))
 }
 
 #[tauri::command(async)]
 fn disconnect(app: State<App>) -> Result<(), String> {
-    app.run(|n| {
-        n.disconnect();
-        Ok(())
-    })
+    app.run(Client::disconnect)
 }
 
 #[tauri::command(async)]
 fn forget(app: State<App>, id: String) -> Result<(), String> {
-    app.run(|n| n.forget(&id))
+    app.run(|c| c.forget(&id))
 }
 
 #[tauri::command(async)]
 fn set_settings(app: State<App>, settings: Settings) -> Result<(), String> {
-    app.run(|n| n.set_settings(settings))
+    app.run(|c| c.set_settings(&settings))
+}
+
+/// Tray Quit: the engine goes too unless it is meant to run in the background.
+fn quit(app: &AppHandle) {
+    let client = app.state::<App>().client.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    if let Some(c) = client {
+        if c.state().is_ok_and(|s| !s.settings.service) {
+            let _ = c.shutdown();
+        }
+    }
+    app.exit(0);
 }
 
 const WINDOW_LABEL: &str = "main";
@@ -83,24 +131,38 @@ fn show_window(app: &AppHandle) {
     }
     let _ = WebviewWindowBuilder::new(app, WINDOW_LABEL, WebviewUrl::App("index.html".into()))
         .title("CapraLink")
-        .inner_size(360.0, 660.0)
+        .inner_size(360.0, 700.0)
         .min_inner_size(360.0, 480.0)
         .build();
 }
 
 fn main() {
+    // Test overrides, honoured by both the daemon and the UI.
+    let dir: Option<PathBuf> = std::env::var_os("CAPRALINK_CONFIG_DIR").map(Into::into);
+    let port = std::env::var("CAPRALINK_PORT").ok().and_then(|p| p.parse().ok()).unwrap_or(47800);
+
+    // Before any Tauri/GTK/webview init, so the engine runs without a display.
+    if std::env::args().any(|a| a == "--daemon") {
+        if let Err(e) = capralink_engine::daemon(dir, port) {
+            eprintln!("capralink --daemon: {e:#}");
+            std::process::exit(1);
+        }
+        return;
+    }
+
+    let app = App { dir, port, client: Mutex::new(None) };
     tauri::Builder::default()
         // a second launch (no tray on stock GNOME, Start menu on Windows) brings this window back
         .plugin(tauri_plugin_single_instance::init(|app, _, _| show_window(app)))
-        .manage(App(Node::start(None, 47800, true).map_err(|e| format!("{e:#}"))))
+        .manage(app)
         .invoke_handler(tauri::generate_handler![devices, state, pair, connect, disconnect, forget, set_settings])
         .setup(|app| {
             #[cfg(target_os = "macos")]
             app.set_activation_policy(tauri::ActivationPolicy::Accessory);
 
             let open = MenuItem::with_id(app, "open", "Open CapraLink", true, None::<&str>)?;
-            let quit = MenuItem::with_id(app, "quit", "Quit", true, None::<&str>)?;
-            let menu = Menu::with_items(app, &[&open, &quit])?;
+            let quit_item = MenuItem::with_id(app, "quit", "Quit", true, None::<&str>)?;
+            let menu = Menu::with_items(app, &[&open, &quit_item])?;
 
             TrayIconBuilder::new()
                 .icon(tauri::image::Image::from_bytes(TRAY_ICON)?)
@@ -108,7 +170,7 @@ fn main() {
                 .menu(&menu)
                 .on_menu_event(|app, event| match event.id().as_ref() {
                     "open" => show_window(app),
-                    "quit" => app.exit(0),
+                    "quit" => quit(app),
                     _ => {}
                 })
                 .build(app)?;
@@ -118,17 +180,12 @@ fn main() {
         })
         .build(tauri::generate_context!())
         .expect("error while building tauri application")
-        .run(|app, event| match event {
-            RunEvent::Exit => {
-                if let Ok(n) = app.state::<App>().node() {
-                    n.shutdown();
-                }
-            }
+        .run(|app, event| match (app, event) {
             // closing the last window keeps the tray running; explicit Quit (code set) exits
-            RunEvent::ExitRequested { api, code: None, .. } => api.prevent_exit(),
+            (_, RunEvent::ExitRequested { api, code: None, .. }) => api.prevent_exit(),
             // launching the app again while it runs (Finder, `open`) brings the window back
             #[cfg(target_os = "macos")]
-            RunEvent::Reopen { .. } => show_window(app),
+            (app, RunEvent::Reopen { .. }) => show_window(app),
             _ => {}
         });
 }

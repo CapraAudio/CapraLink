@@ -2,13 +2,15 @@ use capralink_engine::{input_devices, output_devices, Node, VIRTUAL_INPUT, VIRTU
 use std::time::Duration;
 
 const USAGE: &str = "usage: capralinkd [--port N] [--pair NAME_OR_ID PIN] [--connect NAME_OR_ID]
+       capralinkd [--port N] --daemon
        capralinkd --list
 Runs a headless CapraLink node. --pair alone pairs and exits; --connect keeps running.
+--daemon runs the engine like `capralink --daemon` (local RPC on port+1, no console output).
 Config dir: $CAPRALINK_CONFIG_DIR, else the OS config dir.";
 
 fn main() -> anyhow::Result<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();
-    let (mut port, mut pair, mut connect) = (47800, None, None);
+    let (mut port, mut pair, mut connect, mut daemon) = (47800, None, None, false);
     let mut it = args.iter();
     while let Some(flag) = it.next() {
         match flag.as_str() {
@@ -22,11 +24,16 @@ fn main() -> anyhow::Result<()> {
             "--port" => port = next(&mut it, flag)?.parse()?,
             "--pair" => pair = Some((next(&mut it, flag)?, next(&mut it, flag)?)),
             "--connect" => connect = Some(next(&mut it, flag)?),
+            "--daemon" => daemon = true,
             _ => anyhow::bail!("unknown flag {flag}\n{USAGE}"),
         }
     }
 
-    let node = Node::start(std::env::var_os("CAPRALINK_CONFIG_DIR").map(Into::into), port, true)?;
+    let dir = std::env::var_os("CAPRALINK_CONFIG_DIR").map(Into::into);
+    if daemon {
+        return capralink_engine::daemon(dir, port);
+    }
+    let node = Node::start(dir, port, true)?;
     // Ctrl-C / service stop: remove the virtual devices and say goodbye on mDNS before exiting
     let n = node.clone();
     ctrlc::set_handler(move || {

@@ -41,6 +41,8 @@
   }
   .seg button.active { background: var(--accent); color: white; }
   input[type=range] { padding: 0; margin-bottom: 4px; }
+  .check { display: flex; align-items: center; gap: 6px; font-size: 13px; color: var(--fg); margin: 2px 0 4px; }
+  .check input { width: auto; margin: 0; }
   .bitrate-val { font-size: 11px; color: var(--sub); text-align: right; margin-bottom: 8px; }
   h2 { font-size: 11px; color: var(--sub); font-weight: 600; margin: 0 0 6px; text-transform: uppercase; letter-spacing: .04em; }
   .me-name { font-weight: 600; margin-bottom: 4px; }
@@ -103,6 +105,11 @@
     <div class="bitrate-val" id="bitrateVal">64 kbps</div>
   </section>
 
+  <section>
+    <label class="check"><input id="service" type="checkbox" /> Run in background at login</label>
+    <div class="hint">Keeps CapraLink running without this window, even in Steam Game Mode.</div>
+  </section>
+
   <div class="meters">
     <span>Sending</span><meter id="inLevel" min="-60" max="0" low="-20" high="-6" optimum="-30" value="-60"></meter>
     <span>Receiving</span><meter id="outLevel" min="-60" max="0" low="-20" high="-6" optimum="-30" value="-60"></meter>
@@ -116,7 +123,7 @@ const { invoke } = window.__TAURI__.core;
 const $ = (id) => document.getElementById(id);
 const els = {
   input: $('input'), output: $('output'), channels: $('channels'), bitrate: $('bitrate'),
-  bitrateVal: $('bitrateVal'), error: $('error'), status: $('status'), stats: $('stats'), devices: $('devices'),
+  bitrateVal: $('bitrateVal'), service: $('service'), error: $('error'), status: $('status'), stats: $('stats'), devices: $('devices'),
 };
 
 let channels = 1;
@@ -144,7 +151,7 @@ async function act(cmd, args) {
 function saveSettings() {
   act('set_settings', { settings: {
     input: els.input.value || null, output: els.output.value || null,
-    bitrate: Number(els.bitrate.value) * 1000, channels,
+    bitrate: Number(els.bitrate.value) * 1000, channels, service: els.service.checked,
   }});
 }
 
@@ -157,6 +164,7 @@ els.bitrate.addEventListener('input', () => { els.bitrateVal.textContent = els.b
 els.bitrate.addEventListener('change', saveSettings);
 els.input.addEventListener('change', saveSettings);
 els.output.addEventListener('change', saveSettings);
+els.service.addEventListener('change', saveSettings);
 
 // ---- devices list ----
 function el(tag, cls, text) {
@@ -241,6 +249,7 @@ async function poll() {
     els.bitrateVal.textContent = els.bitrate.value + ' kbps';
     setChannels(s.channels);
   }
+  els.service.checked = st.settings.service; // also undoes a failed toggle
   devices = st.devices;
   render();
   const peer = devices.find((d) => d.connected);
@@ -279,7 +288,11 @@ async function loadDevices() {
 }
 
 (async function init() {
-  await loadDevices(); // options must exist before saved selections can apply
+  // options must exist before saved selections can apply; the engine may still be starting
+  for (;;) {
+    try { await loadDevices(); break; } catch (e) { els.error.textContent = String(e); }
+    await new Promise((r) => setTimeout(r, 2000));
+  }
   await poll();
   setInterval(() => { if (!busy) poll(); }, 1000);
 })();
