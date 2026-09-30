@@ -81,6 +81,11 @@ fn state(app: State<App>) -> Result<NodeState, String> {
 }
 
 #[tauri::command(async)]
+fn levels(app: State<App>) -> Result<Option<(f32, f32)>, String> {
+    app.run(Client::levels)
+}
+
+#[tauri::command(async)]
 fn pair(app: State<App>, id: String, pin: String) -> Result<(), String> {
     app.run(|c| c.pair(&id, &pin))
 }
@@ -175,7 +180,7 @@ fn main() {
         // a second launch (no tray on stock GNOME, Start menu on Windows) brings this window back
         .plugin(tauri_plugin_single_instance::init(|app, _, _| show_window(app)))
         .manage(app)
-        .invoke_handler(tauri::generate_handler![devices, state, pair, pair_ip, connect, disconnect, forget, set_settings, set_name, remote_get, remote_set])
+        .invoke_handler(tauri::generate_handler![devices, state, levels, pair, pair_ip, connect, disconnect, forget, set_settings, set_name, remote_get, remote_set])
         .setup(|app| {
             #[cfg(target_os = "macos")]
             app.set_activation_policy(tauri::ActivationPolicy::Accessory);

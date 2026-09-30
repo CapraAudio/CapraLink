@@ -118,6 +118,7 @@ fn dispatch(node: &Node, cmd: &str, args: Value) -> Result<Value> {
     let done = |r: Result<()>| r.map(|()| Value::Null);
     match cmd {
         "state" => Ok(serde_json::to_value(node.state())?),
+        "levels" => Ok(serde_json::to_value(node.levels())?),
         "devices" => Ok(serde_json::to_value(Devices { inputs: crate::input_devices(), outputs: crate::output_devices() })?),
         "pair" => done(node.pair(&a.id, &a.pin)),
         "pair_ip" => node.pair_ip(&a.addr, &a.pin).map(Value::from),
@@ -175,6 +176,11 @@ impl Client {
 
     pub fn state(&self) -> Result<NodeState> {
         self.call("state", Value::Null)
+    }
+
+    /// (sending, receiving) VU levels, or None when not streaming.
+    pub fn levels(&self) -> Result<Option<(f32, f32)>> {
+        self.call("levels", Value::Null)
     }
 
     pub fn devices(&self) -> Result<Devices> {

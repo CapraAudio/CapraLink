@@ -69,7 +69,12 @@
   #error { color: var(--danger); font-size: 11px; margin-top: 6px; min-height: 14px; }
   #stats { font-size: 11px; color: var(--sub); text-align: center; }
   .meters { display: grid; grid-template-columns: auto 1fr; gap: 4px 8px; align-items: center; font-size: 11px; color: var(--sub); margin-top: 10px; }
-  meter { width: 100%; height: 8px; }
+  /* VU bars: a fixed green→red scale, uncovered from the left by the level */
+  .bar { position: relative; height: 8px; border-radius: 4px; overflow: hidden;
+    background: linear-gradient(90deg, #34c759 0 65%, #ffcc00 65% 85%, #ff3b30 85%); }
+  .bar > i { position: absolute; top: 0; right: 0; bottom: 0; width: 100%; background: var(--border);
+    transition: width 70ms linear; }
+  .pinrow { display: flex; align-items: baseline; gap: 10px; }
   .remote { padding: 6px 0 0; border-top: 1px solid var(--border); }
   .remote .btns { display: flex; gap: 6px; justify-content: flex-end; padding-bottom: 8px; }
 </style>
@@ -83,7 +88,7 @@
   <section>
     <h2>This device</h2>
     <div class="me-name" id="myNameRow"></div>
-    <div class="pin" id="pin">––– –––</div>
+    <div class="pinrow"><div class="pin" id="pin">••• •••</div><button class="link" id="pinToggle">Show</button></div>
     <div class="hint">Enter this PIN on the other computer to pair</div>
   </section>
 
@@ -124,8 +129,8 @@
   </section>
 
   <div class="meters">
-    <span>Sending</span><meter id="inLevel" min="-60" max="0" low="-20" high="-6" optimum="-30" value="-60"></meter>
-    <span>Receiving</span><meter id="outLevel" min="-60" max="0" low="-20" high="-6" optimum="-30" value="-60"></meter>
+    <span>Sending</span><div class="bar"><i id="inLevel"></i></div>
+    <span>Receiving</span><div class="bar"><i id="outLevel"></i></div>
   </div>
   <div id="stats" style="margin-top:8px;"></div>
   <div id="error"></div>
@@ -151,6 +156,8 @@ let devices = [];
 let remote = null;      // open "Settings on <name>" panel: {id, name, inputs, outputs, draft}
 let renaming = null;    // draft name while the "This device" name is being edited, else null
 let lastNameSig = '';
+let currentPin = '';
+let pinShown = false, pinTimer = null;
 
 function setChannels(v) {
   channels = v;
@@ -357,14 +364,39 @@ function setSel(sel, v) {
   sel.value = v || '';
 }
 
+// ---- PIN: hidden until asked for, hides itself again after 30 s ----
+function showPin(on) {
+  pinShown = on;
+  $('pin').textContent = on && currentPin ? currentPin : '••• •••';
+  $('pinToggle').textContent = on ? 'Hide' : 'Show';
+  clearTimeout(pinTimer);
+  if (on) pinTimer = setTimeout(() => showPin(false), 30000);
+}
+$('pinToggle').addEventListener('click', () => showPin(!pinShown));
+
+// ---- VU meters: ~15 updates/s from the engine's VU levels; CSS animates between them ----
+const pct = (p) => (Math.max(-60, 20 * Math.log10(p || 1e-9)) + 60) / 60 * 100;
+function setBars(inP, outP) {
+  $('inLevel').style.width = (100 - pct(inP)) + '%';   // the cover shrinks as the level rises
+  $('outLevel').style.width = (100 - pct(outP)) + '%';
+}
+let levelsBusy = false;
+setInterval(async () => {
+  if (levelsBusy || document.hidden) return;
+  levelsBusy = true;
+  try { const l = await invoke('levels'); l ? setBars(l[0], l[1]) : setBars(0, 0); }
+  catch (_) { setBars(0, 0); }
+  finally { levelsBusy = false; }
+}, 66);
+
 // ---- polling ----
-const db = (p) => Math.max(-60, 20 * Math.log10(p));
 
 async function poll() {
   let st;
   try { st = await invoke('state'); } catch (e) { els.error.textContent = String(e); return; }
   renderName(st.name);
-  $('pin').textContent = st.pin.slice(0, 3) + ' ' + st.pin.slice(3);
+  currentPin = st.pin.slice(0, 3) + ' ' + st.pin.slice(3);
+  showPin(pinShown);
   if (!settingsLoaded) {
     settingsLoaded = true;
     const s = st.settings;
@@ -383,12 +415,9 @@ async function poll() {
   els.status.classList.toggle('on', !!peer);
   const s = st.stats;
   if (s) {
-    inLevel.value = db(s.in_peak);
-    outLevel.value = db(s.out_peak);
     els.stats.textContent =
       `sent ${s.sent} · recv ${s.received} · lost ${s.lost} · fec ${s.fec_recovered} · underruns ${s.underruns} · buf ${s.buffer_ms.toFixed(0)}/${s.target_ms.toFixed(0)}ms · gap tx ${s.tx_gap_ms.toFixed(0)} rx ${s.rx_gap_ms.toFixed(0)}ms · ${Math.round(s.bitrate / 1000)} kbps · cx ${s.complexity}`;
   } else {
-    inLevel.value = outLevel.value = -60;
     els.stats.textContent = '';
   }
   els.error.textContent = [actionError || st.error, st.virtual_error].filter(Boolean).join(' · ');

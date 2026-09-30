@@ -106,7 +106,7 @@ pub struct Stats {
     pub buffer_ms: f32,
     /// Current adaptive playout target; grows when the link is bursty.
     pub target_ms: f32,
-    /// Peak sample (0..1) captured / played since the previous `stats()` call.
+    /// VU level (0..1) of audio captured / played: instant rise, ~26 dB/s fall.
     pub in_peak: f32,
     pub out_peak: f32,
     /// Longest gap between packets sent / received since the previous `stats()` call.
@@ -123,8 +123,8 @@ struct Shared {
     c: Counters,
     buffer_ms: AtomicU32, // f32 bits
     target_ms: AtomicU32, // f32 bits
-    in_peak: AtomicU32,   // f32 bits, reset on read
-    out_peak: AtomicU32,  // f32 bits, reset on read
+    in_peak: AtomicU32,   // f32 bits, VU level (see `meter`)
+    out_peak: AtomicU32,  // f32 bits, VU level (see `meter`)
     rx_channels: AtomicU8,
     tx_gap_us: AtomicU32, // reset on read
     rx_gap_us: AtomicU32, // reset on read
@@ -197,6 +197,11 @@ impl Link {
         Ok(Link { shared, stop, rx: Some(rx), _input: input, _output: output })
     }
 
+    /// Current (sending, receiving) VU levels, 0..1; cheap enough to poll many times a second.
+    pub fn levels(&self) -> (f32, f32) {
+        (f32::from_bits(self.shared.in_peak.load(Relaxed)), f32::from_bits(self.shared.out_peak.load(Relaxed)))
+    }
+
     pub fn stats(&self) -> Stats {
         let c = &self.shared.c;
         Stats {
@@ -207,8 +212,8 @@ impl Link {
             underruns: c.underruns.load(Relaxed),
             buffer_ms: f32::from_bits(self.shared.buffer_ms.load(Relaxed)),
             target_ms: f32::from_bits(self.shared.target_ms.load(Relaxed)),
-            in_peak: f32::from_bits(self.shared.in_peak.swap(0, Relaxed)),
-            out_peak: f32::from_bits(self.shared.out_peak.swap(0, Relaxed)),
+            in_peak: f32::from_bits(self.shared.in_peak.load(Relaxed)),
+            out_peak: f32::from_bits(self.shared.out_peak.load(Relaxed)),
             tx_gap_ms: self.shared.tx_gap_us.swap(0, Relaxed) as f32 / 1000.0,
             rx_gap_ms: self.shared.rx_gap_us.swap(0, Relaxed) as f32 / 1000.0,
             bitrate: self.shared.bitrate.load(Relaxed),
@@ -258,9 +263,13 @@ fn gap(last: &mut Option<Instant>, max_us: &AtomicU32) -> u32 {
 }
 
 /// Raises a reset-on-read peak meter. Positive f32 bit patterns order like the floats.
-fn meter(peak: &AtomicU32, samples: &[f32]) {
+/// VU-style level: jumps to a new peak at once, then falls back about 26 dB/s
+/// (×0.97 per ~10 ms callback), so any reader at any rate sees smooth motion.
+/// Each level has a single writer (its audio callback), so load/store is enough.
+fn meter(level: &AtomicU32, samples: &[f32]) {
     let p = samples.iter().fold(0f32, |m, s| m.max(s.abs()));
-    peak.fetch_max(p.to_bits(), Relaxed);
+    let old = f32::from_bits(level.load(Relaxed));
+    level.store(p.max(old * 0.97).to_bits(), Relaxed);
 }
 
 fn err_cb(e: cpal::Error) {

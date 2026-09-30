@@ -199,6 +199,11 @@ impl Node {
         self.0.st.lock().unwrap_or_else(|e| e.into_inner())
     }
 
+    /// (sending, receiving) VU levels of the active link, for smooth meters.
+    pub fn levels(&self) -> Option<(f32, f32)> {
+        self.st().session.as_ref().and_then(|s| s.link.as_ref()).map(Link::levels)
+    }
+
     pub fn state(&self) -> NodeState {
         let st = self.st();
         let conn = st.session.as_ref().map(|s| s.peer_id.as_str());
