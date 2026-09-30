@@ -22,7 +22,7 @@ pub(crate) fn system_command(program: &str) -> std::process::Command {
 use anyhow::{anyhow, Context};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::{FromSample, Sample, SampleFormat, SizedSample};
-use dsp::{Complexity, Counters, Jitter, Packetizer, Plan, Playout, Resampler, Rx, FRAME, MUSIC_TARGET, RATE, TARGET};
+use dsp::{Complexity, Counters, Jitter, Packetizer, Plan, Playout, Resampler, Rx, FRAME, JITTER_WINDOW_US, MUSIC_JITTER_WINDOW_US, RATE, TARGET};
 use ringbuf::traits::{Consumer, Observer, Producer, Split};
 use ringbuf::{HeapCons, HeapRb};
 use std::net::{SocketAddr, UdpSocket};
@@ -192,7 +192,7 @@ impl Link {
                         prod.push_slice(pcm);
                     }) {
                         let g = gap(&mut last, &shared.rx_gap_us);
-                        shared.jitter_us.store(jitter.push(g, rx.period_us()), Relaxed);
+                        shared.jitter_us.store(jitter.push(g, rx.period_us(), if shared.music.load(Relaxed) { MUSIC_JITTER_WINDOW_US } else { JITTER_WINDOW_US }), Relaxed);
                         shared.rx_channels.store(ch, Relaxed);
                     }
                 }
@@ -460,7 +460,7 @@ impl Playback {
             let avail = self.cons.occupied_len() / 2;
             self.scratch.clear();
             let base_need = (missing as f64 * self.base_step).ceil() as usize + 1;
-            self.plan.set_min(if self.shared.music.load(Relaxed) { MUSIC_TARGET } else { TARGET });
+            self.plan.set_music(self.shared.music.load(Relaxed));
             self.plan.set_jitter(self.shared.jitter_us.load(Relaxed) as usize * RATE as usize / 1_000_000);
             match self.plan.plan(avail, base_need) {
                 Plan::Play { discard, ratio } => {

@@ -227,6 +227,12 @@ const GROW: usize = RATE as usize / 100; // +10 ms boost per underrun (spike jit
 const SHRINK: usize = RATE as usize / 1000; // ... fading 1 ms ...
 const RELAX: usize = RATE as usize; // ... per second of clean playback
 const MAX_TARGET: usize = RATE as usize / 8; // 125 ms
+// Music Mode trades delay for never hiccuping on stall-prone Wi-Fi: a deeper ceiling, a bigger
+// step after a surprise stall, and (in `Jitter`) a much longer memory of past stalls.
+const MUSIC_MAX_TARGET: usize = RATE as usize * 3 / 10; // 300 ms
+const MUSIC_GROW: usize = RATE as usize * 3 / 100; // +30 ms per underrun
+pub const JITTER_WINDOW_US: u32 = 5_000_000; // stall memory 5–10 s ...
+pub const MUSIC_JITTER_WINDOW_US: u32 = 30_000_000; // ... 30–60 s in Music Mode
 const WINDOW: usize = RATE as usize / 2; // low-water mark measured over 0.5 s
 const TAU: f32 = 2.0 * RATE as f32; // drift controller: remove a cushion error over ~2 s ...
 const MAX_ADJ: f32 = 0.02; // ... playing at most 2% fast/slow (inaudible)
@@ -248,6 +254,8 @@ pub enum Plan {
 /// sized from measured packet jitter (`set_jitter`); an underrun adds a boost that fades.
 pub struct Playout {
     min: usize,
+    max: usize,
+    grow: usize,
     playing: bool,
     jitter: usize,
     boost: usize,
@@ -259,7 +267,7 @@ pub struct Playout {
 
 impl Default for Playout {
     fn default() -> Self {
-        Playout { min: TARGET, playing: false, jitter: 0, boost: 0, clean: 0, low: usize::MAX, span: 0, adj: 0.0 }
+        Playout { min: TARGET, max: MAX_TARGET, grow: GROW, playing: false, jitter: 0, boost: 0, clean: 0, low: usize::MAX, span: 0, adj: 0.0 }
     }
 }
 
@@ -269,13 +277,14 @@ impl Playout {
         self.jitter = frames;
     }
 
-    /// Minimum cushion: `TARGET`, or `MUSIC_TARGET` in Music Mode.
-    pub fn set_min(&mut self, frames: usize) {
-        self.min = frames;
+    /// Normal: 10 ms minimum, 125 ms ceiling, +10 ms per underrun.
+    /// Music Mode: 40 ms minimum, 300 ms ceiling, +30 ms per underrun.
+    pub fn set_music(&mut self, music: bool) {
+        (self.min, self.max, self.grow) = if music { (MUSIC_TARGET, MUSIC_MAX_TARGET, MUSIC_GROW) } else { (TARGET, MAX_TARGET, GROW) };
     }
 
     pub fn target(&self) -> usize {
-        (self.min.max(self.jitter + MARGIN) + self.boost).min(MAX_TARGET)
+        (self.min.max(self.jitter + MARGIN) + self.boost).min(self.max)
     }
 
     /// `need`: 48 kHz frames the next callback will take from the ring.
@@ -308,7 +317,7 @@ impl Playout {
     /// The ring ran dry mid-playback: re-prebuffer against a deeper target.
     pub fn underrun(&mut self) {
         self.playing = false;
-        self.boost = (self.boost + GROW).min(MAX_TARGET);
+        self.boost = (self.boost + self.grow).min(self.max);
         self.clean = 0;
     }
 }
@@ -324,12 +333,13 @@ pub struct Jitter {
 
 impl Jitter {
     /// `period_us`: the stream's packet period (10 ms, 20 ms in Music Mode).
-    pub fn push(&mut self, gap_us: u32, period_us: u32) -> u32 {
+    /// `window_us`: how long a stall is remembered (between 1× and 2× this).
+    pub fn push(&mut self, gap_us: u32, period_us: u32, window_us: u32) -> u32 {
         // a pause this long is a peer restart or a stopped stream, not jitter
         if gap_us < 500_000 {
             self.cur = self.cur.max(gap_us.saturating_sub(period_us));
             self.elapsed += gap_us;
-            if self.elapsed >= 5_000_000 {
+            if self.elapsed >= window_us {
                 (self.prev, self.cur, self.elapsed) = (self.cur, 0, 0);
             }
         }
@@ -534,20 +544,36 @@ mod tests {
     fn music_cushion() {
         let mut p = Playout::default();
         assert_eq!(p.target(), TARGET);
-        p.set_min(MUSIC_TARGET);
+        p.set_music(true);
         assert_eq!(p.target(), RATE as usize * 40 / 1000);
         assert_eq!(p.plan(480 + MUSIC_TARGET - 1, 480), Plan::Silence, "prebuffers 40 ms");
-        p.set_min(TARGET);
-        assert_eq!(p.target(), TARGET);
+        // a 150 ms stall is covered in Music Mode (ceiling 300 ms), capped at 125 ms normally
+        p.set_jitter(RATE as usize * 150 / 1000);
+        assert_eq!(p.target(), RATE as usize * 155 / 1000);
+        p.set_music(false);
+        assert_eq!(p.target(), MAX_TARGET);
+        p.set_jitter(0);
+        p.set_music(true);
+        p.underrun();
+        assert_eq!(p.target(), MUSIC_TARGET + MUSIC_GROW, "a surprise stall adds 30 ms in Music Mode");
+        // Music Mode remembers a stall for at least 30 s of smooth packets
+        let mut j = Jitter::default();
+        j.push(150_000, 20_000, MUSIC_JITTER_WINDOW_US);
+        for _ in 0..1500 {
+            j.push(20_000, 20_000, MUSIC_JITTER_WINDOW_US); // 30 s
+        }
+        assert_eq!(j.push(20_000, 20_000, MUSIC_JITTER_WINDOW_US), 130_000);
+        p.set_music(false);
+        assert_eq!(p.target(), TARGET + MUSIC_GROW, "the stall boost carries over and fades as usual");
     }
 
     #[test]
     fn jitter_20ms_period() {
         let mut j = Jitter::default();
         for _ in 0..500 {
-            assert_eq!(j.push(20_000, 20_000), 0, "evenly spaced 20 ms packets are not late");
+            assert_eq!(j.push(20_000, 20_000, JITTER_WINDOW_US), 0, "evenly spaced 20 ms packets are not late");
         }
-        assert_eq!(j.push(25_000, 20_000), 5_000);
+        assert_eq!(j.push(25_000, 20_000, JITTER_WINDOW_US), 5_000);
     }
 
     #[test]
@@ -590,13 +616,13 @@ mod tests {
     #[test]
     fn jitter_window() {
         let mut j = Jitter::default();
-        assert_eq!(j.push(10_000, 10_000), 0); // on time
-        assert_eq!(j.push(28_000, 10_000), 18_000); // 18 ms late
-        assert_eq!(j.push(3_000_000, 10_000), 18_000); // restart pause ignored
+        assert_eq!(j.push(10_000, 10_000, JITTER_WINDOW_US), 0); // on time
+        assert_eq!(j.push(28_000, 10_000, JITTER_WINDOW_US), 18_000); // 18 ms late
+        assert_eq!(j.push(3_000_000, 10_000, JITTER_WINDOW_US), 18_000); // restart pause ignored
         for _ in 0..1000 {
-            j.push(10_000, 10_000); // 10 s of smooth packets ages the spike out
+            j.push(10_000, 10_000, JITTER_WINDOW_US); // 10 s of smooth packets ages the spike out
         }
-        assert_eq!(j.push(10_000, 10_000), 0);
+        assert_eq!(j.push(10_000, 10_000, JITTER_WINDOW_US), 0);
     }
 
     #[test]
