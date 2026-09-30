@@ -294,6 +294,7 @@ See `HANDOFF.md` → "Pending owner actions" for the live list. Answers get move
 | Date | Change |
 |---|---|
 | 2026-09-29 | Project started. Master plan written. No Rust toolchain on the Mac yet. |
+| 2026-09-29 | Device rename verified by owner. Remaining milestones: M4 (Windows), M7 (installers/signing). |
 | 2026-09-29 | Device rename (D14): set_name + mDNS re-advertise, stored peer names refresh from mDNS/remote_get, remote rename via Configure (remote_config-gated). 18 tests. |
 | 2026-09-29 | M6b verified by owner (Mac configured Deck remotely). M6 done except owner's Mac login check. Next: device rename (owner request). |
 | 2026-09-29 | M6b landed: Manage sessions (get_config/set_settings) gated by target's remote_config; service/remote_config only changeable locally; UI Configure panel + checkbox. 17 tests. Field test pending. |
