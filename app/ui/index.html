@@ -478,6 +478,14 @@ async function loadDevices() {
   fill(els.output, d.outputs, 'CapraLink Input', 'apps on this computer record from it');
 }
 
+// Size the window to the content, so it never needs a scroll bar; re-fit whenever the
+// content grows or shrinks (devices appearing, Configure panel, errors).
+let fittedHeight = 0;
+new ResizeObserver(() => {
+  const h = Math.ceil(document.body.getBoundingClientRect().height);
+  if (h !== fittedHeight) { fittedHeight = h; invoke('fit', { height: h }).catch(() => {}); }
+}).observe(document.body);
+
 (async function init() {
   // options must exist before saved selections can apply; the engine may still be starting
   for (;;) {

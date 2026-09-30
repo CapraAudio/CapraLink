@@ -80,6 +80,13 @@ fn state(app: State<App>) -> Result<NodeState, String> {
     app.run(Client::state)
 }
 
+/// Sizes the window to its content height (the page measures itself), keeping the width.
+#[tauri::command]
+fn fit(window: tauri::WebviewWindow, height: f64) {
+    let width = window.inner_size().ok().zip(window.scale_factor().ok()).map_or(360.0, |(s, f)| s.to_logical::<f64>(f).width);
+    let _ = window.set_size(tauri::LogicalSize::new(width, height.clamp(300.0, 1000.0)));
+}
+
 #[tauri::command(async)]
 fn levels(app: State<App>) -> Result<Option<(f32, f32)>, String> {
     app.run(Client::levels)
@@ -191,7 +198,7 @@ fn show_window(app: &AppHandle) {
     let _ = WebviewWindowBuilder::new(app, WINDOW_LABEL, WebviewUrl::App("index.html".into()))
         .title("CapraLink")
         .inner_size(360.0, 700.0)
-        .min_inner_size(360.0, 480.0)
+        .min_inner_size(360.0, 300.0)
         .build();
 }
 
@@ -214,7 +221,7 @@ fn main() {
         // a second launch (no tray on stock GNOME, Start menu on Windows) brings this window back
         .plugin(tauri_plugin_single_instance::init(|app, _, _| show_window(app)))
         .manage(app)
-        .invoke_handler(tauri::generate_handler![devices, state, levels, pair, pair_ip, connect, disconnect, forget, set_settings, set_name, remote_get, remote_set])
+        .invoke_handler(tauri::generate_handler![devices, state, levels, fit, pair, pair_ip, connect, disconnect, forget, set_settings, set_name, remote_get, remote_set])
         .setup(|app| {
             #[cfg(target_os = "macos")]
             app.set_activation_policy(tauri::ActivationPolicy::Accessory);
