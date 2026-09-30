@@ -176,6 +176,31 @@ these to the real per-OS device names in one small function; the UI lists them f
   EMA < 0.3 ms for ~5 s → +1 (max 5). Bitrate is not a CPU lever for Opus.
 - **Visibility:** Stats gain `bitrate` (current kbps) and `complexity`; UI stats line shows them.
 
+### 3.6 Service mode and remote configuration (M6 design)
+
+**M6a — engine/UI split + service mode.**
+- One binary per OS (`capralink`, the Tauri app). `capralink --daemon` runs the headless engine:
+  the `Node` plus a local RPC server; it returns before any Tauri/GTK/webview init, so it runs
+  without a display (SteamOS Game Mode, login agents). `capralinkd` stays as a dev/CLI tool.
+- Default launch = UI client: tray + window. On start it connects to the local daemon; if none
+  answers it spawns `<self> --daemon` detached and retries for ~3 s. The UI never embeds a Node.
+- **Local RPC:** TCP 127.0.0.1:(port+1, default 47801), one JSON request/response per connection:
+  `{"token","cmd","args"}` → `{"ok":…}|{"err":"…"}`. Token = 32 random bytes hex in
+  `<config dir>/rpc.token` (0600), created by the daemon; the UI reads it. Commands mirror Node:
+  state, devices, pair, connect, disconnect, forget, set_settings, set_service, shutdown.
+- **Service toggle** (`Settings.service: bool`, UI "Run in background at login"): the daemon
+  installs/removes a login agent that runs `<exe> --daemon` (on Linux AppImage: `$APPIMAGE`, not the
+  ephemeral mount path). macOS `~/Library/LaunchAgents/com.capraaudio.capralink.plist` (RunAtLoad,
+  KeepAlive on crash only); Linux `~/.config/systemd/user/capralink.service` (enable, Restart=on-failure);
+  Windows `HKCU\Software\Microsoft\Windows\CurrentVersion\Run\CapraLink`. Takes effect next login
+  (the running daemon keeps running).
+- **Quit** in the tray: service off → also shut the daemon down; service on → only the UI exits.
+
+**M6b — remote configuration** (after M6a): `Settings.remote_config: bool` (default off). A paired
+peer may open a control session without audio (`Manage` instead of `Link`) to `GetConfig`
+(name, settings, device lists) and `SetSettings`; refused unless the target allows it. UI: a
+"Configure" action on paired, online devices that allow it.
+
 ## 4. Feasibility notes (owner asked for honest feedback)
 
 1. **Virtual devices on Windows are the hardest part.** Windows has no user-mode way to create
@@ -230,6 +255,7 @@ these to the real per-OS device names in one small function; the UI lists them f
 | D5 | 2026-09-29 | UDP + per-packet encryption keyed by PIN pairing | Low latency, LAN-safe |
 | D6 | 2026-09-29 | "Service" = headless login agent, not system service | OS audio is per-user-session |
 | D7 | 2026-09-29 | One peer at a time (1:1 link) | Covers the use case; simplest |
+| D13 | 2026-09-29 | M6: single binary with `--daemon` engine mode + UI client over token-authenticated loopback RPC; service = OS login agent running the daemon | Game Mode/headless support, zero webview while gaming, one download per OS, keeps macOS mic permission |
 | D12 | 2026-09-29 | M5: network drives bitrate (AIMD on receiver loss/underrun reports, slider = ceiling); CPU drives Opus complexity (encode-time EMA) | Opus bitrate ≠ CPU cost; complexity is the real CPU knob |
 | D11 | 2026-09-29 | M2 security: SPAKE2 PIN pairing → stored secret; Noise NNpsk0 control channel; per-session ChaCha20-Poly1305 audio keys; standing PIN on target, auto-accept from paired peers | Standard, audited crates; no PKI; headless-friendly |
 | D8 | 2026-09-29 | Open-source release, GPL-3.0 | Owner choice; lets us reuse GPL drivers (e.g. BlackHole on macOS) |
