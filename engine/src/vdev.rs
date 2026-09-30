@@ -1,7 +1,6 @@
 //! Linux virtual devices (MASTER.md §3.4): PulseAudio / pipewire-pulse modules loaded with `pactl`.
 //! Other OSes: nothing to do (macOS ships drivers; Windows is M4).
 
-use std::process::Command;
 
 /// (key token identifying our module in `pactl list short modules`, module, arguments).
 /// Single quotes around the property list keep the space in the description intact for both
@@ -77,7 +76,7 @@ impl Drop for Virtual {
 // ponytail: pactl runs synchronously in Node::start; a hung sound server would stall startup.
 // Move it to a thread with a timeout if that's ever seen.
 fn pactl(args: &[&str]) -> Result<String, String> {
-    let out = Command::new("pactl").args(args).output().map_err(|e| match e.kind() {
+    let out = crate::system_command("pactl").args(args).output().map_err(|e| match e.kind() {
         std::io::ErrorKind::NotFound => "pactl not found — install it (Debian/Ubuntu/Fedora: pulseaudio-utils) and restart CapraLink".to_string(),
         _ => format!("can't run pactl: {e}"),
     })?;

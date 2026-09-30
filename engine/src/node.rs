@@ -556,7 +556,7 @@ fn secret(cfg: &Config, id: &str) -> Option<[u8; 32]> {
 fn hostname() -> String {
     // Windows sets COMPUTERNAME; Linux has the kernel's name even without a `hostname` binary (SteamOS)
     let n = std::env::var("COMPUTERNAME").ok().or_else(|| std::fs::read_to_string("/proc/sys/kernel/hostname").ok()).or_else(|| {
-        let o = std::process::Command::new("hostname").output().ok()?;
+        let o = crate::system_command("hostname").output().ok()?;
         Some(String::from_utf8_lossy(&o.stdout).into_owned())
     });
     let n = n.unwrap_or_default();

@@ -10,7 +10,7 @@ use serde_json::{json, Value};
 use std::io::{self, Read, Write};
 use std::net::{Ipv4Addr, Shutdown, SocketAddr, TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::Stdio;
 use std::time::Duration;
 
 const TOKEN_FILE: &str = "rpc.token";
@@ -271,7 +271,7 @@ fn remove(path: &Path) -> Result<()> {
 
 #[allow(dead_code)]
 fn run(cmd: &str, args: &[&str]) -> Result<()> {
-    let mut c = Command::new(cmd);
+    let mut c = crate::system_command(cmd);
     c.args(args).stdin(Stdio::null());
     #[cfg(windows)]
     std::os::windows::process::CommandExt::creation_flags(&mut c, 0x0800_0000); // CREATE_NO_WINDOW
