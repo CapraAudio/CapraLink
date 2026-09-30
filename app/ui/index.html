@@ -75,6 +75,8 @@
   .bar > i { position: absolute; top: 0; right: 0; bottom: 0; width: 100%; background: var(--border);
     transition: width 70ms linear; }
   .pinrow { display: flex; align-items: baseline; gap: 10px; }
+  /* fixed width (7 characters + letter spacing) so Show/Hide stays put when dots swap for digits */
+  .pinrow .pin { width: calc(7ch + 0.84em); white-space: nowrap; }
   .remote { padding: 6px 0 0; border-top: 1px solid var(--border); }
   .remote .btns { display: flex; gap: 6px; justify-content: flex-end; padding-bottom: 8px; }
 </style>
