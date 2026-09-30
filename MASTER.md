@@ -264,6 +264,7 @@ device's Send from / Play to / Channels / Bitrate.
 | D5 | 2026-09-29 | UDP + per-packet encryption keyed by PIN pairing | Low latency, LAN-safe |
 | D6 | 2026-09-29 | "Service" = headless login agent, not system service | OS audio is per-user-session |
 | D7 | 2026-09-29 | One peer at a time (1:1 link) | Covers the use case; simplest |
+| D14 | 2026-09-29 | Device names: each computer has an editable name (config.name) that peers see (mDNS TXT + stored peer name refresh); changeable locally or via remote config | Owner chose global rename over per-machine nicknames |
 | D13 | 2026-09-29 | M6: single binary with `--daemon` engine mode + UI client over token-authenticated loopback RPC; service = OS login agent running the daemon | Game Mode/headless support, zero webview while gaming, one download per OS, keeps macOS mic permission |
 | D12 | 2026-09-29 | M5: network drives bitrate (AIMD on receiver loss/underrun reports, slider = ceiling); CPU drives Opus complexity (encode-time EMA) | Opus bitrate ≠ CPU cost; complexity is the real CPU knob |
 | D11 | 2026-09-29 | M2 security: SPAKE2 PIN pairing → stored secret; Noise NNpsk0 control channel; per-session ChaCha20-Poly1305 audio keys; standing PIN on target, auto-accept from paired peers | Standard, audited crates; no PKI; headless-friendly |
@@ -281,7 +282,7 @@ device's Send from / Play to / Channels / Bitrate.
 | M3 | Virtual devices: Linux, then macOS HAL plug-in | Discord on A can pick CapraLink Input/Output |
 | M4 | Virtual devices: Windows — fork + rename + test-sign VirtualDrivers driver, built in CI (D4) | Same, on Windows |
 | M5 | Adaptive bitrate (loss/RTT/CPU), jitter tuning | Holds quality on Wi-Fi; CPU target met — code done 2026-09-29, field test pending |
-| M6 | Service mode + remote configuration | Configure a headless machine from another |
+| M6 | Service mode + remote configuration | Configure a headless machine from another — **done 2026-09-29** (Mac LaunchAgent login check pending owner) |
 | M7 | Installers + signing for all 3 OSes | One-click install per OS |
 
 ## 7. Open questions
@@ -293,6 +294,7 @@ See `HANDOFF.md` → "Pending owner actions" for the live list. Answers get move
 | Date | Change |
 |---|---|
 | 2026-09-29 | Project started. Master plan written. No Rust toolchain on the Mac yet. |
+| 2026-09-29 | M6b verified by owner (Mac configured Deck remotely). M6 done except owner's Mac login check. Next: device rename (owner request). |
 | 2026-09-29 | M6b landed: Manage sessions (get_config/set_settings) gated by target's remote_config; service/remote_config only changeable locally; UI Configure panel + checkbox. 17 tests. Field test pending. |
 | 2026-09-29 | Deck reboot check passed (service auto-starts). M6b started. |
 | 2026-09-29 | M6a verified on Deck: systemd user service runs the engine in Game Mode; Mac↔Deck audio works with Deck in Game Mode (owner confirmed). Pair-by-IP used to re-pair. |
