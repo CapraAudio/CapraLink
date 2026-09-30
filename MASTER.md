@@ -291,6 +291,7 @@ item in the tray menu. Status pill just says "Streaming" / "Idle" (owner request
 | D5 | 2026-09-29 | UDP + per-packet encryption keyed by PIN pairing | Low latency, LAN-safe |
 | D6 | 2026-09-29 | "Service" = headless login agent, not system service | OS audio is per-user-session |
 | D7 | 2026-09-29 | One peer at a time (1:1 link) | Covers the use case; simplest |
+| D16 | 2026-09-29 | Tray: single click shows the menu on all OSes (owner choice); double-click opens the window where reported (Windows only) | Keeps Quit/Music Mode discoverable on macOS |
 | D15 | 2026-09-29 | Music Mode = link-wide (either side on → both directions): stereo, 20 ms frames, 160 kbps ceiling, complexity 10 w/ back-off, 40 ms min cushion; AIMD floor unchanged | Owner answers (quality over latency, smooth over pristine on bad Wi-Fi) |
 | D14 | 2026-09-29 | Device names: each computer has an editable name (config.name) that peers see (mDNS TXT + stored peer name refresh); changeable locally or via remote config | Owner chose global rename over per-machine nicknames |
 | D13 | 2026-09-29 | M6: single binary with `--daemon` engine mode + UI client over token-authenticated loopback RPC; service = OS login agent running the daemon | Game Mode/headless support, zero webview while gaming, one download per OS, keeps macOS mic permission |
@@ -322,6 +323,7 @@ See `HANDOFF.md` → "Pending owner actions" for the live list. Answers get move
 | Date | Change |
 |---|---|
 | 2026-09-29 | Project started. Master plan written. No Rust toolchain on the Mac yet. |
+| 2026-09-29 | UI polish: status pill just Streaming/Idle; VU gradient blends green→yellow→red; window auto-fits content height (self-correcting for title bar); tray double-click (Windows). |
 | 2026-09-29 | Music Mode field test: occasional hiccups = Deck Wi-Fi stalls 100–150 ms every ~12 s (iwd re-enables power save; owner declined iwd config). Music Mode buffer now remembers stalls 30–60 s, ceiling 300 ms, +30 ms per hiccup. |
 | 2026-09-29 | Music Mode landed (D15): live link-wide switch via `mode` message, encoder rebuilt in-callback with continuing seq, 20 ms/stereo/160k/cx10, 40 ms min cushion; tray check item. Encode cost 0.65% of a core (vs 0.23% normal). 22 tests. Known: old remote configurers reset music_mode on save; no FEC at music bitrates. |
 | 2026-09-29 | Device rename verified by owner. Remaining milestones: M4 (Windows), M7 (installers/signing). |
