@@ -415,7 +415,8 @@ function setBars(inP, outP) {
 }
 let levelsBusy = false;
 setInterval(async () => {
-  if (levelsBusy || document.hidden) return;
+  // only while streaming: each poll is a local connection, so idle windows make none
+  if (levelsBusy || document.hidden || !els.status.classList.contains('on')) { if (!levelsBusy) setBars(0, 0); return; }
   levelsBusy = true;
   try { const l = await invoke('levels'); l ? setBars(l[0], l[1]) : setBars(0, 0); }
   catch (_) { setBars(0, 0); }
