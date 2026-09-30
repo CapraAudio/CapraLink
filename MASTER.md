@@ -238,6 +238,27 @@ change and must size PLC/FEC to the incoming frame duration (10 or 20 ms).
 bitrate label show the forced values while it's on), in the remote Configure panel, and as a checkable
 item in the tray menu. Status pill just says "Streaming" / "Idle" (owner request).
 
+### 3.8 Windows (M4 plan, owner answers 2026-09-29)
+
+Driverless first (owner choice; keeps Secure Boot and anti-cheat working). Test PC: Windows 11, owner
+is admin, remote access via Windows' built-in OpenSSH Server. Role: both A and B.
+
+- **M4a — native smoke test as B** (no new code): CapraLink.exe runs, window + tray, pair with the Mac/Deck,
+  audio both ways, service Run key, firewall prompt. SSH sessions run outside the user's desktop session,
+  so the app is launched in the interactive session via a scheduled task (`schtasks /create … /it` +
+  `schtasks /run`).
+- **M4b — driverless capture ("CapraLink Output" side):** WASAPI process loopback (Windows 10 2004+,
+  `ActivateAudioInterfaceAsync` with `AUDIOCLIENT_ACTIVATION_TYPE_PROCESS_LOOPBACK`, include the process
+  tree) and whole-system loopback of the default render device. Send-from list on Windows gains
+  "<app> (app audio)" entries for running processes with audio sessions (e.g. Discord) and
+  "Everything this PC plays". Settings stores the choice by process name (`app:Discord.exe`) so it
+  survives restarts. Implemented with the `windows` crate (already a cpal dependency).
+- **M4c — virtual mic via VB-Cable (if installed):** Play-to "CapraLink Input" maps to the "CABLE Input"
+  render device; the hint tells the user to pick "CABLE Output" as the microphone in Discord. If VB-Cable
+  isn't installed the entry is absent and the UI links to vb-audio.com. Nothing bundled (licence).
+- **Later (optional):** own signed driver (D4 path) only if VB-Cable proves insufficient.
+- Installer (NSIS/MSI via the Tauri bundler) belongs to M7.
+
 ## 4. Feasibility notes (owner asked for honest feedback)
 
 1. **Virtual devices on Windows are the hardest part.** Windows has no user-mode way to create
@@ -292,6 +313,7 @@ item in the tray menu. Status pill just says "Streaming" / "Idle" (owner request
 | D5 | 2026-09-29 | UDP + per-packet encryption keyed by PIN pairing | Low latency, LAN-safe |
 | D6 | 2026-09-29 | "Service" = headless login agent, not system service | OS audio is per-user-session |
 | D7 | 2026-09-29 | One peer at a time (1:1 link) | Covers the use case; simplest |
+| D17 | 2026-09-29 | Windows goes driverless first (supersedes D4 for now): per-app / whole-system WASAPI loopback for the Output side; VB-Cable (user-installed, signed) for the Input side | Keeps Secure Boot + anti-cheat; no signing cost; D4 test-signed driver kept as a fallback |
 | D16 | 2026-09-29 | Tray: single click shows the menu on all OSes (owner choice); double-click opens the window where reported (Windows only) | Keeps Quit/Music Mode discoverable on macOS |
 | D15 | 2026-09-29 | Music Mode = link-wide (either side on → both directions): stereo, 20 ms frames, 160 kbps ceiling, complexity 10 w/ back-off, 40 ms min cushion; AIMD floor unchanged | Owner answers (quality over latency, smooth over pristine on bad Wi-Fi) |
 | D14 | 2026-09-29 | Device names: each computer has an editable name (config.name) that peers see (mDNS TXT + stored peer name refresh); changeable locally or via remote config | Owner chose global rename over per-machine nicknames |
@@ -310,7 +332,7 @@ item in the tray menu. Status pill just says "Streaming" / "Idle" (owner request
 | M1 | Engine: mic → Opus → UDP → speaker, two hard-coded peers | Hear yourself across two machines; latency measured |
 | M2 | mDNS discovery, PIN pairing, encryption, saved pairings | Pair two machines from the UI — **done 2026-09-29**, owner-verified Mac↔Linux (pair, connect, audio both ways, disconnect/reconnect) |
 | M3 | Virtual devices: Linux, then macOS HAL plug-in | Discord on A can pick CapraLink Input/Output |
-| M4 | Virtual devices: Windows — fork + rename + test-sign VirtualDrivers driver, built in CI (D4) | Same, on Windows |
+| M4 | Windows: native test as B; driverless app/system loopback capture; VB-Cable as virtual mic (§3.8, D17) | Same, on Windows |
 | M5 | Adaptive bitrate (loss/RTT/CPU), jitter tuning | Holds quality on Wi-Fi; CPU target met — code done 2026-09-29, field test pending |
 | M6 | Service mode + remote configuration | Configure a headless machine from another — **done 2026-09-29** (Mac LaunchAgent login check pending owner) |
 | M7 | Installers + signing for all 3 OSes | One-click install per OS |

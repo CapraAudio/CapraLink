@@ -27,6 +27,9 @@ Read `MASTER.md` first. This file is the live position.
 ## Music Mode planning (2026-09-29, owner answers round 1)
 - Delay: +40–60 ms OK (bigger frames + bigger buffer). Max bitrate 160 kbps. Complexity 10 allowed with auto back-off. Bad network: keep smooth (AIMD down to 8 kbps as today). Round 2: force stereo; toggle in main window + tray menu; BOTH directions (link-wide). Full design: MASTER §3.7 / D15. Committed 2026-09-29; Deck deployed incl. Music Mode buffer fix + 0.5% pitch cap (latest, 2026-09-29; Deck now also has all UI polish) (300 ms ceiling, 30–60 s stall memory) 2026-09-29. Owner to reconnect + listen; then re-run scratchpad watch.py (Deck copy at ~/.cache/capralink-watch.py) to confirm underruns stop. Deck now current. Deck mic input peaks ~4x full scale — told owner to lower mic volume.
 
+## M4 Windows (started 2026-09-29)
+- Plan: MASTER §3.8 / D17. Waiting on owner: enable Windows OpenSSH Server + install key ~/.ssh/capralink_windows.pub (admin → C:\ProgramData\ssh\administrators_authorized_keys), send PC IP.
+
 ## Next step
 Verify engine build/tests, commit, then build app/ (Tauri tray) against the engine API, add CI.
 
