@@ -111,13 +111,18 @@ fn set_settings(app: State<App>, settings: Settings) -> Result<(), String> {
 }
 
 #[tauri::command(async)]
+fn set_name(app: State<App>, name: String) -> Result<(), String> {
+    app.run(|c| c.set_name(&name))
+}
+
+#[tauri::command(async)]
 fn remote_get(app: State<App>, id: String) -> Result<RemoteConfig, String> {
     app.run(|c| c.remote_get(&id))
 }
 
 #[tauri::command(async)]
-fn remote_set(app: State<App>, id: String, settings: Settings) -> Result<(), String> {
-    app.run(|c| c.remote_set(&id, &settings))
+fn remote_set(app: State<App>, id: String, settings: Settings, name: Option<String>) -> Result<(), String> {
+    app.run(|c| c.remote_set(&id, &settings, name.as_deref()))
 }
 
 /// Tray Quit: the engine goes too unless it is meant to run in the background.
@@ -170,7 +175,7 @@ fn main() {
         // a second launch (no tray on stock GNOME, Start menu on Windows) brings this window back
         .plugin(tauri_plugin_single_instance::init(|app, _, _| show_window(app)))
         .manage(app)
-        .invoke_handler(tauri::generate_handler![devices, state, pair, pair_ip, connect, disconnect, forget, set_settings, remote_get, remote_set])
+        .invoke_handler(tauri::generate_handler![devices, state, pair, pair_ip, connect, disconnect, forget, set_settings, set_name, remote_get, remote_set])
         .setup(|app| {
             #[cfg(target_os = "macos")]
             app.set_activation_policy(tauri::ActivationPolicy::Accessory);

@@ -45,7 +45,8 @@
   .check input { width: auto; margin: 0; }
   .bitrate-val { font-size: 11px; color: var(--sub); text-align: right; margin-bottom: 8px; }
   h2 { font-size: 11px; color: var(--sub); font-weight: 600; margin: 0 0 6px; text-transform: uppercase; letter-spacing: .04em; }
-  .me-name { font-weight: 600; margin-bottom: 4px; }
+  .me-name { font-weight: 600; margin-bottom: 4px; display: flex; align-items: center; gap: 6px; }
+  .me-name input { margin: 0; flex: 1; min-width: 0; }
   .pin { font-size: 30px; font-weight: 700; letter-spacing: .12em; font-variant-numeric: tabular-nums; }
   .hint { font-size: 11px; color: var(--sub); margin-bottom: 8px; }
   .dev { display: flex; align-items: center; gap: 8px; padding: 6px 0; border-top: 1px solid var(--border); }
@@ -81,7 +82,7 @@
 
   <section>
     <h2>This device</h2>
-    <div class="me-name" id="myName"></div>
+    <div class="me-name" id="myNameRow"></div>
     <div class="pin" id="pin">––– –––</div>
     <div class="hint">Enter this PIN on the other computer to pair</div>
   </section>
@@ -136,6 +137,7 @@ const $ = (id) => document.getElementById(id);
 const els = {
   input: $('input'), output: $('output'), channels: $('channels'), bitrate: $('bitrate'),
   bitrateVal: $('bitrateVal'), service: $('service'), remoteCfg: $('remoteCfg'), error: $('error'), status: $('status'), stats: $('stats'), devices: $('devices'),
+  myNameRow: $('myNameRow'),
 };
 
 let channels = 1;
@@ -147,6 +149,8 @@ let pinDraft = '';
 let lastDevices = '';
 let devices = [];
 let remote = null;      // open "Settings on <name>" panel: {id, name, inputs, outputs, draft}
+let renaming = null;    // draft name while the "This device" name is being edited, else null
+let lastNameSig = '';
 
 function setChannels(v) {
   channels = v;
@@ -182,6 +186,34 @@ els.input.addEventListener('change', saveSettings);
 els.output.addEventListener('change', saveSettings);
 els.service.addEventListener('change', saveSettings);
 els.remoteCfg.addEventListener('change', saveSettings);
+
+// ---- this device's name ----
+function renderName(name) {
+  // stays 'edit' while typing, so the 1 s poll can't clobber the draft or steal focus
+  const sig = renaming === null ? 'view:' + name : 'edit';
+  if (sig === lastNameSig) return;
+  lastNameSig = sig;
+  const box = els.myNameRow;
+  box.innerHTML = '';
+  if (renaming === null) {
+    box.appendChild(el('span', null, name));
+    box.appendChild(button('Rename', 'link', () => { renaming = name; lastNameSig = ''; renderName(name); }));
+    return;
+  }
+  const input = el('input');
+  input.value = renaming;
+  const cancel = () => { renaming = null; lastNameSig = ''; renderName(name); };
+  const save = async () => { const n = renaming; if (await act('set_name', { name: n })) cancel(); };
+  input.addEventListener('input', () => { renaming = input.value; });
+  input.addEventListener('keydown', (e) => {
+    if (e.key === 'Enter') save();
+    if (e.key === 'Escape') cancel();
+  });
+  box.appendChild(input);
+  box.appendChild(button('Save', 'btn', save));
+  box.appendChild(button('Cancel', 'link', cancel));
+  setTimeout(() => { input.focus(); input.select(); });
+}
 
 // ---- pair by IP (manual fallback when mDNS discovery can't see the other computer) ----
 els.ipAddr = $('ipAddr'); els.ipPin = $('ipPin'); els.ipPairBtn = $('ipPairBtn');
@@ -265,7 +297,7 @@ function render() {
 async function openRemote(id) {
   if (remote && remote.id === id) { remote = null; lastDevices = ''; render(); return; }
   busy = true; actionError = ''; remote = null; lastDevices = ''; render();
-  try { const c = await invoke('remote_get', { id }); remote = { id, ...c, draft: { ...c.settings } }; }
+  try { const c = await invoke('remote_get', { id }); remote = { id, ...c, draft: { ...c.settings }, nameDraft: c.name }; }
   catch (e) { actionError = String(e); }
   busy = false; lastDevices = '';
   await poll();
@@ -275,6 +307,11 @@ function remotePanel() {
   const r = remote, s = r.draft;
   const box = el('div', 'remote');
   box.appendChild(el('h2', null, 'Settings on ' + r.name));
+  box.appendChild(el('label', null, 'Name'));
+  const nameInput = el('input');
+  nameInput.value = r.nameDraft;
+  nameInput.addEventListener('input', () => { r.nameDraft = nameInput.value; });
+  box.appendChild(nameInput);
   const pick = (label, list, special, hint, key) => {
     box.appendChild(el('label', null, label));
     const sel = el('select');
@@ -303,7 +340,8 @@ function remotePanel() {
   const btns = el('div', 'btns');
   btns.appendChild(button('Close', 'link', () => { remote = null; lastDevices = ''; render(); }));
   btns.appendChild(button('Save', 'btn', async () => {
-    if (await act('remote_set', { id: r.id, settings: s })) { remote = null; lastDevices = ''; render(); }
+    const name = r.nameDraft !== r.name ? r.nameDraft : null;
+    if (await act('remote_set', { id: r.id, settings: s, name })) { remote = null; lastDevices = ''; render(); }
   }));
   box.appendChild(btns);
   return box;
@@ -325,7 +363,7 @@ const db = (p) => Math.max(-60, 20 * Math.log10(p));
 async function poll() {
   let st;
   try { st = await invoke('state'); } catch (e) { els.error.textContent = String(e); return; }
-  $('myName').textContent = st.name;
+  renderName(st.name);
   $('pin').textContent = st.pin.slice(0, 3) + ' ' + st.pin.slice(3);
   if (!settingsLoaded) {
     settingsLoaded = true;

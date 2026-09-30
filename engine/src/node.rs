@@ -105,7 +105,7 @@ enum Msg {
     GetConfig,
     Config(RemoteConfig),
     #[serde(rename = "set_settings")]
-    SetSettings { settings: Settings },
+    SetSettings { settings: Settings, #[serde(default)] name: Option<String> },
 }
 
 struct Found {
@@ -154,9 +154,7 @@ impl Node {
             // IPv4 only (the link is IPv4); with enable_addr_auto every remaining interface
             // address is advertised, and the dialer picks the one that answers.
             d.disable_interface(vec![IfKind::IPv6, IfKind::LoopbackV4])?;
-            let props = [("id", cfg.device_id.as_str()), ("name", cfg.name.as_str()), ("v", "2")];
-            let host = format!("{}.local.", cfg.device_id);
-            d.register(ServiceInfo::new(SERVICE, &cfg.device_id, &host, "", port, &props[..])?.enable_addr_auto())?;
+            advertise(&d, &cfg.device_id, &cfg.name, port)?;
             let rx = d.browse(SERVICE)?;
             (Some(d), Some(rx))
         } else {
@@ -378,19 +376,45 @@ impl Node {
     }
 
     /// Reads paired device `id`'s settings and device lists (it must allow remote configuration).
+    /// Refreshes the stored peer name if it has changed on the other end.
     pub fn remote_get(&self, id: &str) -> Result<RemoteConfig> {
-        match self.manage(id, &Msg::GetConfig)? {
-            Msg::Config(c) => Ok(c),
+        let c = match self.manage(id, &Msg::GetConfig)? {
+            Msg::Config(c) => c,
+            _ => bail!("unexpected reply"),
+        };
+        let mut st = self.st();
+        if let Some(p) = st.cfg.peers.iter_mut().find(|p| p.id == id) {
+            if p.name != c.name {
+                p.name = c.name.clone();
+                save(&self.0.dir, &st.cfg)?;
+            }
+        }
+        Ok(c)
+    }
+
+    /// Changes paired device `id`'s settings, except its `service` and `remote_config`; `name`
+    /// renames it too, when given (MASTER.md §3.6 device rename).
+    pub fn remote_set(&self, id: &str, settings: Settings, name: Option<String>) -> Result<()> {
+        match self.manage(id, &Msg::SetSettings { settings, name })? {
+            Msg::Ok => Ok(()),
             _ => bail!("unexpected reply"),
         }
     }
 
-    /// Changes paired device `id`'s settings, except its `service` and `remote_config`.
-    pub fn remote_set(&self, id: &str, settings: Settings) -> Result<()> {
-        match self.manage(id, &Msg::SetSettings { settings })? {
-            Msg::Ok => Ok(()),
-            _ => bail!("unexpected reply"),
+    /// Renames this computer; re-advertises immediately so paired peers see it without a
+    /// restart (MASTER.md §3.6 device rename).
+    pub fn set_name(&self, name: &str) -> Result<()> {
+        let name = clean_name(name.trim());
+        ensure!(!name.is_empty(), "the name can't be empty");
+        let mut st = self.st();
+        st.cfg.name = name.clone();
+        save(&self.0.dir, &st.cfg)?;
+        let id = st.cfg.device_id.clone();
+        drop(st);
+        if let Some(d) = &self.0.mdns {
+            advertise(d, &id, &name, self.0.port)?;
         }
+        Ok(())
     }
 
     /// One request over its own management session (a separate connection; any audio session
@@ -590,10 +614,17 @@ impl Node {
             _ if !local.remote_config => Msg::Error { message: format!("remote configuration is off on {name}") },
             Some(Msg::GetConfig) => Msg::Config(RemoteConfig { name, settings: local, inputs: crate::input_devices(), outputs: crate::output_devices() }),
             // `service` and `remote_config` only change locally
-            Some(Msg::SetSettings { settings }) => match self.set_settings(Settings { service: local.service, remote_config: local.remote_config, ..settings }) {
-                Ok(()) => Msg::Ok,
-                Err(e) => Msg::Error { message: format!("{name}: {e:#}") },
-            },
+            Some(Msg::SetSettings { settings, name: new_name }) => {
+                let r = match new_name {
+                    Some(n) => self.set_name(&n),
+                    None => Ok(()),
+                }
+                .and_then(|()| self.set_settings(Settings { service: local.service, remote_config: local.remote_config, ..settings }));
+                match r {
+                    Ok(()) => Msg::Ok,
+                    Err(e) => Msg::Error { message: format!("{name}: {e:#}") },
+                }
+            }
             _ => Msg::Error { message: "unsupported request".into() },
         };
         let r = ctl.send(&reply);
@@ -613,7 +644,15 @@ impl Node {
                 if info.get_property_val_str("v") != Some("2") || id == st.cfg.device_id || check_id(id).is_err() {
                     return;
                 }
-                let found = Found { name: clean_name(name), addrs, fullname: info.get_fullname().to_string() };
+                let clean = clean_name(name);
+                // a paired peer's rename shows up here (and in a fresh remote_get) without restart
+                if let Some(p) = st.cfg.peers.iter_mut().find(|p| p.id == id) {
+                    if p.name != clean {
+                        p.name = clean.clone();
+                        let _ = save(&self.0.dir, &st.cfg);
+                    }
+                }
+                let found = Found { name: clean, addrs, fullname: info.get_fullname().to_string() };
                 st.found.insert(id.to_string(), found);
             }
             ServiceEvent::ServiceRemoved(_, fullname) => st.found.retain(|_, f| f.fullname != fullname),
@@ -628,6 +667,14 @@ fn start_link(s: &Settings, port: u16, peer: SocketAddr, keys: &Keys) -> Result<
         return Ok(None);
     }
     Link::start(s, port, peer, keys).map(Some)
+}
+
+/// (Re-)registers this node's mDNS service with the given name; mdns-sd re-announces in place,
+/// no unregister needed (used at startup and by `set_name`).
+fn advertise(d: &ServiceDaemon, id: &str, name: &str, port: u16) -> Result<()> {
+    let props = [("id", id), ("name", name), ("v", "2")];
+    let host = format!("{id}.local.");
+    Ok(d.register(ServiceInfo::new(SERVICE, id, &host, "", port, &props[..])?.enable_addr_auto())?)
 }
 
 // ---------- config ----------
@@ -994,12 +1041,37 @@ mod tests {
         assert!(both(), "a manage session leaves the audio session alone");
 
         let want = Settings { bitrate: 32_000, channels: 2, service: true, remote_config: false, ..rc.settings };
-        a.remote_set(&bid, want).unwrap();
+        a.remote_set(&bid, want.clone(), None).unwrap();
         let s = load(&bdir).unwrap().settings;
         assert_eq!((s.bitrate, s.channels, s.service, s.remote_config), (32_000, 2, false, true));
         wait(both); // b restarts its link for the new audio settings
+
+        // remote rename (service/remote_config in `want` are ignored, so b's remote_config is
+        // still on): the target renames and the initiator's stored peer name catches up.
+        a.remote_set(&bid, want.clone(), Some("Renamed B".into())).unwrap();
+        assert_eq!(load(&bdir).unwrap().name, "Renamed B");
+        assert_ne!(peers(&adir).iter().find(|p| p.id == bid).unwrap().name, "Renamed B", "not updated until the next remote_get");
+        let rc2 = a.remote_get(&bid).unwrap();
+        assert_eq!(rc2.name, "Renamed B");
+        assert_eq!(peers(&adir).iter().find(|p| p.id == bid).unwrap().name, "Renamed B", "initiator's stored peer name updates after remote_get");
+
+        let err = a.remote_set(&bid, want.clone(), Some("   ".into())).unwrap_err().to_string();
+        assert!(err.contains("can't be empty"), "{err}");
+
+        b.set_settings(Settings { remote_config: false, ..b.state().settings }).unwrap();
+        assert!(a.remote_set(&bid, want, Some("Nope".into())).is_err(), "remote_config off refuses the rename too");
         let _ = std::fs::remove_dir_all(adir);
         let _ = std::fs::remove_dir_all(bdir);
+    }
+
+    #[test]
+    fn set_name_trims_cleans_and_rejects_empty() {
+        let (a, adir) = node();
+        assert!(a.set_name("   ").unwrap_err().to_string().contains("can't be empty"));
+        a.set_name("  New Name  ").unwrap();
+        assert_eq!(a.state().name, "New Name");
+        assert_eq!(load(&adir).unwrap().name, "New Name");
+        let _ = std::fs::remove_dir_all(adir);
     }
 
     #[test]
@@ -1014,6 +1086,9 @@ mod tests {
 
         let m: Msg = serde_json::from_str(r#"{"type":"pair","id":"a","name":"b"}"#).unwrap();
         assert!(matches!(m, Msg::Pair { port: None, .. }));
+
+        let m: Msg = serde_json::from_str(r#"{"type":"set_settings","settings":{"bitrate":48000,"channels":1}}"#).unwrap();
+        assert!(matches!(m, Msg::SetSettings { name: None, .. }), "old SetSettings JSON without `name` parses");
     }
 
     #[test]

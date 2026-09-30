@@ -112,6 +112,7 @@ fn dispatch(node: &Node, cmd: &str, args: Value) -> Result<Value> {
         pin: String,
         addr: String,
         settings: Option<Settings>,
+        name: Option<String>,
     }
     let a: Args = if args.is_null() { Args::default() } else { serde_json::from_value(args)? };
     let done = |r: Result<()>| r.map(|()| Value::Null);
@@ -127,8 +128,9 @@ fn dispatch(node: &Node, cmd: &str, args: Value) -> Result<Value> {
         }
         "forget" => done(node.forget(&a.id)),
         "set_settings" => done(node.set_settings(a.settings.ok_or_else(|| anyhow!("missing settings"))?)),
+        "set_name" => done(node.set_name(&a.name.ok_or_else(|| anyhow!("missing name"))?)),
         "remote_get" => Ok(serde_json::to_value(node.remote_get(&a.id)?)?),
-        "remote_set" => done(node.remote_set(&a.id, a.settings.ok_or_else(|| anyhow!("missing settings"))?)),
+        "remote_set" => done(node.remote_set(&a.id, a.settings.ok_or_else(|| anyhow!("missing settings"))?, a.name)),
         "shutdown" => Ok(Value::Null), // `handle` exits after replying
         _ => bail!("unknown command {cmd}"),
     }
@@ -203,12 +205,17 @@ impl Client {
         self.call("set_settings", json!({ "settings": s }))
     }
 
+    pub fn set_name(&self, name: &str) -> Result<()> {
+        self.call("set_name", json!({ "name": name }))
+    }
+
     pub fn remote_get(&self, id: &str) -> Result<RemoteConfig> {
         self.call("remote_get", json!({ "id": id }))
     }
 
-    pub fn remote_set(&self, id: &str, s: &Settings) -> Result<()> {
-        self.call("remote_set", json!({ "id": id, "settings": s }))
+    /// `name` renames the target too, when given.
+    pub fn remote_set(&self, id: &str, s: &Settings, name: Option<&str>) -> Result<()> {
+        self.call("remote_set", json!({ "id": id, "settings": s, "name": name }))
     }
 
     pub fn shutdown(&self) -> Result<()> {
