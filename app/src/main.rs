@@ -7,7 +7,7 @@ use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
-use tauri::menu::{Menu, MenuItem};
+use tauri::menu::{CheckMenuItem, Menu, MenuItem};
 use tauri::tray::TrayIconBuilder;
 use tauri::{AppHandle, Manager, RunEvent, State, WebviewUrl, WebviewWindowBuilder};
 
@@ -141,6 +141,40 @@ fn quit(app: &AppHandle) {
     app.exit(0);
 }
 
+/// Tray "Music Mode": flips the daemon's setting (read fresh, so nothing else is reset), then
+/// shows what the daemon actually has. Off the main thread: the daemon may need starting.
+fn toggle_music(app: &AppHandle, item: CheckMenuItem<tauri::Wry>) {
+    let app = app.clone();
+    std::thread::spawn(move || {
+        let a = app.state::<App>();
+        let _ = a.run(|c| {
+            let s = c.state()?.settings;
+            c.set_settings(&Settings { music_mode: !s.music_mode, ..s })
+        });
+        if let Ok(st) = a.run(Client::state) {
+            let _ = item.set_checked(st.settings.music_mode);
+        }
+    });
+}
+
+/// Keeps the tray check in step with changes made elsewhere (window, remote config).
+/// Only asks an engine this UI is already connected to; never starts one.
+fn sync_music(app: AppHandle, item: CheckMenuItem<tauri::Wry>) {
+    std::thread::spawn(move || loop {
+        std::thread::sleep(Duration::from_secs(2));
+        // the open window already polls state; a second reader would reset its gap meters
+        if app.get_webview_window(WINDOW_LABEL).is_some() {
+            continue;
+        }
+        let client = app.state::<App>().client.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        if let Some(st) = client.and_then(|c| c.state().ok()) {
+            if item.is_checked().is_ok_and(|on| on != st.settings.music_mode) {
+                let _ = item.set_checked(st.settings.music_mode);
+            }
+        }
+    });
+}
+
 const WINDOW_LABEL: &str = "main";
 
 // macOS menu bar: black silhouette that the system recolours; elsewhere: white for dark panels
@@ -186,15 +220,18 @@ fn main() {
             app.set_activation_policy(tauri::ActivationPolicy::Accessory);
 
             let open = MenuItem::with_id(app, "open", "Open CapraLink", true, None::<&str>)?;
+            let music = CheckMenuItem::with_id(app, "music", "Music Mode", true, false, None::<&str>)?;
             let quit_item = MenuItem::with_id(app, "quit", "Quit", true, None::<&str>)?;
-            let menu = Menu::with_items(app, &[&open, &quit_item])?;
+            let menu = Menu::with_items(app, &[&open, &music, &quit_item])?;
+            sync_music(app.handle().clone(), music.clone());
 
             TrayIconBuilder::new()
                 .icon(tauri::image::Image::from_bytes(TRAY_ICON)?)
                 .icon_as_template(cfg!(target_os = "macos"))
                 .menu(&menu)
-                .on_menu_event(|app, event| match event.id().as_ref() {
+                .on_menu_event(move |app, event| match event.id().as_ref() {
                     "open" => show_window(app),
+                    "music" => toggle_music(app, music.clone()),
                     "quit" => quit(app),
                     _ => {}
                 })

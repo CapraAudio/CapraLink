@@ -39,36 +39,72 @@ fn nonce(seq: u32) -> Nonce {
     n.into()
 }
 
-/// TX side: 10 ms interleaved f32 frames in, finished (encrypted) UDP payloads out.
-/// Packet v2: `magic u16 | version u8 | seq u32 | AEAD(channels u8 | opus)`.
+/// Bitrate ceiling in Music Mode (MASTER.md §3.7); normally the user's Bitrate setting (≤ 96 kbps).
+pub const MUSIC_BITRATE: i32 = 160_000;
+
+/// The sender's bitrate ceiling: the user's setting, or the Music Mode ceiling.
+pub fn ceiling(user: i32, music: bool) -> i32 {
+    if music { MUSIC_BITRATE } else { user.clamp(8_000, 96_000) }
+}
+
+fn encoder(channels: u16, music: bool, bitrate: i32, complexity: i32, loss_perc: i32) -> anyhow::Result<opus::Encoder> {
+    let ch = if channels == 1 { opus::Channels::Mono } else { opus::Channels::Stereo };
+    let mut enc = opus::Encoder::new(RATE, ch, opus::Application::Audio)?;
+    enc.set_complexity(complexity)?;
+    enc.set_inband_fec(true)?;
+    enc.set_packet_loss_perc(loss_perc)?;
+    enc.set_bitrate(opus::Bitrate::Bits(bitrate.clamp(8_000, MUSIC_BITRATE)))?;
+    if music {
+        // bandwidth stays automatic: Opus picks fullband at music bitrates and narrows only
+        // when bad-network back-off drops the rate, which sounds better than forcing it
+        enc.set_signal(opus::Signal::Music)?;
+    }
+    Ok(enc)
+}
+
+/// TX side: interleaved f32 frames (10 ms, or 20 ms in Music Mode) in, finished (encrypted)
+/// UDP payloads out. Packet v2: `magic u16 | version u8 | seq u32 | AEAD(channels u8 | opus)`.
 pub struct Packetizer {
     enc: opus::Encoder,
     aead: ChaCha20Poly1305,
     channels: u8,
+    music: bool,
     seq: u32,
     buf: [u8; MAX_PACKET],
 }
 
 impl Packetizer {
     pub fn new(channels: u16, bitrate: i32, key: &[u8; 32]) -> anyhow::Result<Self> {
-        let ch = if channels == 1 { opus::Channels::Mono } else { opus::Channels::Stereo };
-        let mut enc = opus::Encoder::new(RATE, ch, opus::Application::Audio)?;
-        enc.set_complexity(5)?;
-        enc.set_inband_fec(true)?;
-        enc.set_packet_loss_perc(5)?;
-        enc.set_bitrate(opus::Bitrate::Bits(bitrate.clamp(8_000, 96_000)))?;
+        let enc = encoder(channels, false, bitrate, 5, 5)?;
         let mut buf = [0; MAX_PACKET];
         buf[..2].copy_from_slice(&MAGIC.to_be_bytes());
         buf[2] = VERSION;
-        Ok(Packetizer { enc, aead: cipher(key), channels: channels as u8, seq: 0, buf })
+        Ok(Packetizer { enc, aead: cipher(key), channels: channels as u8, music: false, seq: 0, buf })
+    }
+
+    /// Switches channels / Music Mode live by replacing the Opus encoder (bitrate, complexity
+    /// and loss% carry over). The AEAD key and `seq` stay, so nonces keep counting up.
+    pub fn set_mode(&mut self, channels: u16, music: bool) -> anyhow::Result<()> {
+        let bitrate = match self.enc.get_bitrate()? {
+            opus::Bitrate::Bits(b) => b,
+            _ => 64_000,
+        };
+        self.enc = encoder(channels, music, bitrate, self.enc.get_complexity()?, self.enc.get_packet_loss_perc()?)?;
+        (self.channels, self.music) = (channels as u8, music);
+        Ok(())
     }
 
     pub fn channels(&self) -> usize {
         self.channels as usize
     }
 
+    /// Samples per channel in one frame: 10 ms, or 20 ms in Music Mode.
+    pub fn frame(&self) -> usize {
+        if self.music { 2 * FRAME } else { FRAME }
+    }
+
     pub fn set_bitrate(&mut self, bitrate: i32) -> anyhow::Result<()> {
-        Ok(self.enc.set_bitrate(opus::Bitrate::Bits(bitrate.clamp(8_000, 96_000)))?)
+        Ok(self.enc.set_bitrate(opus::Bitrate::Bits(bitrate.clamp(8_000, MUSIC_BITRATE)))?)
     }
 
     pub fn set_packet_loss_perc(&mut self, perc: u8) -> anyhow::Result<()> {
@@ -79,7 +115,7 @@ impl Packetizer {
         Ok(self.enc.set_complexity(level.min(10).into())?)
     }
 
-    /// `pcm` must be exactly one 10 ms frame (FRAME * channels samples).
+    /// `pcm` must be exactly one frame (`frame()` * channels samples).
     pub fn packet(&mut self, pcm: &[f32]) -> anyhow::Result<&[u8]> {
         // ponytail: u32 seq wraps after ~497 days of one session (nonce reuse); rekey by reconnecting before then
         let seq = self.seq;
@@ -113,13 +149,14 @@ pub struct Rx {
     aead: ChaCha20Poly1305,
     dec: Option<(u8, opus::Decoder)>,
     expected: Option<u32>,
+    last_len: usize, // samples per channel of the last decoded packet: the size PLC/FEC fill
     pcm: Vec<f32>,
     stereo: Vec<f32>,
 }
 
 impl Rx {
     pub fn new(key: &[u8; 32]) -> Self {
-        Rx { aead: cipher(key), dec: None, expected: None, pcm: vec![0.0; MAX_OPUS_FRAME * 2], stereo: vec![0.0; MAX_OPUS_FRAME * 2] }
+        Rx { aead: cipher(key), dec: None, expected: None, last_len: FRAME, pcm: vec![0.0; MAX_OPUS_FRAME * 2], stereo: vec![0.0; MAX_OPUS_FRAME * 2] }
     }
 
     /// Returns the stream's channel count for authentic packets, None for junk (dropped silently).
@@ -154,12 +191,22 @@ impl Rx {
         Some(ch)
     }
 
+    /// The stream's current packet period in µs (10 ms, 20 ms in Music Mode).
+    pub fn period_us(&self) -> u32 {
+        (self.last_len * 1_000_000 / RATE as usize) as u32
+    }
+
     fn decode(&mut self, opus: &[u8], fec: bool, ch: u8, out: &mut impl FnMut(&[f32])) {
         let ch = ch as usize;
-        // FEC and PLC must be asked for exactly one missing frame; normal decode gets the full buffer.
-        let len = if fec || opus.is_empty() { FRAME * ch } else { self.pcm.len() };
+        // FEC and PLC must be asked for exactly one missing frame (assumed the size of the last
+        // one); normal decode gets the full buffer.
+        let (conceal, len) = (fec || opus.is_empty(), self.last_len * ch);
+        let len = if conceal { len } else { self.pcm.len() };
         let Some((_, dec)) = self.dec.as_mut() else { return };
         let Ok(n) = dec.decode_float(opus, &mut self.pcm[..len], fec) else { return };
+        if !conceal {
+            self.last_len = n;
+        }
         if ch == 2 {
             out(&self.pcm[..n * 2]);
         } else {
@@ -172,7 +219,8 @@ impl Rx {
     }
 }
 
-pub const TARGET: usize = RATE as usize / 100; // 10 ms: minimum cushion
+pub const TARGET: usize = RATE as usize / 100; // 10 ms: minimum cushion ...
+pub const MUSIC_TARGET: usize = 4 * TARGET; // ... 40 ms in Music Mode
 const MARGIN: usize = RATE as usize / 200; // 5 ms on top of measured jitter
 const HEADROOM: usize = RATE as usize / 10; // fill beyond need + target + 100 ms is discarded
 const GROW: usize = RATE as usize / 100; // +10 ms boost per underrun (spike jitter missed) ...
@@ -199,6 +247,7 @@ pub enum Plan {
 /// slightly fast or slow, which also absorbs clock drift between machines. The target is
 /// sized from measured packet jitter (`set_jitter`); an underrun adds a boost that fades.
 pub struct Playout {
+    min: usize,
     playing: bool,
     jitter: usize,
     boost: usize,
@@ -210,7 +259,7 @@ pub struct Playout {
 
 impl Default for Playout {
     fn default() -> Self {
-        Playout { playing: false, jitter: 0, boost: 0, clean: 0, low: usize::MAX, span: 0, adj: 0.0 }
+        Playout { min: TARGET, playing: false, jitter: 0, boost: 0, clean: 0, low: usize::MAX, span: 0, adj: 0.0 }
     }
 }
 
@@ -220,8 +269,13 @@ impl Playout {
         self.jitter = frames;
     }
 
+    /// Minimum cushion: `TARGET`, or `MUSIC_TARGET` in Music Mode.
+    pub fn set_min(&mut self, frames: usize) {
+        self.min = frames;
+    }
+
     pub fn target(&self) -> usize {
-        (TARGET.max(self.jitter + MARGIN) + self.boost).min(MAX_TARGET)
+        (self.min.max(self.jitter + MARGIN) + self.boost).min(MAX_TARGET)
     }
 
     /// `need`: 48 kHz frames the next callback will take from the ring.
@@ -259,8 +313,8 @@ impl Playout {
     }
 }
 
-/// Worst packet lateness (arrival gap beyond the 10 ms packet period) seen over the last
-/// 5–10 s, in µs: how much cushion the link needs to ride out its bursts.
+/// Worst packet lateness (arrival gap beyond the packet period) seen over the last 5–10 s,
+/// in µs: how much cushion the link needs to ride out its bursts.
 #[derive(Default)]
 pub struct Jitter {
     cur: u32,
@@ -269,10 +323,11 @@ pub struct Jitter {
 }
 
 impl Jitter {
-    pub fn push(&mut self, gap_us: u32) -> u32 {
+    /// `period_us`: the stream's packet period (10 ms, 20 ms in Music Mode).
+    pub fn push(&mut self, gap_us: u32, period_us: u32) -> u32 {
         // a pause this long is a peer restart or a stopped stream, not jitter
         if gap_us < 500_000 {
-            self.cur = self.cur.max(gap_us.saturating_sub(10_000));
+            self.cur = self.cur.max(gap_us.saturating_sub(period_us));
             self.elapsed += gap_us;
             if self.elapsed >= 5_000_000 {
                 (self.prev, self.cur, self.elapsed) = (self.cur, 0, 0);
@@ -283,7 +338,7 @@ impl Jitter {
 }
 
 /// AIMD bitrate controller (MASTER.md §3.5): the sender's reaction to the peer's periodic
-/// receive-side reports. `ceiling` tracks the user's Bitrate setting.
+/// receive-side reports. `ceiling` tracks the user's Bitrate setting (see `ceiling()`).
 pub struct RateControl {
     bitrate: i32,
     ceiling: i32,
@@ -291,8 +346,14 @@ pub struct RateControl {
 
 impl RateControl {
     pub fn new(ceiling: i32) -> Self {
-        let ceiling = ceiling.clamp(8_000, 96_000);
+        let ceiling = ceiling.clamp(8_000, MUSIC_BITRATE);
         RateControl { bitrate: ceiling, ceiling }
+    }
+
+    /// A higher ceiling is ramped up to by later clean reports; a lower one applies at once.
+    pub fn set_ceiling(&mut self, ceiling: i32) {
+        self.ceiling = ceiling.clamp(8_000, MUSIC_BITRATE);
+        self.bitrate = self.bitrate.min(self.ceiling);
     }
 
     /// Feeds one peer report (deltas since its last report). Returns the bitrate to apply and
@@ -317,6 +378,7 @@ impl RateControl {
 /// dropping complexity fast under load and only raising it back after a sustained quiet spell.
 pub struct Complexity {
     level: u8,
+    max: u8,
     ema_us: f32,
     hold: u32,
 }
@@ -325,11 +387,17 @@ const COMPLEXITY_HOLD_FRAMES: u32 = 500; // ~5 s of 10 ms frames
 
 impl Default for Complexity {
     fn default() -> Self {
-        Complexity { level: 5, ema_us: 0.0, hold: 0 }
+        Complexity { level: 5, max: 5, ema_us: 0.0, hold: 0 }
     }
 }
 
 impl Complexity {
+    /// Highest level to climb to: 5, or 10 in Music Mode. Returns the (clamped) current level.
+    pub fn set_max(&mut self, max: u8) -> u8 {
+        self.max = max;
+        self.level = self.level.min(max);
+        self.level
+    }
     /// Feeds one frame's encode time (µs). Returns the new level when it changes.
     pub fn on_encode(&mut self, us: f32) -> Option<u8> {
         self.ema_us += 0.05 * (us - self.ema_us);
@@ -343,7 +411,7 @@ impl Complexity {
             self.hold += 1;
             if self.hold >= COMPLEXITY_HOLD_FRAMES {
                 self.hold = 0;
-                if self.level < 5 {
+                if self.level < self.max {
                     self.level += 1;
                     return Some(self.level);
                 }
@@ -429,6 +497,60 @@ mod tests {
     }
 
     #[test]
+    fn live_music_mode_switch() {
+        let key = [7u8; 32];
+        let mut tx = Packetizer::new(1, 64_000, &key).unwrap();
+        let tone = |n: usize, ch: usize| -> Vec<f32> { (0..n * ch).map(|i| 0.5 * (i as f32 * 0.13 / ch as f32).sin()).collect() };
+        let mut packets: Vec<Vec<u8>> = (0..10).map(|_| tx.packet(&tone(FRAME, 1)).unwrap().to_vec()).collect();
+        tx.set_mode(2, true).unwrap();
+        assert_eq!((tx.channels(), tx.frame()), (2, 2 * FRAME));
+        packets.extend((0..10).map(|_| tx.packet(&tone(2 * FRAME, 2)).unwrap().to_vec()));
+        // seq (the AEAD nonce) keeps counting across the encoder swap: no reuse
+        let seqs: Vec<u32> = packets.iter().map(|p| u32::from_be_bytes([p[3], p[4], p[5], p[6]])).collect();
+        assert_eq!(seqs, (0..20).collect::<Vec<u32>>());
+
+        let (mut rx, c) = (Rx::new(&key), Counters::default());
+        let mut sizes = Vec::new(); // stereo frames per `out` call
+        for (i, p) in packets.iter().enumerate() {
+            if i != 15 && i != 16 {
+                let ch = rx.handle(&mut p.clone(), &c, &mut |s: &[f32]| sizes.push(s.len() / 2)).unwrap();
+                assert_eq!(ch, if i < 10 { 1 } else { 2 });
+            }
+        }
+        assert_eq!(rx.period_us(), 20_000);
+        assert_eq!(c.lost.load(Relaxed), 2);
+        assert_eq!(&sizes[..10], &[FRAME; 10], "10 ms mono decodes");
+        // the two lost 20 ms packets are concealed (PLC) with 20 ms each, then packet 17 decodes
+        assert_eq!(&sizes[10..], &[2 * FRAME; 10]);
+
+        // and back to normal
+        tx.set_mode(1, false).unwrap();
+        assert_eq!(tx.frame(), FRAME);
+        let p = tx.packet(&tone(FRAME, 1)).unwrap();
+        assert_eq!(u32::from_be_bytes([p[3], p[4], p[5], p[6]]), 20);
+    }
+
+    #[test]
+    fn music_cushion() {
+        let mut p = Playout::default();
+        assert_eq!(p.target(), TARGET);
+        p.set_min(MUSIC_TARGET);
+        assert_eq!(p.target(), RATE as usize * 40 / 1000);
+        assert_eq!(p.plan(480 + MUSIC_TARGET - 1, 480), Plan::Silence, "prebuffers 40 ms");
+        p.set_min(TARGET);
+        assert_eq!(p.target(), TARGET);
+    }
+
+    #[test]
+    fn jitter_20ms_period() {
+        let mut j = Jitter::default();
+        for _ in 0..500 {
+            assert_eq!(j.push(20_000, 20_000), 0, "evenly spaced 20 ms packets are not late");
+        }
+        assert_eq!(j.push(25_000, 20_000), 5_000);
+    }
+
+    #[test]
     fn drift_controller() {
         let mut p = Playout::default();
         let ratio = |plan| match plan {
@@ -468,13 +590,13 @@ mod tests {
     #[test]
     fn jitter_window() {
         let mut j = Jitter::default();
-        assert_eq!(j.push(10_000), 0); // on time
-        assert_eq!(j.push(28_000), 18_000); // 18 ms late
-        assert_eq!(j.push(3_000_000), 18_000); // restart pause ignored
+        assert_eq!(j.push(10_000, 10_000), 0); // on time
+        assert_eq!(j.push(28_000, 10_000), 18_000); // 18 ms late
+        assert_eq!(j.push(3_000_000, 10_000), 18_000); // restart pause ignored
         for _ in 0..1000 {
-            j.push(10_000); // 10 s of smooth packets ages the spike out
+            j.push(10_000, 10_000); // 10 s of smooth packets ages the spike out
         }
-        assert_eq!(j.push(10_000), 0);
+        assert_eq!(j.push(10_000, 10_000), 0);
     }
 
     #[test]
@@ -507,6 +629,19 @@ mod tests {
         // ceiling change (M5: applied by restarting the link with a fresh controller) clamps
         assert_eq!(RateControl::new(96_000).on_report(0, 0, 0).0, 96_000);
         assert_eq!(RateControl::new(16_000).on_report(0, 0, 0).0, 16_000, "starting bitrate is the new ceiling");
+
+        // Music Mode: the ceiling rises to 160k and clean reports ramp up in +8k steps
+        let mut r = RateControl::new(ceiling(64_000, false));
+        r.set_ceiling(ceiling(64_000, true));
+        assert_eq!(r.on_report(100, 0, 0).0, 72_000);
+        assert_eq!(r.on_report(100, 0, 0).0, 80_000);
+        for _ in 0..20 {
+            r.on_report(100, 0, 0);
+        }
+        assert_eq!(r.on_report(100, 0, 0).0, 160_000);
+        r.set_ceiling(ceiling(64_000, false));
+        assert_eq!(r.on_report(100, 0, 0).0, 64_000, "back to normal clamps down at once");
+        assert_eq!(ceiling(200_000, false), 96_000);
     }
 
     #[test]
@@ -532,6 +667,17 @@ mod tests {
             c.on_encode(50.0);
         }
         assert_eq!(c.level, 5);
+        // Music Mode raises the max to 10, same climb rules; leaving it clamps back to 5
+        c.set_max(10);
+        for _ in 0..COMPLEXITY_HOLD_FRAMES * 20 {
+            c.on_encode(50.0);
+        }
+        assert_eq!(c.level, 10);
+        for _ in 0..3 {
+            c.on_encode(20_000.0);
+        }
+        assert!(c.level < 10, "backs off under load in Music Mode too");
+        assert_eq!(c.set_max(5), 5);
     }
 
     #[test]

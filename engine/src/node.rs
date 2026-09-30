@@ -1,7 +1,7 @@
 //! One node per process: config, mDNS discovery, PIN pairing (SPAKE2), the Noise control
 //! channel and the single active `Link` (MASTER.md §3.3).
 
-use crate::dsp::RateControl;
+use crate::dsp::{ceiling, RateControl};
 use crate::vdev::Virtual;
 use crate::{Keys, Link, Settings, Stats};
 use anyhow::{anyhow, bail, ensure, Context, Result};
@@ -106,6 +106,9 @@ enum Msg {
     Config(RemoteConfig),
     #[serde(rename = "set_settings")]
     SetSettings { settings: Settings, #[serde(default)] name: Option<String> },
+    /// This side's own Music Mode setting, sent after the session starts and on every change
+    /// (MASTER.md §3.7). Old peers never send it (= off) and ignore it.
+    Mode { music: bool },
 }
 
 struct Found {
@@ -119,6 +122,7 @@ struct Session {
     addr: SocketAddr, // peer's control/UDP address
     link: Option<Link>,
     ctl: Arc<Ctl>,
+    peer_music: bool, // the peer's last `Mode`
 }
 
 struct St {
@@ -337,7 +341,8 @@ impl Node {
             Some(Msg::Error { message }) => bail!("other computer: {message}"),
             _ => bail!("unexpected reply"),
         }
-        self.activate(id, addr, &keys, ctl)?;
+        self.activate(id, addr, &keys, ctl.clone())?;
+        self.send_mode(&ctl);
         let mut st = self.st();
         set_addr(&mut st.cfg, id, addr.to_string());
         save(&self.0.dir, &st.cfg)
@@ -360,20 +365,27 @@ impl Node {
     }
 
     /// Saves the settings; a running link reconnects (fresh keys) to apply audio changes.
-    /// A change to `service` installs/removes the login agent first.
+    /// A change to `service` installs/removes the login agent first. Music Mode switches live:
+    /// the peer is told, no reconnect.
     pub fn set_settings(&self, s: Settings) -> Result<()> {
         ensure!(matches!(s.channels, 1 | 2), "channels must be 1 or 2");
         let old = self.st().cfg.settings.clone();
         if old.service != s.service {
             crate::rpc::login_agent(s.service).context("background service")?;
         }
-        let running = {
+        let music = s.music_mode;
+        let (running, notify) = {
             let mut st = self.st();
-            let audio_changed = Settings { service: s.service, remote_config: s.remote_config, ..old } != s;
+            let audio_changed = Settings { service: s.service, remote_config: s.remote_config, music_mode: music, ..old } != s;
             st.cfg.settings = s;
             save(&self.0.dir, &st.cfg)?;
-            st.session.as_ref().filter(|_| audio_changed).map(|s| (s.peer_id.clone(), s.addr))
+            apply_mode(&st);
+            let sess = st.session.as_ref();
+            (sess.filter(|_| audio_changed).map(|s| (s.peer_id.clone(), s.addr)), sess.filter(|_| !audio_changed && old.music_mode != music).map(|s| s.ctl.clone()))
         };
+        if let Some(ctl) = notify {
+            let _ = ctl.send(&Msg::Mode { music });
+        }
         match running {
             Some((id, addr)) => self.connect_to(&id, &[addr]),
             None => Ok(()),
@@ -464,8 +476,9 @@ impl Node {
                 return Err(e);
             }
         };
-        st.session = Some(Session { peer_id: id.to_string(), addr, link, ctl: ctl.clone() });
+        st.session = Some(Session { peer_id: id.to_string(), addr, link, ctl: ctl.clone(), peer_music: false });
         st.error = None;
+        apply_mode(&st);
         drop(st);
         let n = self.clone();
         std::thread::Builder::new().name("capralink-session".into()).spawn(move || n.serve(ctl))?;
@@ -477,8 +490,7 @@ impl Node {
     /// silence.
     fn serve(&self, ctl: Arc<Ctl>) {
         let _ = ctl.stream.set_read_timeout(Some(Duration::from_secs(1)));
-        let ceiling = self.st().cfg.settings.bitrate;
-        let mut rate = RateControl::new(ceiling);
+        let mut rate = RateControl::new(ceiling(self.st().cfg.settings.bitrate, false));
         let mut last_counts = (0u64, 0u64, 0u64);
         let (mut last_rx, mut last_report) = (Instant::now(), Instant::now());
         let lost = loop {
@@ -486,8 +498,20 @@ impl Node {
                 Ok(Some(Msg::Stop)) => break false,
                 Ok(Some(Msg::Report { received, lost, underruns, .. })) => {
                     last_rx = Instant::now();
+                    rate.set_ceiling({
+                        let st = self.st();
+                        ceiling(st.cfg.settings.bitrate, music(&st))
+                    });
                     let (bitrate, loss_perc) = rate.on_report(received, lost, underruns);
                     self.apply_rate(&ctl, bitrate, loss_perc);
+                }
+                Ok(Some(Msg::Mode { music })) => {
+                    last_rx = Instant::now();
+                    let mut st = self.st();
+                    if let Some(s) = st.session.as_mut().filter(|s| Arc::ptr_eq(&s.ctl, &ctl)) {
+                        s.peer_music = music;
+                    }
+                    apply_mode(&st);
                 }
                 Ok(_) => last_rx = Instant::now(),
                 Err(e) if matches!(e.kind(), io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut) => {
@@ -518,6 +542,11 @@ impl Node {
                 st.error = Some(format!("lost connection to {}", name.unwrap_or_default()));
             }
         }
+    }
+
+    fn send_mode(&self, ctl: &Ctl) {
+        let music = self.st().cfg.settings.music_mode;
+        let _ = ctl.send(&Msg::Mode { music });
     }
 
     /// This session's own receive-side counters, as deltas since `last` (updated in place).
@@ -605,6 +634,7 @@ impl Node {
         save(&self.0.dir, &st.cfg)?;
         drop(st);
         ctl.send(&Msg::Ok)?;
+        self.send_mode(&ctl); // after Ok: an old initiator expects Ok first
         Ok(())
     }
 
@@ -663,6 +693,18 @@ impl Node {
             ServiceEvent::ServiceRemoved(_, fullname) => st.found.retain(|_, f| f.fullname != fullname),
             _ => {}
         }
+    }
+}
+
+/// Effective Music Mode: on when either side has it on (MASTER.md §3.7).
+fn music(st: &St) -> bool {
+    st.cfg.settings.music_mode || st.session.as_ref().is_some_and(|s| s.peer_music)
+}
+
+/// Pushes the effective Music Mode to the running Link.
+fn apply_mode(st: &St) {
+    if let Some(link) = st.session.as_ref().and_then(|s| s.link.as_ref()) {
+        link.set_music(music(st));
     }
 }
 
@@ -1070,6 +1112,34 @@ mod tests {
     }
 
     #[test]
+    fn music_mode_is_link_wide_and_live() {
+        let ((a, adir), (b, bdir)) = (node(), node());
+        a.pair_ip(&format!("127.0.0.1:{}", b.port()), &b.state().pin).unwrap();
+        wait(|| peers(&bdir).len() == 1);
+        let bid = peers(&adir)[0].id.clone();
+        a.connect(&bid).unwrap();
+        wait(|| b.state().devices.iter().any(|d| d.connected));
+        let ctl = |n: &Node| n.st().session.as_ref().unwrap().ctl.clone();
+        let peer_music = |n: &Node| n.st().session.as_ref().is_some_and(|s| s.peer_music);
+        let (ca, cb) = (ctl(&a), ctl(&b));
+        assert!(!peer_music(&a) && !peer_music(&b));
+
+        b.set_settings(Settings { music_mode: true, ..b.state().settings }).unwrap();
+        wait(|| peer_music(&a));
+        assert!(music(&a.st()) && music(&b.st()), "either side on = both on");
+        assert!(!peer_music(&b));
+        a.set_settings(Settings { music_mode: true, ..a.state().settings }).unwrap();
+        wait(|| peer_music(&b));
+        b.set_settings(Settings { music_mode: false, ..b.state().settings }).unwrap();
+        wait(|| !peer_music(&a));
+        assert!(music(&b.st()), "a still has it on");
+        assert!(Arc::ptr_eq(&ca, &ctl(&a)) && Arc::ptr_eq(&cb, &ctl(&b)), "same sessions: no reconnect");
+        assert!(load(&adir).unwrap().settings.music_mode && !load(&bdir).unwrap().settings.music_mode);
+        let _ = std::fs::remove_dir_all(adir);
+        let _ = std::fs::remove_dir_all(bdir);
+    }
+
+    #[test]
     fn set_name_trims_cleans_and_rejects_empty() {
         let (a, adir) = node();
         assert!(a.set_name("   ").unwrap_err().to_string().contains("can't be empty"));
@@ -1087,13 +1157,19 @@ mod tests {
         )
         .unwrap();
         assert!(cfg.peers[0].addr.is_none());
-        assert!(!cfg.settings.remote_config);
+        assert!(!cfg.settings.remote_config && !cfg.settings.music_mode);
 
         let m: Msg = serde_json::from_str(r#"{"type":"pair","id":"a","name":"b"}"#).unwrap();
         assert!(matches!(m, Msg::Pair { port: None, .. }));
 
         let m: Msg = serde_json::from_str(r#"{"type":"set_settings","settings":{"bitrate":48000,"channels":1}}"#).unwrap();
         assert!(matches!(m, Msg::SetSettings { name: None, .. }), "old SetSettings JSON without `name` parses");
+
+        let m: Msg = serde_json::from_str(r#"{"type":"mode","music":true}"#).unwrap();
+        assert!(matches!(m, Msg::Mode { music: true }));
+        let st: Stats = serde_json::from_str(r#"{"sent":0,"received":0,"lost":0,"fec_recovered":0,"underruns":0,"buffer_ms":0,"target_ms":0,
+            "in_peak":0,"out_peak":0,"tx_gap_ms":0,"rx_gap_ms":0,"bitrate":0,"complexity":0}"#).unwrap();
+        assert!(!st.music, "old Stats JSON without `music` parses");
     }
 
     #[test]

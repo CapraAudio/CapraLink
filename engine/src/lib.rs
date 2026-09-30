@@ -22,7 +22,7 @@ pub(crate) fn system_command(program: &str) -> std::process::Command {
 use anyhow::{anyhow, Context};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::{FromSample, Sample, SampleFormat, SizedSample};
-use dsp::{Complexity, Counters, Jitter, Packetizer, Plan, Playout, Resampler, Rx, FRAME, RATE, TARGET};
+use dsp::{Complexity, Counters, Jitter, Packetizer, Plan, Playout, Resampler, Rx, FRAME, MUSIC_TARGET, RATE, TARGET};
 use ringbuf::traits::{Consumer, Observer, Producer, Split};
 use ringbuf::{HeapCons, HeapRb};
 use std::net::{SocketAddr, UdpSocket};
@@ -82,11 +82,13 @@ pub struct Settings {
     pub service: bool,
     /// Let paired computers read and change these settings (MASTER.md §3.6 M6b).
     pub remote_config: bool,
+    /// Music Mode (MASTER.md §3.7): the link runs in it when either side has this on.
+    pub music_mode: bool,
 }
 
 impl Default for Settings {
     fn default() -> Self {
-        Settings { input: None, output: None, bitrate: 64_000, channels: 1, service: false, remote_config: false }
+        Settings { input: None, output: None, bitrate: 64_000, channels: 1, service: false, remote_config: false, music_mode: false }
     }
 }
 
@@ -116,6 +118,9 @@ pub struct Stats {
     /// Currently applied Opus bitrate (bps) and complexity (MASTER.md §3.5).
     pub bitrate: i32,
     pub complexity: u8,
+    /// The link is in Music Mode (either side has it on).
+    #[serde(default)]
+    pub music: bool,
 }
 
 #[derive(Default)]
@@ -133,6 +138,7 @@ struct Shared {
     target_loss_perc: AtomicU8,
     bitrate: AtomicI32, // currently applied, for Stats
     complexity: AtomicU8,
+    music: AtomicBool, // effective Music Mode, set by the node
 }
 
 /// A running TX + RX link. Dropping it stops everything.
@@ -186,7 +192,7 @@ impl Link {
                         prod.push_slice(pcm);
                     }) {
                         let g = gap(&mut last, &shared.rx_gap_us);
-                        shared.jitter_us.store(jitter.push(g), Relaxed);
+                        shared.jitter_us.store(jitter.push(g, rx.period_us()), Relaxed);
                         shared.rx_channels.store(ch, Relaxed);
                     }
                 }
@@ -218,7 +224,13 @@ impl Link {
             rx_gap_ms: self.shared.rx_gap_us.swap(0, Relaxed) as f32 / 1000.0,
             bitrate: self.shared.bitrate.load(Relaxed),
             complexity: self.shared.complexity.load(Relaxed),
+            music: self.shared.music.load(Relaxed),
         }
+    }
+
+    /// Switches this link's sender and receiver into or out of Music Mode, live.
+    pub fn set_music(&self, on: bool) {
+        self.shared.music.store(on, Relaxed);
     }
 
     /// Sets the sender's target bitrate/loss%, applied by the capture callback (MASTER.md §3.5).
@@ -281,6 +293,9 @@ struct Tx {
     sock: UdpSocket,
     peer: SocketAddr,
     dev_ch: usize,
+    rate: u32,
+    user_ch: u16,
+    music: bool,
     rs: Option<Resampler>,
     mixed: Vec<f32>,
     resampled: Vec<f32>,
@@ -299,6 +314,7 @@ impl Tx {
     where
         f32: FromSample<T>,
     {
+        self.apply_mode();
         self.apply_rate();
         let (dev_ch, out_ch) = (self.dev_ch, self.pk.channels());
         self.mixed.clear();
@@ -319,10 +335,11 @@ impl Tx {
             }
             None => &self.mixed,
         };
-        for chunk in pcm.chunks(FRAME * out_ch) {
-            let take = chunk.len().min(FRAME * out_ch - self.frame.len());
+        let frame_len = self.pk.frame() * out_ch;
+        for chunk in pcm.chunks(frame_len) {
+            let take = chunk.len().min(frame_len - self.frame.len());
             self.frame.extend_from_slice(&chunk[..take]);
-            if self.frame.len() == FRAME * out_ch {
+            if self.frame.len() == frame_len {
                 let t0 = Instant::now();
                 if let Ok(p) = self.pk.packet(&self.frame) {
                     if self.sock.send_to(p, self.peer).is_ok() {
@@ -330,16 +347,44 @@ impl Tx {
                         gap(&mut self.last_send, &self.shared.tx_gap_us);
                     }
                 }
-                let us = t0.elapsed().as_micros() as f32;
-                if let Some(level) = self.cx.on_encode(us) {
-                    if self.pk.set_complexity(level).is_ok() {
-                        self.shared.complexity.store(level, Relaxed);
+                // The controller thinks in 10 ms frames: a 20 ms frame counts as two, each with
+                // half the encode time (same CPU share, same ~5 s hold).
+                let tens = self.pk.frame() / FRAME;
+                let us = t0.elapsed().as_micros() as f32 / tens as f32;
+                for _ in 0..tens {
+                    if let Some(level) = self.cx.on_encode(us) {
+                        if self.pk.set_complexity(level).is_ok() {
+                            self.shared.complexity.store(level, Relaxed);
+                        }
                     }
                 }
                 self.frame.clear();
                 self.frame.extend_from_slice(&chunk[take..]);
             }
         }
+    }
+
+    /// Follows the node's Music Mode flag: forced stereo, 20 ms frames, complexity up to 10.
+    /// The encoder is rebuilt in place (seq continues); a partial frame is dropped.
+    fn apply_mode(&mut self) {
+        let music = self.shared.music.load(Relaxed);
+        if music == self.music {
+            return;
+        }
+        self.music = music;
+        let ch = if music { 2 } else { self.user_ch };
+        // ponytail: allocates (new Opus encoder, resampler, buffers) in the audio callback; fine for a rare user toggle
+        let _ = self.pk.set_mode(ch, music);
+        let level = self.cx.set_max(if music { 10 } else { 5 });
+        if self.pk.set_complexity(level).is_ok() {
+            self.shared.complexity.store(level, Relaxed);
+        }
+        let ch = self.pk.channels();
+        if self.rs.is_some() {
+            self.rs = Some(Resampler::new(self.rate, RATE, ch));
+        }
+        self.frame.clear();
+        self.frame.reserve(self.pk.frame() * ch);
     }
 
     /// Applies the session thread's latest bitrate/loss% target, only when it actually changed.
@@ -366,10 +411,13 @@ fn build_input(dev: &cpal::Device, cfg: &Settings, pk: Packetizer, sock: UdpSock
         sock,
         peer,
         dev_ch,
+        rate,
+        user_ch: cfg.channels,
+        music: false,
         rs: (rate != RATE).then(|| Resampler::new(rate, RATE, ch)),
         mixed: Vec::with_capacity(16_384 * ch),
         resampled: Vec::with_capacity(32_768 * ch),
-        frame: Vec::with_capacity(FRAME * ch),
+        frame: Vec::with_capacity(4 * FRAME), // room for a 20 ms stereo frame
         last_send: None,
         shared,
         last_bitrate,
@@ -412,6 +460,7 @@ impl Playback {
             let avail = self.cons.occupied_len() / 2;
             self.scratch.clear();
             let base_need = (missing as f64 * self.base_step).ceil() as usize + 1;
+            self.plan.set_min(if self.shared.music.load(Relaxed) { MUSIC_TARGET } else { TARGET });
             self.plan.set_jitter(self.shared.jitter_us.load(Relaxed) as usize * RATE as usize / 1_000_000);
             match self.plan.plan(avail, base_need) {
                 Plan::Play { discard, ratio } => {

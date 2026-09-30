@@ -219,7 +219,7 @@ Music Mode when **either** side has it on (both directions switch together — o
 |---|---|---|
 | Channels | user's Mono/Stereo | forced stereo |
 | Opus frame | 10 ms | 20 ms (better quality per bit, +10 ms) |
-| Opus signal hint | auto | music, fullband |
+| Opus signal hint | auto | music (bandwidth auto: fullband at music rates, narrows only under back-off) |
 | Bitrate ceiling | Bitrate slider (≤ 96 kbps) | 160 kbps |
 | Bitrate floor on bad network | 8 kbps (AIMD) | same — stay smooth (owner choice) |
 | Encoder complexity max | 5 | 10, same CPU back-off under load |
@@ -321,6 +321,7 @@ See `HANDOFF.md` → "Pending owner actions" for the live list. Answers get move
 | Date | Change |
 |---|---|
 | 2026-09-29 | Project started. Master plan written. No Rust toolchain on the Mac yet. |
+| 2026-09-29 | Music Mode landed (D15): live link-wide switch via `mode` message, encoder rebuilt in-callback with continuing seq, 20 ms/stereo/160k/cx10, 40 ms min cushion; tray check item. Encode cost 0.65% of a core (vs 0.23% normal). 22 tests. Known: old remote configurers reset music_mode on save; no FEC at music bitrates. |
 | 2026-09-29 | Device rename verified by owner. Remaining milestones: M4 (Windows), M7 (installers/signing). |
 | 2026-09-29 | Device rename (D14): set_name + mDNS re-advertise, stored peer names refresh from mDNS/remote_get, remote rename via Configure (remote_config-gated). 18 tests. |
 | 2026-09-29 | M6b verified by owner (Mac configured Deck remotely). M6 done except owner's Mac login check. Next: device rename (owner request). |

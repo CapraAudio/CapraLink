@@ -40,6 +40,7 @@
     flex: 1; padding: 6px; border: none; background: var(--bg); color: var(--fg); cursor: pointer; font-size: 13px;
   }
   .seg button.active { background: var(--accent); color: white; }
+  .seg button:disabled { opacity: .6; cursor: default; }
   input[type=range] { padding: 0; margin-bottom: 4px; }
   .check { display: flex; align-items: center; gap: 6px; font-size: 13px; color: var(--fg); margin: 2px 0 4px; }
   .check input { width: auto; margin: 0; }
@@ -121,13 +122,15 @@
     <label>Bitrate</label>
     <input id="bitrate" type="range" min="8" max="96" step="8" value="64" />
     <div class="bitrate-val" id="bitrateVal">64 kbps</div>
+    <label class="check"><input id="music" type="checkbox" /> Music Mode</label>
+    <div class="hint">Stereo, higher quality, a little more delay — applies to both directions of the link.</div>
   </section>
 
   <section>
     <label class="check"><input id="service" type="checkbox" /> Run in background at login</label>
     <div class="hint">Keeps CapraLink running without this window, even in Steam Game Mode.</div>
     <label class="check"><input id="remoteCfg" type="checkbox" /> Allow paired computers to change these settings</label>
-    <div class="hint">Lets them pick this computer's devices, channels and bitrate.</div>
+    <div class="hint">Lets them pick this computer's devices, channels, bitrate and Music Mode.</div>
   </section>
 
   <div class="meters">
@@ -143,11 +146,12 @@ const { invoke } = window.__TAURI__.core;
 const $ = (id) => document.getElementById(id);
 const els = {
   input: $('input'), output: $('output'), channels: $('channels'), bitrate: $('bitrate'),
-  bitrateVal: $('bitrateVal'), service: $('service'), remoteCfg: $('remoteCfg'), error: $('error'), status: $('status'), stats: $('stats'), devices: $('devices'),
+  bitrateVal: $('bitrateVal'), service: $('service'), remoteCfg: $('remoteCfg'), music: $('music'), error: $('error'), status: $('status'), stats: $('stats'), devices: $('devices'),
   myNameRow: $('myNameRow'),
 };
 
 let channels = 1;
+let effectiveMusic = false; // the link is in Music Mode (either side has it on)
 let settingsLoaded = false;
 let actionError = '';
 let busy = false;
@@ -163,7 +167,19 @@ let pinShown = false, pinTimer = null;
 
 function setChannels(v) {
   channels = v;
-  for (const b of els.channels.children) b.classList.toggle('active', Number(b.dataset.v) === v);
+  showMusic();
+}
+
+const MUSIC_RATE = 'up to 160 kbps (Music Mode)';
+// Music Mode forces stereo and its own bitrate ceiling: show those instead of the user's choice
+function showMusic() {
+  const on = els.music.checked || effectiveMusic;
+  for (const b of els.channels.children) {
+    b.disabled = on;
+    b.classList.toggle('active', Number(b.dataset.v) === (on ? 2 : channels));
+  }
+  els.bitrate.disabled = on;
+  els.bitrateVal.textContent = on ? MUSIC_RATE : els.bitrate.value + ' kbps';
 }
 
 // ---- actions ----
@@ -180,7 +196,7 @@ function saveSettings() {
   act('set_settings', { settings: {
     input: els.input.value || null, output: els.output.value || null,
     bitrate: Number(els.bitrate.value) * 1000, channels, service: els.service.checked,
-    remote_config: els.remoteCfg.checked,
+    remote_config: els.remoteCfg.checked, music_mode: els.music.checked,
   }});
 }
 
@@ -189,7 +205,8 @@ els.channels.addEventListener('click', (e) => {
   setChannels(Number(e.target.dataset.v));
   saveSettings();
 });
-els.bitrate.addEventListener('input', () => { els.bitrateVal.textContent = els.bitrate.value + ' kbps'; });
+els.bitrate.addEventListener('input', showMusic);
+els.music.addEventListener('change', () => { showMusic(); saveSettings(); });
 els.bitrate.addEventListener('change', saveSettings);
 els.input.addEventListener('change', saveSettings);
 els.output.addEventListener('change', saveSettings);
@@ -333,19 +350,33 @@ function remotePanel() {
   pick('Play to', r.outputs, 'CapraLink Input', 'apps on that computer record from it', 'output');
   box.appendChild(el('label', null, 'Channels'));
   const seg = el('div', 'seg');
+  const rate = el('input');
+  const val = el('div', 'bitrate-val');
+  const sync = () => {
+    const on = !!s.music_mode;
+    for (const c of seg.children) { c.disabled = on; c.classList.toggle('active', Number(c.dataset.v) === (on ? 2 : s.channels)); }
+    rate.disabled = on;
+    val.textContent = on ? MUSIC_RATE : rate.value + ' kbps';
+  };
   for (const [v, t] of [[1, 'Mono'], [2, 'Stereo']]) {
-    const b = el('button', s.channels === v ? 'active' : '', t);
-    b.addEventListener('click', () => { s.channels = v; for (const c of seg.children) c.classList.toggle('active', c === b); });
+    const b = el('button', null, t);
+    b.dataset.v = v;
+    b.addEventListener('click', () => { s.channels = v; sync(); });
     seg.appendChild(b);
   }
   box.appendChild(seg);
   box.appendChild(el('label', null, 'Bitrate'));
-  const rate = el('input');
   rate.type = 'range'; rate.min = 8; rate.max = 96; rate.step = 8; rate.value = Math.round(s.bitrate / 1000);
-  const val = el('div', 'bitrate-val', rate.value + ' kbps');
-  rate.addEventListener('input', () => { val.textContent = rate.value + ' kbps'; s.bitrate = Number(rate.value) * 1000; });
+  rate.addEventListener('input', () => { s.bitrate = Number(rate.value) * 1000; sync(); });
   box.appendChild(rate);
   box.appendChild(val);
+  const music = el('label', 'check');
+  const cb = el('input');
+  cb.type = 'checkbox'; cb.checked = !!s.music_mode;
+  cb.addEventListener('change', () => { s.music_mode = cb.checked; sync(); });
+  music.append(cb, ' Music Mode');
+  box.appendChild(music);
+  sync();
   const btns = el('div', 'btns');
   btns.appendChild(button('Close', 'link', () => { remote = null; lastDevices = ''; render(); }));
   btns.appendChild(button('Save', 'btn', async () => {
@@ -405,15 +436,17 @@ async function poll() {
     setSel(els.input, s.input);
     setSel(els.output, s.output);
     els.bitrate.value = Math.round(s.bitrate / 1000);
-    els.bitrateVal.textContent = els.bitrate.value + ' kbps';
-    setChannels(s.channels);
+    channels = s.channels;
   }
   els.service.checked = st.settings.service; // also undoes a failed toggle
   els.remoteCfg.checked = st.settings.remote_config;
+  els.music.checked = !!st.settings.music_mode; // also follows the tray menu's toggle
+  effectiveMusic = !!(st.stats && st.stats.music);
+  showMusic();
   devices = st.devices;
   render();
   const peer = devices.find((d) => d.connected);
-  els.status.textContent = peer ? 'Streaming — ' + peer.name : 'Idle';
+  els.status.textContent = peer ? 'Streaming — ' + peer.name + (effectiveMusic ? ' · Music' : '') : 'Idle';
   els.status.classList.toggle('on', !!peer);
   const s = st.stats;
   if (s) {
