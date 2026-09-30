@@ -111,6 +111,7 @@
     <select id="input"></select>
     <label>Play to</label>
     <select id="output"></select>
+    <div class="hint" id="cableNote" hidden>Windows needs VB-Cable (free) for a CapraLink microphone: vb-audio.com/Cable</div>
   </section>
 
   <section>
@@ -468,7 +469,8 @@ function fill(sel, list, special, hint) {
   const names = list.includes(special) ? [special, ...list.filter((n) => n !== special)] : list;
   for (const name of names) {
     const o = document.createElement('option');
-    o.value = name; o.textContent = name === special ? name + ' — ' + hint : name;
+    const shown = name.startsWith('app:') ? name.slice(4).replace(/\.exe$/i, '') + ' (app audio)' : name; // Windows app capture
+    o.value = name; o.textContent = name === special ? shown + ' — ' + hint : shown;
     sel.appendChild(o);
   }
 }
@@ -476,7 +478,10 @@ function fill(sel, list, special, hint) {
 async function loadDevices() {
   const d = await invoke('devices');
   fill(els.input, d.inputs, 'CapraLink Output', 'apps on this computer play into it');
-  fill(els.output, d.outputs, 'CapraLink Input', 'apps on this computer record from it');
+  // Windows: CapraLink Input is VB-Cable's "CABLE Input"; apps record from its other end
+  const win = navigator.userAgent.includes('Windows');
+  fill(els.output, d.outputs, 'CapraLink Input', win ? 'apps on this computer record from it — pick "CABLE Output" as the microphone in Discord' : 'apps on this computer record from it');
+  $('cableNote').hidden = !win || d.outputs.includes('CapraLink Input');
 }
 
 // Size the window to the content, so it never needs a scroll bar; re-fit whenever the

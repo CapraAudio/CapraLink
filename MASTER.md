@@ -346,6 +346,7 @@ See `HANDOFF.md` → "Pending owner actions" for the live list. Answers get move
 | Date | Change |
 |---|---|
 | 2026-09-29 | Project started. Master plan written. No Rust toolchain on the Mac yet. |
+| 2026-09-30 | M4b/M4c code (engine/src/wincap.rs): process loopback for `app:<exe>`, system loopback "Everything this PC plays" (cpal), VB-Cable → CapraLink Input mapping, UI hints/note. Compiled + type-checked for Windows; runtime untested. |
 | 2026-09-30 | M4a passed: CI Windows build runs on Win 11 Pro (window, tray, daemon, mDNS, pairing, audio both ways with Mac). Windows default devices were Steam Streaming → pick headset explicitly. |
 | 2026-09-29 | Music sounded slow: cushion refills played up to 2% slow → capped at 0.5% in Music Mode. Wi-Fi at the time: stalls 548–892 ms, 15 lost packets. |
 | 2026-09-29 | UI polish: status pill just Streaming/Idle; VU gradient blends green→yellow→red; window auto-fits content height (self-correcting for title bar); tray double-click (Windows). |
