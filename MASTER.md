@@ -293,6 +293,7 @@ See `HANDOFF.md` → "Pending owner actions" for the live list. Answers get move
 | Date | Change |
 |---|---|
 | 2026-09-29 | Project started. Master plan written. No Rust toolchain on the Mac yet. |
+| 2026-09-29 | M6b landed: Manage sessions (get_config/set_settings) gated by target's remote_config; service/remote_config only changeable locally; UI Configure panel + checkbox. 17 tests. Field test pending. |
 | 2026-09-29 | Deck reboot check passed (service auto-starts). M6b started. |
 | 2026-09-29 | M6a verified on Deck: systemd user service runs the engine in Game Mode; Mac↔Deck audio works with Deck in Game Mode (owner confirmed). Pair-by-IP used to re-pair. |
 | 2026-09-29 | Repo made PUBLIC (private Actions minutes exhausted; aligns with D8). Wi-Fi name scrubbed from notes + history (filter-branch, force-push; local branch backup-before-scrub kept), 12 CI runs linked to old commits deleted. |

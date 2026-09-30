@@ -5,7 +5,7 @@ mod node;
 mod rpc;
 mod vdev;
 
-pub use node::{Device, Node, NodeState};
+pub use node::{Device, Node, NodeState, RemoteConfig};
 pub use rpc::{daemon, daemon_exe, serve_rpc, Client, Devices};
 
 /// A command for a system tool (pactl, systemctl, reg, hostname). Inside an AppImage,
@@ -80,11 +80,13 @@ pub struct Settings {
     pub channels: u16,
     /// Start `capralink --daemon` at login (MASTER.md §3.6).
     pub service: bool,
+    /// Let paired computers read and change these settings (MASTER.md §3.6 M6b).
+    pub remote_config: bool,
 }
 
 impl Default for Settings {
     fn default() -> Self {
-        Settings { input: None, output: None, bitrate: 64_000, channels: 1, service: false }
+        Settings { input: None, output: None, bitrate: 64_000, channels: 1, service: false, remote_config: false }
     }
 }
 

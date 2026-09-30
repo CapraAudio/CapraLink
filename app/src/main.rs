@@ -2,7 +2,7 @@
 // a client of that engine (MASTER.md §3.6).
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
-use capralink_engine::{Client, Devices, NodeState, Settings};
+use capralink_engine::{Client, Devices, NodeState, RemoteConfig, Settings};
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::sync::Mutex;
@@ -110,6 +110,16 @@ fn set_settings(app: State<App>, settings: Settings) -> Result<(), String> {
     app.run(|c| c.set_settings(&settings))
 }
 
+#[tauri::command(async)]
+fn remote_get(app: State<App>, id: String) -> Result<RemoteConfig, String> {
+    app.run(|c| c.remote_get(&id))
+}
+
+#[tauri::command(async)]
+fn remote_set(app: State<App>, id: String, settings: Settings) -> Result<(), String> {
+    app.run(|c| c.remote_set(&id, &settings))
+}
+
 /// Tray Quit: the engine goes too unless it is meant to run in the background.
 fn quit(app: &AppHandle) {
     let client = app.state::<App>().client.lock().unwrap_or_else(|e| e.into_inner()).clone();
@@ -160,7 +170,7 @@ fn main() {
         // a second launch (no tray on stock GNOME, Start menu on Windows) brings this window back
         .plugin(tauri_plugin_single_instance::init(|app, _, _| show_window(app)))
         .manage(app)
-        .invoke_handler(tauri::generate_handler![devices, state, pair, pair_ip, connect, disconnect, forget, set_settings])
+        .invoke_handler(tauri::generate_handler![devices, state, pair, pair_ip, connect, disconnect, forget, set_settings, remote_get, remote_set])
         .setup(|app| {
             #[cfg(target_os = "macos")]
             app.set_activation_policy(tauri::ActivationPolicy::Accessory);

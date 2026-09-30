@@ -2,7 +2,7 @@
 //! (one JSON request/response per TCP connection) and the "run at login" agent.
 
 use crate::node::{config_dir_or_default, hex, random, write_private};
-use crate::{Node, NodeState, Settings};
+use crate::{Node, NodeState, RemoteConfig, Settings};
 use anyhow::{anyhow, bail, ensure, Context, Result};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
@@ -127,6 +127,8 @@ fn dispatch(node: &Node, cmd: &str, args: Value) -> Result<Value> {
         }
         "forget" => done(node.forget(&a.id)),
         "set_settings" => done(node.set_settings(a.settings.ok_or_else(|| anyhow!("missing settings"))?)),
+        "remote_get" => Ok(serde_json::to_value(node.remote_get(&a.id)?)?),
+        "remote_set" => done(node.remote_set(&a.id, a.settings.ok_or_else(|| anyhow!("missing settings"))?)),
         "shutdown" => Ok(Value::Null), // `handle` exits after replying
         _ => bail!("unknown command {cmd}"),
     }
@@ -199,6 +201,14 @@ impl Client {
 
     pub fn set_settings(&self, s: &Settings) -> Result<()> {
         self.call("set_settings", json!({ "settings": s }))
+    }
+
+    pub fn remote_get(&self, id: &str) -> Result<RemoteConfig> {
+        self.call("remote_get", json!({ "id": id }))
+    }
+
+    pub fn remote_set(&self, id: &str, s: &Settings) -> Result<()> {
+        self.call("remote_set", json!({ "id": id, "settings": s }))
     }
 
     pub fn shutdown(&self) -> Result<()> {

@@ -52,6 +52,15 @@ pub struct Device {
     pub addr: Option<String>,
 }
 
+/// Another computer's settings and its own device lists, for remote configuration.
+#[derive(Serialize, Deserialize)]
+pub struct RemoteConfig {
+    pub name: String,
+    pub settings: Settings,
+    pub inputs: Vec<String>,
+    pub outputs: Vec<String>,
+}
+
 #[derive(Serialize, Deserialize)]
 struct Config {
     device_id: String,
@@ -90,6 +99,13 @@ enum Msg {
     /// Deltas (since this node's previous report) of its own Link's receive-side counters,
     /// sent every second so the peer's sender can steer bitrate/FEC (MASTER.md §3.5).
     Report { received: u64, lost: u64, underruns: u64, jitter_ms: f32 },
+    /// Instead of `Link`: a one-request remote-configuration session (MASTER.md §3.6 M6b).
+    Manage,
+    #[serde(rename = "get_config")]
+    GetConfig,
+    Config(RemoteConfig),
+    #[serde(rename = "set_settings")]
+    SetSettings { settings: Settings },
 }
 
 struct Found {
@@ -350,7 +366,7 @@ impl Node {
         }
         let running = {
             let mut st = self.st();
-            let audio_changed = Settings { service: s.service, ..old } != s;
+            let audio_changed = Settings { service: s.service, remote_config: s.remote_config, ..old } != s;
             st.cfg.settings = s;
             save(&self.0.dir, &st.cfg)?;
             st.session.as_ref().filter(|_| audio_changed).map(|s| (s.peer_id.clone(), s.addr))
@@ -358,6 +374,50 @@ impl Node {
         match running {
             Some((id, addr)) => self.connect_to(&id, &[addr]),
             None => Ok(()),
+        }
+    }
+
+    /// Reads paired device `id`'s settings and device lists (it must allow remote configuration).
+    pub fn remote_get(&self, id: &str) -> Result<RemoteConfig> {
+        match self.manage(id, &Msg::GetConfig)? {
+            Msg::Config(c) => Ok(c),
+            _ => bail!("unexpected reply"),
+        }
+    }
+
+    /// Changes paired device `id`'s settings, except its `service` and `remote_config`.
+    pub fn remote_set(&self, id: &str, settings: Settings) -> Result<()> {
+        match self.manage(id, &Msg::SetSettings { settings })? {
+            Msg::Ok => Ok(()),
+            _ => bail!("unexpected reply"),
+        }
+    }
+
+    /// One request over its own management session (a separate connection; any audio session
+    /// with that device is left alone).
+    fn manage(&self, id: &str, req: &Msg) -> Result<Msg> {
+        let (addrs, fullname) = self.addrs(id)?;
+        let r = self.manage_at(id, &addrs, req);
+        self.recheck(fullname, r)
+    }
+
+    fn manage_at(&self, id: &str, addrs: &[SocketAddr], req: &Msg) -> Result<Msg> {
+        let (my_id, secret) = {
+            let st = self.st();
+            (st.cfg.device_id.clone(), secret(&st.cfg, id).ok_or_else(|| anyhow!("not paired with that device"))?)
+        };
+        let mut s = dial(addrs)?;
+        send_msg(&mut s, &Msg::Session { id: my_id })?;
+        let (ctl, _) = handshake(&mut s, &secret, true).context("secure connection failed (try pairing again)")?;
+        ctl.send(&Msg::Manage)?;
+        ctl.send(req)?;
+        s.set_read_timeout(Some(LINK_TIMEOUT + IO_TIMEOUT))?; // new audio settings may restart its link
+        let reply = ctl.recv();
+        ctl.close();
+        match reply? {
+            Some(Msg::Error { message }) => bail!("{message}"),
+            Some(m) => Ok(m),
+            None => bail!("unexpected reply"),
         }
     }
 
@@ -501,7 +561,11 @@ impl Node {
     fn on_session(&self, mut s: TcpStream, id: &str) -> Result<()> {
         let secret = secret(&self.st().cfg, id).ok_or_else(|| anyhow!("unknown device"))?;
         let (ctl, keys) = handshake(&mut s, &secret, false)?;
-        let Some(Msg::Link { port, .. }) = ctl.recv()? else { bail!("expected link request") };
+        let port = match ctl.recv()? {
+            Some(Msg::Link { port, .. }) => port,
+            Some(Msg::Manage) => return self.on_manage(&ctl),
+            _ => bail!("expected link request"),
+        };
         let addr = SocketAddr::new(s.peer_addr()?.ip(), port);
         if let Err(e) = self.activate(id, addr, &keys, ctl.clone()) {
             let _ = ctl.send(&Msg::Error { message: format!("{e:#}") });
@@ -513,6 +577,28 @@ impl Node {
         drop(st);
         ctl.send(&Msg::Ok)?;
         Ok(())
+    }
+
+    /// Answers one remote-configuration request; never touches the current session.
+    fn on_manage(&self, ctl: &Ctl) -> Result<()> {
+        let req = ctl.recv()?; // read before replying, so closing can't reset the reply away
+        let (name, local) = {
+            let st = self.st();
+            (st.cfg.name.clone(), st.cfg.settings.clone())
+        };
+        let reply = match req {
+            _ if !local.remote_config => Msg::Error { message: format!("remote configuration is off on {name}") },
+            Some(Msg::GetConfig) => Msg::Config(RemoteConfig { name, settings: local, inputs: crate::input_devices(), outputs: crate::output_devices() }),
+            // `service` and `remote_config` only change locally
+            Some(Msg::SetSettings { settings }) => match self.set_settings(Settings { service: local.service, remote_config: local.remote_config, ..settings }) {
+                Ok(()) => Msg::Ok,
+                Err(e) => Msg::Error { message: format!("{name}: {e:#}") },
+            },
+            _ => Msg::Error { message: "unsupported request".into() },
+        };
+        let r = ctl.send(&reply);
+        ctl.close();
+        r
     }
 
     fn on_mdns(&self, ev: ServiceEvent) {
@@ -891,6 +977,32 @@ mod tests {
     }
 
     #[test]
+    fn remote_config() {
+        let ((a, adir), (b, bdir)) = (node(), node());
+        a.pair_ip(&format!("127.0.0.1:{}", b.port()), &b.state().pin).unwrap();
+        wait(|| peers(&bdir).len() == 1);
+        let bid = peers(&adir)[0].id.clone();
+        a.connect(&bid).unwrap();
+        wait(|| b.state().devices.iter().any(|d| d.connected));
+        let both = || a.state().devices.iter().any(|d| d.connected) && b.state().devices.iter().any(|d| d.connected);
+
+        let err = a.remote_get(&bid).map(drop).unwrap_err().to_string();
+        assert!(err.contains("remote configuration is off"), "{err}");
+        b.set_settings(Settings { remote_config: true, ..b.state().settings }).unwrap();
+        let rc = a.remote_get(&bid).unwrap();
+        assert_eq!((rc.name, &rc.settings), (b.state().name, &b.state().settings));
+        assert!(both(), "a manage session leaves the audio session alone");
+
+        let want = Settings { bitrate: 32_000, channels: 2, service: true, remote_config: false, ..rc.settings };
+        a.remote_set(&bid, want).unwrap();
+        let s = load(&bdir).unwrap().settings;
+        assert_eq!((s.bitrate, s.channels, s.service, s.remote_config), (32_000, 2, false, true));
+        wait(both); // b restarts its link for the new audio settings
+        let _ = std::fs::remove_dir_all(adir);
+        let _ = std::fs::remove_dir_all(bdir);
+    }
+
+    #[test]
     fn old_config_and_hello_without_new_fields_parse() {
         let cfg: Config = serde_json::from_str(
             r#"{"device_id":"a","name":"b","input":null,"output":null,"bitrate":48000,"channels":1,
@@ -898,6 +1010,7 @@ mod tests {
         )
         .unwrap();
         assert!(cfg.peers[0].addr.is_none());
+        assert!(!cfg.settings.remote_config);
 
         let m: Msg = serde_json::from_str(r#"{"type":"pair","id":"a","name":"b"}"#).unwrap();
         assert!(matches!(m, Msg::Pair { port: None, .. }));
