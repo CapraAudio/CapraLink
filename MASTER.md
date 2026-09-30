@@ -210,6 +210,32 @@ the initiator dials fresh each time (addrs incl. remembered address). RPC/App: `
 `remote_set {id, settings}`. UI: "Configure" on paired + reachable devices opens a panel with that
 device's Send from / Play to / Channels / Bitrate.
 
+### 3.7 Music Mode (design, owner-approved answers 2026-09-29)
+
+**What it is:** a link-wide high-quality mode. `Settings.music_mode: bool` per machine; a link runs in
+Music Mode when **either** side has it on (both directions switch together — owner choice).
+
+| Dial | Normal | Music Mode |
+|---|---|---|
+| Channels | user's Mono/Stereo | forced stereo |
+| Opus frame | 10 ms | 20 ms (better quality per bit, +10 ms) |
+| Opus signal hint | auto | music, fullband |
+| Bitrate ceiling | Bitrate slider (≤ 96 kbps) | 160 kbps |
+| Bitrate floor on bad network | 8 kbps (AIMD) | same — stay smooth (owner choice) |
+| Encoder complexity max | 5 | 10, same CPU back-off under load |
+| Receive cushion minimum | 10 ms | 40 ms (+30 ms; owner accepted +40–60 ms total) |
+
+**Signalling:** a new control message `{"type":"mode","music":bool}` sent at session start and whenever
+the local setting changes; each side computes `effective = local || peer` and applies it to its own
+sender (frame/channels/bitrate ceiling/complexity) and receiver (cushion). Old peers ignore the message
+(treated as off). Switching is live — no reconnect: the sender rebuilds its Opus encoder on the next
+frame (seq continues, so nonces never repeat); the receiver already recreates its decoder on a channel
+change and must size PLC/FEC to the incoming frame duration (10 or 20 ms).
+
+**UI:** "Music Mode" checkbox in the main window (next to Channels/Bitrate; the Mono/Stereo control and
+bitrate label show the forced values while it's on), in the remote Configure panel, and as a checkable
+item in the tray menu. Status pill shows "Streaming — <peer> · Music" when active.
+
 ## 4. Feasibility notes (owner asked for honest feedback)
 
 1. **Virtual devices on Windows are the hardest part.** Windows has no user-mode way to create
@@ -264,6 +290,7 @@ device's Send from / Play to / Channels / Bitrate.
 | D5 | 2026-09-29 | UDP + per-packet encryption keyed by PIN pairing | Low latency, LAN-safe |
 | D6 | 2026-09-29 | "Service" = headless login agent, not system service | OS audio is per-user-session |
 | D7 | 2026-09-29 | One peer at a time (1:1 link) | Covers the use case; simplest |
+| D15 | 2026-09-29 | Music Mode = link-wide (either side on → both directions): stereo, 20 ms frames, 160 kbps ceiling, complexity 10 w/ back-off, 40 ms min cushion; AIMD floor unchanged | Owner answers (quality over latency, smooth over pristine on bad Wi-Fi) |
 | D14 | 2026-09-29 | Device names: each computer has an editable name (config.name) that peers see (mDNS TXT + stored peer name refresh); changeable locally or via remote config | Owner chose global rename over per-machine nicknames |
 | D13 | 2026-09-29 | M6: single binary with `--daemon` engine mode + UI client over token-authenticated loopback RPC; service = OS login agent running the daemon | Game Mode/headless support, zero webview while gaming, one download per OS, keeps macOS mic permission |
 | D12 | 2026-09-29 | M5: network drives bitrate (AIMD on receiver loss/underrun reports, slider = ceiling); CPU drives Opus complexity (encode-time EMA) | Opus bitrate ≠ CPU cost; complexity is the real CPU knob |
