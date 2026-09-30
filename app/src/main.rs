@@ -8,7 +8,7 @@ use std::process::{Command, Stdio};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 use tauri::menu::{CheckMenuItem, Menu, MenuItem};
-use tauri::tray::TrayIconBuilder;
+use tauri::tray::{TrayIconBuilder, TrayIconEvent};
 use tauri::{AppHandle, Manager, RunEvent, State, WebviewUrl, WebviewWindowBuilder};
 
 /// Connection to the engine daemon, (re)made on demand.
@@ -241,6 +241,13 @@ fn main() {
                     "music" => toggle_music(app, music.clone()),
                     "quit" => quit(app),
                     _ => {}
+                })
+                // double-click opens the window where the platform reports it (Windows); macOS
+                // opens the menu on the first click and Linux trays send no clicks at all
+                .on_tray_icon_event(|tray, event| {
+                    if let TrayIconEvent::DoubleClick { .. } = event {
+                        show_window(tray.app_handle());
+                    }
                 })
                 .build(app)?;
 
