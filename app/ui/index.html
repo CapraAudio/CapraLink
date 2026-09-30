@@ -63,7 +63,7 @@
   .pairbox { display: flex; gap: 6px; align-items: center; padding: 0 0 8px; }
   .pairbox input { margin: 0; letter-spacing: .2em; font-variant-numeric: tabular-nums; }
   .pairbox input.ip { flex: 1.6; letter-spacing: normal; }
-  .pairbox input.pin { width: 60px; }
+  .pairbox input.code { flex: 1; min-width: 0; }
   .empty { color: var(--sub); font-size: 12px; padding: 4px 0 10px; }
   #error { color: var(--danger); font-size: 11px; margin-top: 6px; min-height: 14px; }
   #stats { font-size: 11px; color: var(--sub); text-align: center; }
@@ -87,9 +87,10 @@
   <section>
     <h2>Devices</h2>
     <div id="devices"><div class="empty">Looking for other CapraLink computers on this network…</div></div>
+    <div class="hint">Not listed? Pair by IP address:</div>
     <div class="pairbox">
       <input id="ipAddr" class="ip" placeholder="192.168.1.20" />
-      <input id="ipPin" class="pin" maxlength="6" inputmode="numeric" placeholder="PIN" />
+      <input id="ipPin" class="code" maxlength="6" inputmode="numeric" placeholder="PIN" />
       <button class="btn" id="ipPairBtn">Pair</button>
     </div>
   </section>
