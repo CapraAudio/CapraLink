@@ -480,11 +480,21 @@ async function loadDevices() {
 
 // Size the window to the content, so it never needs a scroll bar; re-fit whenever the
 // content grows or shrinks (devices appearing, Configure panel, errors).
-let fittedHeight = 0;
-new ResizeObserver(() => {
-  const h = Math.ceil(document.body.getBoundingClientRect().height);
-  if (h !== fittedHeight) { fittedHeight = h; invoke('fit', { height: h }).catch(() => {}); }
-}).observe(document.body);
+// `chrome` is whatever the platform eats from the requested size (title bar, rounding):
+// measured once after the first fit, then added to every request.
+let fittedHeight = 0, chrome = 0;
+async function fitWindow() {
+  const h = Math.ceil(document.body.getBoundingClientRect().height) + 1;
+  if (h === fittedHeight) return;
+  fittedHeight = h;
+  try {
+    await invoke('fit', { height: h + chrome });
+    await new Promise((r) => setTimeout(r, 100)); // let the resize land
+    const short = h - window.innerHeight;
+    if (short > 0) { chrome += short; await invoke('fit', { height: h + chrome }); }
+  } catch (_) {}
+}
+new ResizeObserver(fitWindow).observe(document.body);
 
 (async function init() {
   // options must exist before saved selections can apply; the engine may still be starting
