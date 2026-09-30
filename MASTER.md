@@ -199,10 +199,16 @@ these to the real per-OS device names in one small function; the UI lists them f
   (the running daemon keeps running).
 - **Quit** in the tray: service off → also shut the daemon down; service on → only the UI exits.
 
-**M6b — remote configuration** (after M6a): `Settings.remote_config: bool` (default off). A paired
-peer may open a control session without audio (`Manage` instead of `Link`) to `GetConfig`
-(name, settings, device lists) and `SetSettings`; refused unless the target allows it. UI: a
-"Configure" action on paired, online devices that allow it.
+**M6b — remote configuration.** `Settings.remote_config: bool` (default off; UI checkbox "Allow paired
+computers to change these settings"). A paired peer opens a normal Noise session but sends
+`{"type":"manage"}` instead of `link`; it never touches the target's audio session. If the target has
+remote_config off → `error` "remote configuration is off on <name>" and close. Otherwise requests on
+that channel: `get_config` → `{name, settings, inputs, outputs}` (target's own device lists) and
+`set_settings {settings}` → applied via the normal set_settings path, EXCEPT `service` and
+`remote_config` keep the target's local values (only changeable locally). One request per connection;
+the initiator dials fresh each time (addrs incl. remembered address). RPC/App: `remote_get {id}`,
+`remote_set {id, settings}`. UI: "Configure" on paired + reachable devices opens a panel with that
+device's Send from / Play to / Channels / Bitrate.
 
 ## 4. Feasibility notes (owner asked for honest feedback)
 
@@ -287,6 +293,7 @@ See `HANDOFF.md` → "Pending owner actions" for the live list. Answers get move
 | Date | Change |
 |---|---|
 | 2026-09-29 | Project started. Master plan written. No Rust toolchain on the Mac yet. |
+| 2026-09-29 | Deck reboot check passed (service auto-starts). M6b started. |
 | 2026-09-29 | M6a verified on Deck: systemd user service runs the engine in Game Mode; Mac↔Deck audio works with Deck in Game Mode (owner confirmed). Pair-by-IP used to re-pair. |
 | 2026-09-29 | Repo made PUBLIC (private Actions minutes exhausted; aligns with D8). Wi-Fi name scrubbed from notes + history (filter-branch, force-push; local branch backup-before-scrub kept), 12 CI runs linked to old commits deleted. |
 | 2026-09-29 | M6a landed (engine/src/rpc.rs): `capralink --daemon` headless engine + loopback RPC (token 0600) + UI client that auto-spawns the daemon; Settings.service installs LaunchAgent / systemd user unit / HKCU Run key. Daemon idle 14.6 MB, 0% CPU. 15 tests. Untested: UI mode, agents on real machines. |
