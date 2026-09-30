@@ -110,6 +110,7 @@ fn dispatch(node: &Node, cmd: &str, args: Value) -> Result<Value> {
     struct Args {
         id: String,
         pin: String,
+        addr: String,
         settings: Option<Settings>,
     }
     let a: Args = if args.is_null() { Args::default() } else { serde_json::from_value(args)? };
@@ -118,6 +119,7 @@ fn dispatch(node: &Node, cmd: &str, args: Value) -> Result<Value> {
         "state" => Ok(serde_json::to_value(node.state())?),
         "devices" => Ok(serde_json::to_value(Devices { inputs: crate::input_devices(), outputs: crate::output_devices() })?),
         "pair" => done(node.pair(&a.id, &a.pin)),
+        "pair_ip" => node.pair_ip(&a.addr, &a.pin).map(Value::from),
         "connect" => done(node.connect(&a.id)),
         "disconnect" => {
             node.disconnect();
@@ -177,6 +179,10 @@ impl Client {
 
     pub fn pair(&self, id: &str, pin: &str) -> Result<()> {
         self.call("pair", json!({ "id": id, "pin": pin }))
+    }
+
+    pub fn pair_ip(&self, addr: &str, pin: &str) -> Result<String> {
+        self.call("pair_ip", json!({ "addr": addr, "pin": pin }))
     }
 
     pub fn connect(&self, id: &str) -> Result<()> {

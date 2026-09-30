@@ -86,6 +86,11 @@ fn pair(app: State<App>, id: String, pin: String) -> Result<(), String> {
 }
 
 #[tauri::command(async)]
+fn pair_ip(app: State<App>, addr: String, pin: String) -> Result<String, String> {
+    app.run(|c| c.pair_ip(&addr, &pin))
+}
+
+#[tauri::command(async)]
 fn connect(app: State<App>, id: String) -> Result<(), String> {
     app.run(|c| c.connect(&id))
 }
@@ -155,7 +160,7 @@ fn main() {
         // a second launch (no tray on stock GNOME, Start menu on Windows) brings this window back
         .plugin(tauri_plugin_single_instance::init(|app, _, _| show_window(app)))
         .manage(app)
-        .invoke_handler(tauri::generate_handler![devices, state, pair, connect, disconnect, forget, set_settings])
+        .invoke_handler(tauri::generate_handler![devices, state, pair, pair_ip, connect, disconnect, forget, set_settings])
         .setup(|app| {
             #[cfg(target_os = "macos")]
             app.set_activation_policy(tauri::ActivationPolicy::Accessory);

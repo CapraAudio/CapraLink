@@ -136,7 +136,10 @@ config, mDNS advertise+browse, a TCP control listener, and at most one `Link` (D
   Fresh keys every session → seq-as-nonce never repeats. Packet v2:
   `magic u16 | version u8 (2) | seq u32 | AEAD(channels u8 | opus)` with the 7-byte header as AAD.
   Packets failing auth are dropped silently. UDP from any address other than the session peer ignored.
-- **Not in M2:** manual add-by-IP (add if mDNS proves unreliable), multiple simultaneous peers (D7),
+- **Manual fallback (added 2026-09-29, owner's Wi-Fi drops Mac→Deck multicast):** "Pair by IP address"
+  (`pair_ip`), and each peer's last working control address is stored (`Peer.addr`, pair hello carries the
+  initiator's port) so Connect works without discovery.
+- **Not in M2:** multiple simultaneous peers (D7),
   remote config (M6).
 
 ### 3.4 Virtual devices (M3 design)

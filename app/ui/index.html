@@ -62,6 +62,8 @@
   .link { border: none; background: none; color: var(--sub); font-size: 11px; cursor: pointer; padding: 2px 4px; text-decoration: underline; }
   .pairbox { display: flex; gap: 6px; align-items: center; padding: 0 0 8px; }
   .pairbox input { margin: 0; letter-spacing: .2em; font-variant-numeric: tabular-nums; }
+  .pairbox input.ip { flex: 1.6; letter-spacing: normal; }
+  .pairbox input.pin { width: 60px; }
   .empty { color: var(--sub); font-size: 12px; padding: 4px 0 10px; }
   #error { color: var(--danger); font-size: 11px; margin-top: 6px; min-height: 14px; }
   #stats { font-size: 11px; color: var(--sub); text-align: center; }
@@ -85,6 +87,11 @@
   <section>
     <h2>Devices</h2>
     <div id="devices"><div class="empty">Looking for other CapraLink computers on this network…</div></div>
+    <div class="pairbox">
+      <input id="ipAddr" class="ip" placeholder="192.168.1.20" />
+      <input id="ipPin" class="pin" maxlength="6" inputmode="numeric" placeholder="PIN" />
+      <button class="btn" id="ipPairBtn">Pair</button>
+    </div>
   </section>
 
   <section>
@@ -166,6 +173,21 @@ els.input.addEventListener('change', saveSettings);
 els.output.addEventListener('change', saveSettings);
 els.service.addEventListener('change', saveSettings);
 
+// ---- pair by IP (manual fallback when mDNS discovery can't see the other computer) ----
+els.ipAddr = $('ipAddr'); els.ipPin = $('ipPin'); els.ipPairBtn = $('ipPairBtn');
+els.ipPin.addEventListener('input', () => { els.ipPin.value = els.ipPin.value.replace(/\D/g, ''); });
+async function pairIp() {
+  const addr = els.ipAddr.value, pin = els.ipPin.value;
+  busy = true; actionError = ''; els.ipPairBtn.disabled = true; render();
+  try { await invoke('pair_ip', { addr, pin }); els.ipAddr.value = ''; els.ipPin.value = ''; }
+  catch (e) { actionError = String(e); }
+  busy = false; els.ipPairBtn.disabled = false;
+  await poll();
+}
+els.ipPairBtn.addEventListener('click', pairIp);
+els.ipAddr.addEventListener('keydown', (e) => { if (e.key === 'Enter') pairIp(); });
+els.ipPin.addEventListener('keydown', (e) => { if (e.key === 'Enter') pairIp(); });
+
 // ---- devices list ----
 function el(tag, cls, text) {
   const e = document.createElement(tag);
@@ -196,14 +218,19 @@ function render() {
     const row = el('div', 'dev');
     const info = el('div', 'info');
     info.appendChild(el('div', 'name', d.name));
-    info.appendChild(el('div', 'st', d.connected ? 'Paired · Connected' : d.paired ? (d.online ? 'Paired · Online' : 'Paired · Offline') : 'Not paired'));
+    const status = d.connected ? 'Paired · Connected'
+      : !d.paired ? 'Not paired'
+      : d.online ? 'Paired · Online'
+      : d.reachable ? 'Paired · Offline (last seen at ' + d.addr + ')'
+      : 'Paired · Offline';
+    info.appendChild(el('div', 'st', status));
     row.appendChild(info);
     if (d.paired) row.appendChild(button('Forget', 'link', () => act('forget', { id: d.id })));
     if (!d.paired) {
       row.appendChild(button('Pair', 'btn', () => { pairingId = pairingId === d.id ? null : d.id; pinDraft = ''; render(); }));
     } else if (d.connected) {
       row.appendChild(button('Disconnect', 'btn stop', () => act('disconnect')));
-    } else if (d.online) {
+    } else if (d.reachable) {
       row.appendChild(button('Connect', 'btn', () => act('connect', { id: d.id })));
     }
     list.appendChild(row);

@@ -46,6 +46,10 @@ pub struct Device {
     pub paired: bool,
     pub online: bool,
     pub connected: bool,
+    /// Online, or offline but reachable at a remembered address (manual Connect still works).
+    pub reachable: bool,
+    /// Last address that worked for this peer (for "last seen at" display), if any.
+    pub addr: Option<String>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -63,13 +67,19 @@ struct Peer {
     id: String,
     name: String,
     secret: String, // 32-byte hex
+    /// Last "ip:port" that worked for reaching this peer's control port (manual-connect fallback
+    /// when mDNS discovery can't see it).
+    #[serde(default)]
+    addr: Option<String>,
 }
 
 /// Control messages. Pair/Hello/Session travel in clear; the rest inside Noise.
 #[derive(Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "lowercase")]
 enum Msg {
-    Pair { id: String, name: String },
+    /// `port` = the sender's own listening (control/audio) port, so the responder can remember
+    /// how to reach it later without mDNS; absent (older peer) means don't record it.
+    Pair { id: String, name: String, #[serde(default)] port: Option<u16> },
     Hello { id: String, name: String },
     Session { id: String },
     Link { channels: u16, port: u16 },
@@ -182,17 +192,22 @@ impl Node {
             .cfg
             .peers
             .iter()
-            .map(|p| Device {
-                id: p.id.clone(),
-                name: st.found.get(&p.id).map_or(&p.name, |f| &f.name).clone(),
-                paired: true,
-                online: st.found.contains_key(&p.id) || conn == Some(&p.id),
-                connected: conn == Some(&p.id),
+            .map(|p| {
+                let online = st.found.contains_key(&p.id) || conn == Some(&p.id);
+                Device {
+                    id: p.id.clone(),
+                    name: st.found.get(&p.id).map_or(&p.name, |f| &f.name).clone(),
+                    paired: true,
+                    online,
+                    connected: conn == Some(&p.id),
+                    reachable: online || p.addr.is_some(),
+                    addr: p.addr.clone(),
+                }
             })
             .collect();
         for (id, f) in &st.found {
             if !st.cfg.peers.iter().any(|p| p.id == *id) {
-                devices.push(Device { id: id.clone(), name: f.name.clone(), paired: false, online: true, connected: false });
+                devices.push(Device { id: id.clone(), name: f.name.clone(), paired: false, online: true, connected: false, reachable: true, addr: None });
             }
         }
         devices.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()).then(a.id.cmp(&b.id)));
@@ -207,11 +222,28 @@ impl Node {
         }
     }
 
-    /// Address of a device seen on the network. A failed attempt asks mDNS to re-check it.
+    /// Addresses to try for a device: mDNS-discovered ones first, then its remembered address
+    /// (deduped), so a manual pairing/connect still works once mDNS has found it too. If mDNS
+    /// hasn't found it, falls back to the remembered address alone. A failed attempt asks mDNS
+    /// to re-check the discovered entry, if any.
     fn addrs(&self, id: &str) -> Result<(Vec<SocketAddr>, String)> {
         let st = self.st();
-        let f = st.found.get(id).ok_or_else(|| anyhow!("that device is offline"))?;
-        Ok((f.addrs.clone(), f.fullname.clone()))
+        let stored = st.cfg.peers.iter().find(|p| p.id == id).and_then(|p| p.addr.as_deref()).and_then(|a| a.parse().ok());
+        match st.found.get(id) {
+            Some(f) => {
+                let mut addrs = f.addrs.clone();
+                if let Some(a) = stored {
+                    if !addrs.contains(&a) {
+                        addrs.push(a);
+                    }
+                }
+                Ok((addrs, f.fullname.clone()))
+            }
+            None => match stored {
+                Some(a) => Ok((vec![a], String::new())),
+                None => Err(anyhow!("that device is offline")),
+            },
+        }
     }
 
     fn recheck<T>(&self, fullname: String, r: Result<T>) -> Result<T> {
@@ -238,15 +270,27 @@ impl Node {
             (st.cfg.device_id.clone(), st.cfg.name.clone())
         };
         let mut s = dial(addrs)?;
-        send_msg(&mut s, &Msg::Pair { id: my_id.clone(), name: my_name })?;
+        let addr = s.peer_addr()?.to_string();
+        send_msg(&mut s, &Msg::Pair { id: my_id.clone(), name: my_name, port: Some(self.0.port) })?;
         let Msg::Hello { id, name } = recv_msg(&mut s)? else { bail!("unexpected reply") };
         check_id(&id)?;
         let secret = pake(&mut s, pin, true, &my_id, &id).map_err(|_| anyhow!("pairing failed — check the PIN"))?;
         let mut st = self.st();
-        add_peer(&mut st.cfg, &id, &name, &secret);
+        add_peer(&mut st.cfg, &id, &name, &secret, Some(addr));
         save(&self.0.dir, &st.cfg)?;
         st.error = None;
         Ok(id)
+    }
+
+    /// Pairs directly by address, bypassing mDNS discovery (for when multicast is blocked on
+    /// the LAN). `addr` is "ip", "ip:port" (IPv4/IPv6 literal or hostname) or blank port meaning
+    /// the default. Returns the paired peer's name.
+    pub fn pair_ip(&self, addr: &str, pin: &str) -> Result<String> {
+        let addr = addr.trim();
+        ensure!(!addr.is_empty(), "enter the other computer's IP address");
+        let id = self.pair_addr(&resolve(addr)?, pin)?;
+        let st = self.st();
+        Ok(st.cfg.peers.iter().find(|p| p.id == id).map_or(id, |p| p.name.clone()))
     }
 
     pub fn connect(&self, id: &str) -> Result<()> {
@@ -274,7 +318,10 @@ impl Node {
             Some(Msg::Error { message }) => bail!("other computer: {message}"),
             _ => bail!("unexpected reply"),
         }
-        self.activate(id, addr, &keys, ctl)
+        self.activate(id, addr, &keys, ctl)?;
+        let mut st = self.st();
+        set_addr(&mut st.cfg, id, addr.to_string());
+        save(&self.0.dir, &st.cfg)
     }
 
     pub fn disconnect(&self) {
@@ -416,14 +463,18 @@ impl Node {
 
     fn incoming(&self, mut s: TcpStream) -> Result<()> {
         match recv_msg(&mut s)? {
-            Msg::Pair { id, name } => self.on_pair(s, &id, &name),
+            Msg::Pair { id, name, port } => self.on_pair(s, &id, &name, port),
             Msg::Session { id } => self.on_session(s, &id),
             _ => bail!("unexpected hello"),
         }
     }
 
-    fn on_pair(&self, mut s: TcpStream, id: &str, name: &str) -> Result<()> {
+    fn on_pair(&self, mut s: TcpStream, id: &str, name: &str, port: Option<u16>) -> Result<()> {
         check_id(id)?;
+        let addr = match port {
+            Some(p) => Some(SocketAddr::new(s.peer_addr()?.ip(), p).to_string()),
+            None => None,
+        };
         let (my_id, my_name, pin) = {
             let st = self.st();
             (st.cfg.device_id.clone(), st.cfg.name.clone(), st.pin.clone())
@@ -433,7 +484,7 @@ impl Node {
         let mut st = self.st();
         match r {
             Ok(secret) => {
-                add_peer(&mut st.cfg, id, name, &secret);
+                add_peer(&mut st.cfg, id, name, &secret, addr);
                 (st.pin, st.failures, st.error) = (new_pin(), 0, None);
                 save(&self.0.dir, &st.cfg)
             }
@@ -456,6 +507,10 @@ impl Node {
             let _ = ctl.send(&Msg::Error { message: format!("{e:#}") });
             return Err(e);
         }
+        let mut st = self.st();
+        set_addr(&mut st.cfg, id, addr.to_string());
+        save(&self.0.dir, &st.cfg)?;
+        drop(st);
         ctl.send(&Msg::Ok)?;
         Ok(())
     }
@@ -538,9 +593,32 @@ pub(crate) fn write_private(dir: &Path, name: &str, data: &[u8]) -> Result<()> {
     Ok(())
 }
 
-fn add_peer(cfg: &mut Config, id: &str, name: &str, secret: &[u8; 32]) {
+fn add_peer(cfg: &mut Config, id: &str, name: &str, secret: &[u8; 32], addr: Option<String>) {
     cfg.peers.retain(|p| p.id != id);
-    cfg.peers.push(Peer { id: id.to_string(), name: clean_name(name), secret: hex(secret) });
+    cfg.peers.push(Peer { id: id.to_string(), name: clean_name(name), secret: hex(secret), addr });
+}
+
+/// Updates the remembered address of an already-paired peer, if it's still paired.
+fn set_addr(cfg: &mut Config, id: &str, addr: String) {
+    if let Some(p) = cfg.peers.iter_mut().find(|p| p.id == id) {
+        p.addr = Some(addr);
+    }
+}
+
+/// Parses a user-typed "ip" or "ip:port" (IPv4/IPv6 literal or hostname), defaulting to the
+/// standard port when none is given.
+fn resolve(addr: &str) -> Result<Vec<SocketAddr>> {
+    use std::net::{IpAddr, ToSocketAddrs};
+    if let Ok(sa) = addr.parse::<SocketAddr>() {
+        return Ok(vec![sa]);
+    }
+    if let Ok(ip) = addr.parse::<IpAddr>() {
+        return Ok(vec![SocketAddr::new(ip, 47800)]);
+    }
+    let with_port = if addr.contains(':') { addr.to_string() } else { format!("{addr}:47800") };
+    let addrs: Vec<SocketAddr> = with_port.to_socket_addrs().with_context(|| format!("can't resolve {addr}"))?.collect();
+    ensure!(!addrs.is_empty(), "can't resolve {addr}");
+    Ok(addrs)
 }
 
 fn secret(cfg: &Config, id: &str) -> Option<[u8; 32]> {
@@ -786,19 +864,23 @@ mod tests {
         assert_ne!(b.state().pin, pin, "5 failures rotate the PIN");
 
         let pin = b.state().pin;
-        let bid = a.pair_addr(&[addr(&b)], &pin).unwrap();
+        // pair by IP address (no mDNS involved either side)
+        let bname = a.pair_ip(&format!("127.0.0.1:{}", b.port()), &pin).unwrap();
         wait(|| peers(&bdir).len() == 1); // the responder saves just after sending its confirmation
         let (pa, pb) = (peers(&adir), peers(&bdir));
         assert_eq!((pa.len(), pb.len()), (1, 1));
-        assert_eq!(pa[0].id, bid);
+        let bid = pa[0].id.clone();
+        assert_eq!(pa[0].name, bname);
         assert_eq!(pb[0].id, load(&adir).unwrap().device_id);
         assert_eq!(pa[0].secret, pb[0].secret);
+        assert_eq!(pa[0].addr.as_deref(), Some(format!("127.0.0.1:{}", b.port())).as_deref());
+        assert_eq!(pb[0].addr.as_deref(), Some(format!("127.0.0.1:{}", a.port())).as_deref(), "responder records the initiator's listening port");
         assert_ne!(b.state().pin, pin, "PIN rotates after pairing");
 
-        // session: both sides show connected; a disconnect reaches the other side
-        a.connect_to(&bid, &[addr(&b)]).unwrap();
+        // session: mDNS is off on both, so `connect` must fall back to the remembered address
+        a.connect(&bid).unwrap();
         wait(|| b.state().devices.iter().any(|d| d.connected));
-        assert!(a.state().devices.iter().any(|d| d.id == bid && d.connected && d.paired));
+        assert!(a.state().devices.iter().any(|d| d.id == bid && d.connected && d.paired && d.reachable));
         a.disconnect();
         wait(|| !b.state().devices.iter().any(|d| d.connected));
         // after forgetting, the other side rejects the session
@@ -806,6 +888,19 @@ mod tests {
         assert!(a.connect_to(&bid, &[addr(&b)]).is_err());
         let _ = std::fs::remove_dir_all(adir);
         let _ = std::fs::remove_dir_all(bdir);
+    }
+
+    #[test]
+    fn old_config_and_hello_without_new_fields_parse() {
+        let cfg: Config = serde_json::from_str(
+            r#"{"device_id":"a","name":"b","input":null,"output":null,"bitrate":48000,"channels":1,
+                "peers":[{"id":"1","name":"c","secret":"00"}]}"#,
+        )
+        .unwrap();
+        assert!(cfg.peers[0].addr.is_none());
+
+        let m: Msg = serde_json::from_str(r#"{"type":"pair","id":"a","name":"b"}"#).unwrap();
+        assert!(matches!(m, Msg::Pair { port: None, .. }));
     }
 
     #[test]
