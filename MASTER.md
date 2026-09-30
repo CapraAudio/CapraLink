@@ -287,6 +287,7 @@ See `HANDOFF.md` → "Pending owner actions" for the live list. Answers get move
 | Date | Change |
 |---|---|
 | 2026-09-29 | Project started. Master plan written. No Rust toolchain on the Mac yet. |
+| 2026-09-29 | Repo made PUBLIC (private Actions minutes exhausted; aligns with D8). Wi-Fi name scrubbed from notes + history (filter-branch, force-push; local branch backup-before-scrub kept), 12 CI runs linked to old commits deleted. |
 | 2026-09-29 | M6a landed (engine/src/rpc.rs): `capralink --daemon` headless engine + loopback RPC (token 0600) + UI client that auto-spawns the daemon; Settings.service installs LaunchAgent / systemd user unit / HKCU Run key. Daemon idle 14.6 MB, 0% CPU. 15 tests. Untested: UI mode, agents on real machines. |
 | 2026-09-29 | M5 landed: 1 s receiver reports over the control channel (replace 5 s ping as keepalive); AIMD RateControl (slider = ceiling), loss-driven FEC %, encode-time Complexity controller; stats show kbps + cx. 12 tests. |
 | 2026-09-29 | End-to-end Discord call through CapraLink virtual devices (Mac=A, Linux=B) works. |

@@ -7,7 +7,7 @@ Read `MASTER.md` first. This file is the live position.
 - Phase: M0 + M1 done and owner-validated (Mac↔Linux, no clicks). M2 code committed + verified locally (MASTER §3.3). Owner test 2026-09-29: discovery + PIN pairing Mac(app)↔Linux(capralinkd) WORKS. Connect/audio/disconnect verified → M2 DONE. Linux needs new capralinkd (v1/v2 packets incompatible). Config dir override: $CAPRALINK_CONFIG_DIR. Now: M3 virtual devices (Linux first).
 
 ## Machine facts
-- GitHub: private repo CapraAudio/CapraLink, branch main. Repo-local git identity set.
+- GitHub: PUBLIC repo CapraAudio/CapraLink (since 2026-09-29), branch main. Never commit personal info (network names, IPs, emails) — history was scrubbed once already. Repo-local git identity set.
 - No brew/pkg-config. cmake 4.4 installed user-level at ~/Library/Python/3.9/bin (NOT on PATH): `export PATH=$HOME/Library/Python/3.9/bin:$HOME/.cargo/bin:$PATH` before cargo.
 - Dev machine: macOS 26.6.2 (Apple Silicon assumed), project at `~/Documents/CapraLink`.
 - Rust 1.98.1 via rustup in ~/.cargo (installed without PATH edit; use ~/.cargo/bin or `. ~/.cargo/env`).
