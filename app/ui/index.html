@@ -76,6 +76,7 @@
   .bar > i { position: absolute; top: 0; right: 0; bottom: 0; width: 100%; background: var(--border);
     transition: width 70ms linear; }
   .pinrow { display: flex; align-items: baseline; gap: 10px; }
+  h2.sub { margin-top: 10px; }
   /* fixed width (7 characters + letter spacing) so Show/Hide stays put when dots swap for digits */
   .pinrow .pin { width: calc(7ch + 0.84em); white-space: nowrap; }
   .remote { padding: 6px 0 0; border-top: 1px solid var(--border); }
@@ -107,14 +108,9 @@
   </section>
 
   <section>
+    <h2>Sending</h2>
     <label>Send from</label>
     <select id="input"></select>
-    <label>Play to</label>
-    <select id="output"></select>
-    <div class="hint" id="cableNote" hidden>Windows needs VB-Cable (free) for a CapraLink microphone: vb-audio.com/Cable</div>
-  </section>
-
-  <section>
     <label>Channels</label>
     <div class="seg" id="channels">
       <button data-v="1" class="active">Mono</button>
@@ -123,6 +119,16 @@
     <label>Bitrate</label>
     <input id="bitrate" type="range" min="8" max="96" step="8" value="64" />
     <div class="bitrate-val" id="bitrateVal">64 kbps</div>
+  </section>
+
+  <section>
+    <h2>Receiving</h2>
+    <label>Play to</label>
+    <select id="output"></select>
+    <div class="hint" id="cableNote" hidden>Windows needs VB-Cable (free) for a CapraLink microphone: vb-audio.com/Cable</div>
+  </section>
+
+  <section>
     <label class="check"><input id="music" type="checkbox" /> Music Mode</label>
     <div class="hint">Stereo, higher quality, a little more delay — applies to both directions of the link.</div>
   </section>
@@ -347,8 +353,8 @@ function remotePanel() {
     sel.addEventListener('change', () => { s[key] = sel.value || null; });
     box.appendChild(sel);
   };
+  box.appendChild(el('h2', 'sub', 'Sending'));
   pick('Send from', r.inputs, 'CapraLink Output', 'apps on that computer play into it', 'input');
-  pick('Play to', r.outputs, 'CapraLink Input', 'apps on that computer record from it', 'output');
   box.appendChild(el('label', null, 'Channels'));
   const seg = el('div', 'seg');
   const rate = el('input');
@@ -371,6 +377,8 @@ function remotePanel() {
   rate.addEventListener('input', () => { s.bitrate = Number(rate.value) * 1000; sync(); });
   box.appendChild(rate);
   box.appendChild(val);
+  box.appendChild(el('h2', 'sub', 'Receiving'));
+  pick('Play to', r.outputs, 'CapraLink Input', 'apps on that computer record from it', 'output');
   const music = el('label', 'check');
   const cb = el('input');
   cb.type = 'checkbox'; cb.checked = !!s.music_mode;
