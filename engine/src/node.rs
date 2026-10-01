@@ -215,6 +215,7 @@ impl Node {
     /// Loads (or creates) the config, listens on TCP `port` (0 = any free port), and
     /// advertises + browses via mDNS when `mdns` is set. `None` = OS config dir.
     pub fn start(config_dir: Option<PathBuf>, port: u16, mdns: bool) -> Result<Node> {
+        crate::pin_audio_host();
         let dir = config_dir_or_default(config_dir)?;
         let cfg = load(&dir)?;
         let listener = TcpListener::bind(("0.0.0.0", port)).with_context(|| format!("port {port} is in use (is CapraLink already running?)"))?;

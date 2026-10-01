@@ -42,6 +42,29 @@ pub const EVERYTHING: &str = "Everything this PC plays";
 /// remote-desktop client already carries this computer's audio).
 pub const NO_DEVICE: &str = "none";
 
+/// Windows: cpal creates one process-wide device enumerator (a COM object) on the first thread
+/// that lists devices, and it dies when that thread exits and COM shuts down there. Create it on
+/// a thread that never exits, before short-lived threads (per connection, RPC) list devices.
+pub(crate) fn pin_audio_host() {
+    #[cfg(windows)]
+    {
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(|| {
+            let (tx, rx) = std::sync::mpsc::channel();
+            let pinned = std::thread::Builder::new().name("capralink-com".into()).spawn(move || {
+                let _ = input_devices();
+                let _ = tx.send(());
+                loop {
+                    std::thread::park();
+                }
+            });
+            if pinned.is_ok() {
+                let _ = rx.recv();
+            }
+        });
+    }
+}
+
 pub fn input_devices() -> Vec<String> {
     devices(&cpal::default_host(), true).into_iter().map(|(n, _)| n).collect()
 }
