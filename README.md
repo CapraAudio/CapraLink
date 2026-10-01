@@ -61,6 +61,7 @@ next to a game. CapraLink is meant to be set up once, stay in the tray, and get 
 - **Runs in the background** — optional login service, including Steam Deck Game Mode, with no window open.
 - **Remote configuration** — when allowed, change another computer's devices and settings from this one.
 - **Reconnects by itself** — after a Wi-Fi drop, an IP address change or a restart.
+- **Update check** — the window shows its version and offers a download link when a newer release is out.
 - **Encrypted** — pairing uses SPAKE2; every session is encrypted with fresh keys (Noise + ChaCha20-Poly1305).
 
 ## Install

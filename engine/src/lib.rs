@@ -11,7 +11,7 @@ pub use rpc::{daemon, daemon_exe, serve_rpc, Client, Devices};
 /// A command for a system tool (pactl, systemctl, reg, hostname). Inside an AppImage,
 /// LD_LIBRARY_PATH points at the bundled libraries, which break system binaries
 /// (e.g. systemctl needs a newer OpenSSL than the bundled one), so it is dropped.
-pub(crate) fn system_command(program: &str) -> std::process::Command {
+pub fn system_command(program: &str) -> std::process::Command {
     let mut c = std::process::Command::new(program);
     if std::env::var_os("APPIMAGE").is_some() {
         c.env_remove("LD_LIBRARY_PATH");

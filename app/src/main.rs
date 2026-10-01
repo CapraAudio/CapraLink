@@ -88,6 +88,15 @@ fn fit(window: tauri::WebviewWindow, height: f64) {
     let _ = window.set_size(tauri::LogicalSize::new(width, height.clamp(300.0, 1000.0)));
 }
 
+/// Opens the latest release page in the browser (fixed URL: the page can't open anything else).
+#[tauri::command]
+fn open_releases() -> Result<(), String> {
+    let opener = if cfg!(target_os = "macos") { "open" } else if cfg!(windows) { "explorer" } else { "xdg-open" };
+    capralink_engine::system_command(opener).arg(RELEASES).spawn().map(drop).map_err(|e| e.to_string())
+}
+
+const RELEASES: &str = "https://github.com/CapraAudio/CapraLink/releases/latest";
+
 /// This build's version (the Cargo/Tauri version), shown in the window's corner.
 #[tauri::command]
 fn version() -> &'static str {
@@ -238,7 +247,7 @@ fn main() {
         // a second launch (no tray on stock GNOME, Start menu on Windows) brings this window back
         .plugin(tauri_plugin_single_instance::init(|app, _, _| show_window(app)))
         .manage(app)
-        .invoke_handler(tauri::generate_handler![devices, state, version, levels, fit, pair, pair_ip, open_pairing, connect, disconnect, forget, set_settings, set_peer_addr, set_name, remote_get, remote_set])
+        .invoke_handler(tauri::generate_handler![devices, state, version, open_releases, levels, fit, pair, pair_ip, open_pairing, connect, disconnect, forget, set_settings, set_peer_addr, set_name, remote_get, remote_set])
         .setup(|app| {
             #[cfg(target_os = "macos")]
             app.set_activation_policy(tauri::ActivationPolicy::Accessory);

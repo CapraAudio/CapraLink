@@ -454,8 +454,28 @@ $('optsBtn').addEventListener('click', (e) => { e.stopPropagation(); $('opts').h
 $('opts').addEventListener('click', (e) => e.stopPropagation()); // clicks inside keep it open
 document.addEventListener('click', () => { $('opts').hidden = true; });
 
+// Shows this version in the corner; if GitHub has a newer release, offers it instead.
+// Only asks GitHub for the latest release's tag, once per window.
+async function checkUpdate(current) {
+  $('version').textContent = 'v' + current;
+  try {
+    const r = await fetch('https://api.github.com/repos/CapraAudio/CapraLink/releases/latest');
+    const tag = r.ok ? (await r.json()).tag_name : '';
+    if (!tag || !newer(tag, current)) return;
+    $('version').replaceChildren(button(tag + ' available — Download', 'link', () => invoke('open_releases')));
+  } catch (_) {} // offline: just the version
+}
+
+// "v1.2.10" > "1.2.9"
+function newer(a, b) {
+  const p = (v) => v.replace(/^v/, '').split('.').map(Number);
+  const [x, y] = [p(a), p(b)];
+  for (let i = 0; i < 3; i++) if ((x[i] || 0) !== (y[i] || 0)) return (x[i] || 0) > (y[i] || 0);
+  return false;
+}
+
 (async function init() {
-  invoke('version').then((v) => { $('version').textContent = 'v' + v; }, () => {});
+  invoke('version').then(checkUpdate, () => {});
   // options must exist before saved selections can apply; the engine may still be starting
   for (;;) {
     try { await loadDevices(); break; } catch (e) { els.error.textContent = String(e); }

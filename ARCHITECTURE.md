@@ -63,7 +63,10 @@ playback device
 - **Stored on disk:** settings, paired devices, and their pairing secrets, in
   `<config dir>/CapraLink/config.json`. That's `~/Library/Application Support` on macOS,
   `~/.config` on Linux and `%APPDATA%` on Windows. The file is readable only by you on macOS and Linux.
-- **No telemetry,** no accounts, and no internet access.
+- **No telemetry,** no accounts. The only internet request is the update check: when the window
+  opens, it asks GitHub's public API for the latest CapraLink release (a plain web request, nothing
+  about you or your devices), and offers a Download link if a newer one exists. Audio and control
+  traffic never leave your network.
 
 ## Known limits
 
