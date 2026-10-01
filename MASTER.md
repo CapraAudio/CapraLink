@@ -279,6 +279,31 @@ is admin, remote access via Windows' built-in OpenSSH Server. Role: both A and B
 - Responder side unchanged: it already records the initiator's current IP on each session.
 - As built: node shutdown and lost sessions do NOT send `stop` (so a peer's quit/reboot reads as a loss and is retried); an incoming session clears the receiver's `last_peer` (only the dialer owns reconnecting). Retry loop = generation counter + Condvar; at most one live.
 
+### 3.10 Per-connection audio settings (plan, owner answers 2026-10-01, awaiting go-ahead)
+
+Owner examples: Deck↔Mac = Discord on the Mac, game on the Deck; Mac→Windows = Windows uses the
+Mac's mic, nothing comes back. Answers: each side stores its own half; the main window's
+Sending/Receiving sections edit the current connection; per-connection = Send from, Play to,
+Channels, Bitrate. Music Mode, service, remote config, auto-reconnect stay per-computer.
+
+- **Storage:** `Peer.audio: Option<Audio>` where `Audio { input, output, channels, bitrate }`
+  (serde default → old configs load unchanged). `Settings` keeps those four fields as the *working
+  copy* = the current connection's audio, so the UI, RPC, and `start_link` don't change.
+- **Current connection:** the session's peer, else the last device connected to (either direction);
+  config gains `current: Option<String>` (separate from `last_peer`, which only the dialer owns).
+- **Session start (both directions, the one `start_link` call site):** if the peer has `audio`, copy it
+  into the working settings before starting the link; if not, save the working settings as its
+  `audio` (a new pairing starts from whatever is set now). `current` = that peer.
+- **`set_settings`:** unchanged, plus the four audio fields are also written to `current`'s `audio`.
+- **Remote config:** a `set_settings` from peer X updates X's `audio` (it is configuring "how you talk
+  to me"), and the working copy only if X is current; `GetConfig` from X returns X's audio. Non-audio
+  fields behave as today.
+- **UI:** section titles show which connection is being edited ("Sending to Steam Deck"); nothing else
+  moves. Forget deletes that peer's audio with it.
+- **Tests:** two peers with different saved audio → connect to each, check the link's settings; remote
+  set from X lands in X's profile only; old config without `audio` loads.
+- **Missing device** (saved mic unplugged): same as today's behavior for a missing device.
+
 ## 4. Feasibility notes (owner asked for honest feedback)
 
 1. **Virtual devices on Windows are the hardest part.** Windows has no user-mode way to create
@@ -333,6 +358,7 @@ is admin, remote access via Windows' built-in OpenSSH Server. Role: both A and B
 | D5 | 2026-09-29 | UDP + per-packet encryption keyed by PIN pairing | Low latency, LAN-safe |
 | D6 | 2026-09-29 | "Service" = headless login agent, not system service | OS audio is per-user-session |
 | D7 | 2026-09-29 | One peer at a time (1:1 link) | Covers the use case; simplest |
+| D20 | 2026-10-01 | Per-connection audio: each computer saves Send from / Play to / Channels / Bitrate per paired device; main window edits the current connection; Music Mode stays per-computer | Owner switches setups by partner (Deck↔Mac Discord+game, Mac mic→Windows one-way) |
 | D19 | 2026-10-01 | Auto-reconnect by the initiating side only (backoff 2→30 s, forever; also after restart via last_peer); paired peers' addresses editable without a PIN | IP changes / Wi-Fi drops / reboots shouldn't need a click; initiator-only avoids dueling reconnects |
 | D18 | 2026-10-01 | Per-app (process loopback) capture removed; Windows Output side = "Everything this PC plays" | Owner: VB-Cable + Everything cover the use case; less unsafe Win32 code |
 | D17 | 2026-09-29 | Windows goes driverless first (supersedes D4 for now): per-app / whole-system WASAPI loopback for the Output side; VB-Cable (user-installed, signed) for the Input side | Keeps Secure Boot + anti-cheat; no signing cost; D4 test-signed driver kept as a fallback |
