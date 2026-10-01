@@ -93,7 +93,9 @@
     color: var(--fg); border-radius: 6px; padding: 1px 7px; font-size: 14px; cursor: pointer; }
   .opts { position: absolute; top: 32px; right: 8px; left: 8px; z-index: 6; background: var(--card); border: 1px solid var(--border);
     border-radius: 10px; box-shadow: 0 8px 24px rgba(0,0,0,.2); padding: 10px 12px 4px; }
-  h2.withbar .bar { flex: 1; }
+  h2.withbar .bar { flex: 1; min-width: 40px; }
+  h2 .for { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 75%; }
+  h2 .peer { text-transform: none; letter-spacing: 0; color: var(--fg); }
   /* fixed width (7 characters + letter spacing) so Show/Hide stays put when dots swap for digits */
   .pinrow .pin { width: calc(7ch + 0.84em); white-space: nowrap; }
   .remote { padding: 6px 0 0; border-top: 1px solid var(--border); }
@@ -134,7 +136,7 @@
   </section>
 
   <section>
-    <h2 class="withbar">Sending <div class="bar"><i id="inLevel"></i></div></h2>
+    <h2 class="withbar"><span class="for">Sending<span class="peer" id="sendPeer"></span></span> <div class="bar"><i id="inLevel"></i></div></h2>
     <label>Send from</label>
     <select id="input"></select>
     <label>Channels</label>
@@ -148,7 +150,7 @@
   </section>
 
   <section>
-    <h2 class="withbar">Receiving <div class="bar"><i id="outLevel"></i></div></h2>
+    <h2 class="withbar"><span class="for">Receiving<span class="peer" id="recvPeer"></span></span> <div class="bar"><i id="outLevel"></i></div></h2>
     <label>Play to</label>
     <select id="output"></select>
     <div class="hint" id="cableNote" hidden>Windows needs VB-Cable (free) for a CapraLink microphone: vb-audio.com/Cable</div>
@@ -175,6 +177,7 @@ const els = {
 let channels = 1;
 let effectiveMusic = false; // the link is in Music Mode (either side has it on)
 let settingsLoaded = false;
+let currentId;
 let actionError = '';
 let busy = false;
 let pairingId = null;   // device whose PIN box is open
@@ -487,6 +490,11 @@ async function poll() {
   renderName(st.name);
   currentPin = st.pin.slice(0, 3) + ' ' + st.pin.slice(3);
   showPin(pinShown);
+  // a different current connection brings its own saved audio settings
+  if (st.current !== currentId) { currentId = st.current; settingsLoaded = false; }
+  const cur = st.devices.find((d) => d.id === st.current);
+  $('sendPeer').textContent = cur ? ' to ' + cur.name : '';
+  $('recvPeer').textContent = cur ? ' from ' + cur.name : '';
   if (!settingsLoaded) {
     settingsLoaded = true;
     const s = st.settings;

@@ -3,7 +3,7 @@
 Read `MASTER.md` first. This file is the live position.
 
 ## Current position
-- 2026-10-01: Per-connection audio settings PLANNED (MASTER §3.10, D20), owner answered design questions; waiting for owner go-ahead before coding.
+- 2026-10-01: Per-connection audio settings BUILT (MASTER §3.10, D20) after owner approved the preview; engine tests pass; deploying to Mac/Deck/Windows, then owner field test.
 - Linux tray app (owner request 2026-09-29): CI now builds AppImage/deb/rpm (app/, npx @tauri-apps/cli@2); single-instance plugin added. Owner's Linux = Steam Deck, SteamOS (KDE Wayland desktop mode, read-only root → AppImage). SSH access set up (see memory steamos-test-device). AppImage at ~/Applications/CapraLink on the Deck: window + KDE tray + pactl virtual devices (incl. remap-source) all WORK. Fixed: hostname fallback (no `hostname` binary on SteamOS). Deck Wi-Fi power save ON → rx gaps ~100 ms, target maxes 125 ms; SteamOS dev toggle did NOT change it (NM global wifi.powersave=3); fixed per-connection via `sudo nmcli connection modify <home Wi-Fi> 802-11-wireless.powersave 2` (owner ran). Still: Wi-Fi itself spiky — Deck→router max 733 ms, Mac(en0 Wi-Fi)→router max 160 ms. Recommended wired Ethernet / Mac AWDL off. Relaunch AppImage over SSH with `setsid -f` (plain nohup dies with the SSH session). Game Mode needs M6 service.
 - Phase: M0 + M1 done and owner-validated (Mac↔Linux, no clicks). M2 code committed + verified locally (MASTER §3.3). Owner test 2026-09-29: discovery + PIN pairing Mac(app)↔Linux(capralinkd) WORKS. Connect/audio/disconnect verified → M2 DONE. Linux needs new capralinkd (v1/v2 packets incompatible). Config dir override: $CAPRALINK_CONFIG_DIR. Now: M3 virtual devices (Linux first).
 

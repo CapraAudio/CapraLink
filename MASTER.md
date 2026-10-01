@@ -279,7 +279,7 @@ is admin, remote access via Windows' built-in OpenSSH Server. Role: both A and B
 - Responder side unchanged: it already records the initiator's current IP on each session.
 - As built: node shutdown and lost sessions do NOT send `stop` (so a peer's quit/reboot reads as a loss and is retried); an incoming session clears the receiver's `last_peer` (only the dialer owns reconnecting). Retry loop = generation counter + Condvar; at most one live.
 
-### 3.10 Per-connection audio settings (plan, owner answers 2026-10-01, awaiting go-ahead)
+### 3.10 Per-connection audio settings (owner-approved 2026-10-01, built)
 
 Owner examples: Deck↔Mac = Discord on the Mac, game on the Deck; Mac→Windows = Windows uses the
 Mac's mic, nothing comes back. Answers: each side stores its own half; the main window's
@@ -303,6 +303,7 @@ Channels, Bitrate. Music Mode, service, remote config, auto-reconnect stay per-c
 - **Tests:** two peers with different saved audio → connect to each, check the link's settings; remote
   set from X lands in X's profile only; old config without `audio` loads.
 - **Missing device** (saved mic unplugged): same as today's behavior for a missing device.
+- As built: `use_peer` in `activate` (both directions); `on_manage(ctl, id)`; `NodeState.current`; UI reloads the selects when `current` changes. Re-pairing a device resets its saved audio. Test `audio_settings_are_per_connection`.
 
 ## 4. Feasibility notes (owner asked for honest feedback)
 
@@ -396,6 +397,7 @@ See `HANDOFF.md` → "Pending owner actions" for the live list. Answers get move
 | 2026-09-29 | Project started. Master plan written. No Rust toolchain on the Mac yet. |
 | 2026-10-01 | UI: device rows = name + ⋯ menu (Configure / Edit address / Forget) + status with Connect at right; meters inside Sending/Receiving titles; ⚙ dropdown in This device for background/remote/reconnect options (owner-approved previews). |
 | 2026-10-01 | Auto-reconnect + edit address landed (D19): initiator-only retry 2→30 s, last_peer reconnect at start, 'Reconnecting…' state, set_peer_addr. 26 tests ×20 runs stable. |
+| 2026-10-01 | Per-connection audio settings (§3.10, D20): Send from / Play to / Channels / Bitrate saved per paired device, applied on connect; remote config edits the requester's profile; section titles name the connection. |
 | 2026-10-01 | Per-app capture removed (wincap.rs + windows crate dep deleted, D18). Owner verified None and Everything on Windows. |
 | 2026-10-01 | "None" option for Send from / Play to (value `none`): turns that direction off, e.g. alongside Moonlight. VB-Cable 16ch entry hidden. |
 | 2026-09-30 | M4b/M4c code (engine/src/wincap.rs): process loopback for `app:<exe>`, system loopback "Everything this PC plays" (cpal), VB-Cable → CapraLink Input mapping, UI hints/note. Compiled + type-checked for Windows; runtime untested. |

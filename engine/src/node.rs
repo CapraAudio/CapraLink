@@ -37,6 +37,8 @@ pub struct NodeState {
     pub devices: Vec<Device>,
     pub stats: Option<Stats>,
     pub settings: Settings,
+    /// The device whose audio settings `settings` holds: the connected one, else the last one.
+    pub current: Option<String>,
     pub error: Option<String>,
     /// Why the virtual devices couldn't be created (Linux), if they couldn't.
     pub virtual_error: Option<String>,
@@ -77,6 +79,9 @@ struct Config {
     /// The device this node last connected to itself, for auto-reconnect (MASTER.md §3.9).
     #[serde(default)]
     last_peer: Option<String>,
+    /// The device the working audio settings belong to (MASTER.md §3.10).
+    #[serde(default)]
+    current: Option<String>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -88,6 +93,28 @@ struct Peer {
     /// when mDNS discovery can't see it).
     #[serde(default)]
     addr: Option<String>,
+    /// This computer's audio settings for sessions with this peer (MASTER.md §3.10).
+    #[serde(default)]
+    audio: Option<Audio>,
+}
+
+/// The per-connection part of `Settings`.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+struct Audio {
+    input: Option<String>,
+    output: Option<String>,
+    bitrate: i32,
+    channels: u16,
+}
+
+impl Audio {
+    fn of(s: &Settings) -> Audio {
+        Audio { input: s.input.clone(), output: s.output.clone(), bitrate: s.bitrate, channels: s.channels }
+    }
+
+    fn apply(&self, s: Settings) -> Settings {
+        Settings { input: self.input.clone(), output: self.output.clone(), bitrate: self.bitrate, channels: self.channels, ..s }
+    }
 }
 
 /// Control messages. Pair/Hello/Session travel in clear; the rest inside Noise.
@@ -276,6 +303,7 @@ impl Node {
             devices,
             stats: st.session.as_ref().and_then(|s| s.link.as_ref()).map(Link::stats),
             settings: st.cfg.settings.clone(),
+            current: st.cfg.current.clone(),
             error: st.error.clone(),
             virtual_error: st.vdev.error.clone(),
         }
@@ -460,6 +488,9 @@ impl Node {
         }
         let mut st = self.st();
         st.cfg.peers.retain(|p| p.id != id);
+        if st.cfg.current.as_deref() == Some(id) {
+            st.cfg.current = None;
+        }
         save(&self.0.dir, &st.cfg)
     }
 
@@ -478,6 +509,11 @@ impl Node {
             let audio_changed = Settings { service: s.service, remote_config: s.remote_config, music_mode: music, auto_reconnect: s.auto_reconnect, ..old } != s;
             if !s.auto_reconnect && st.retrying.is_some() {
                 self.cancel_retry(&mut st);
+            }
+            let audio = Audio::of(&s);
+            let cur = st.cfg.current.clone();
+            if let Some(p) = st.cfg.peers.iter_mut().find(|p| Some(&p.id) == cur.as_ref()) {
+                p.audio = Some(audio);
             }
             st.cfg.settings = s;
             save(&self.0.dir, &st.cfg)?;
@@ -591,6 +627,7 @@ impl Node {
         if let Some(old) = st.session.take() {
             old.ctl.close(); // Link drop below frees the UDP port before the new bind
         }
+        use_peer(&mut st.cfg, id);
         let link = match start_link(&st.cfg.settings, self.0.port, addr, keys) {
             Ok(l) => l,
             Err(e) => {
@@ -760,7 +797,7 @@ impl Node {
         let (ctl, keys) = handshake(&mut s, &secret, false)?;
         let port = match ctl.recv()? {
             Some(Msg::Link { port, .. }) => port,
-            Some(Msg::Manage) => return self.on_manage(&ctl),
+            Some(Msg::Manage) => return self.on_manage(&ctl, id),
             _ => bail!("expected link request"),
         };
         let addr = SocketAddr::new(s.peer_addr()?.ip(), port);
@@ -773,23 +810,39 @@ impl Node {
         Ok(())
     }
 
-    /// Answers one remote-configuration request; never touches the current session.
-    fn on_manage(&self, ctl: &Ctl) -> Result<()> {
+    /// Answers one remote-configuration request from peer `id`. Its audio settings are this
+    /// computer's settings for sessions with `id` (MASTER.md §3.10); the current session restarts
+    /// only if it is with `id`.
+    fn on_manage(&self, ctl: &Ctl, id: &str) -> Result<()> {
         let req = ctl.recv()?; // read before replying, so closing can't reset the reply away
-        let (name, local) = {
+        let (name, local, theirs) = {
             let st = self.st();
-            (st.cfg.name.clone(), st.cfg.settings.clone())
+            let theirs = st.cfg.peers.iter().find(|p| p.id == id).and_then(|p| p.audio.clone()).filter(|_| st.cfg.current.as_deref() != Some(id));
+            (st.cfg.name.clone(), st.cfg.settings.clone(), theirs)
         };
         let reply = match req {
             _ if !local.remote_config => Msg::Error { message: format!("remote configuration is off on {name}") },
-            Some(Msg::GetConfig) => Msg::Config(RemoteConfig { name, settings: local, inputs: crate::input_devices(), outputs: crate::output_devices() }),
+            Some(Msg::GetConfig) => Msg::Config(RemoteConfig { name, settings: match theirs { Some(a) => a.apply(local), None => local }, inputs: crate::input_devices(), outputs: crate::output_devices() }),
             // `service` and `remote_config` only change locally
             Some(Msg::SetSettings { settings, name: new_name }) => {
                 let r = match new_name {
                     Some(n) => self.set_name(&n),
                     None => Ok(()),
                 }
-                .and_then(|()| self.set_settings(Settings { service: local.service, remote_config: local.remote_config, ..settings }));
+                .and_then(|()| {
+                    let settings = Settings { service: local.service, remote_config: local.remote_config, ..settings };
+                    let mut st = self.st();
+                    if st.cfg.current.as_deref() == Some(id) {
+                        drop(st);
+                        return self.set_settings(settings);
+                    }
+                    // not the current connection: store its audio, apply only the rest
+                    if let Some(p) = st.cfg.peers.iter_mut().find(|p| p.id == id) {
+                        p.audio = Some(Audio::of(&settings));
+                    }
+                    drop(st);
+                    self.set_settings(Audio::of(&local).apply(settings))
+                });
                 match r {
                     Ok(()) => Msg::Ok,
                     Err(e) => Msg::Error { message: format!("{name}: {e:#}") },
@@ -881,7 +934,7 @@ fn load(dir: &Path) -> Result<Config> {
             Ok(cfg)
         }
         Err(e) if e.kind() == io::ErrorKind::NotFound => {
-            let cfg = Config { device_id: hex(&random::<16>()), name: hostname(), settings: Settings::default(), peers: vec![], last_peer: None };
+            let cfg = Config { device_id: hex(&random::<16>()), name: hostname(), settings: Settings::default(), peers: vec![], last_peer: None, current: None };
             save(dir, &cfg)?;
             Ok(cfg)
         }
@@ -910,7 +963,19 @@ pub(crate) fn write_private(dir: &Path, name: &str, data: &[u8]) -> Result<()> {
 
 fn add_peer(cfg: &mut Config, id: &str, name: &str, secret: &[u8; 32], addr: Option<String>) {
     cfg.peers.retain(|p| p.id != id);
-    cfg.peers.push(Peer { id: id.to_string(), name: clean_name(name), secret: hex(secret), addr });
+    cfg.peers.push(Peer { id: id.to_string(), name: clean_name(name), secret: hex(secret), addr, audio: None });
+}
+
+/// Makes `id` the current connection: its saved audio becomes the working settings, or, the
+/// first time, the working settings become its saved audio.
+fn use_peer(cfg: &mut Config, id: &str) {
+    cfg.current = Some(id.to_string());
+    if let Some(p) = cfg.peers.iter_mut().find(|p| p.id == id) {
+        match &p.audio {
+            Some(a) => cfg.settings = a.apply(cfg.settings.clone()),
+            None => p.audio = Some(Audio::of(&cfg.settings)),
+        }
+    }
 }
 
 /// Updates the remembered address of an already-paired peer, if it's still paired.
@@ -1249,6 +1314,43 @@ mod tests {
     }
 
     #[test]
+    fn audio_settings_are_per_connection() {
+        let ((a, adir), (b, bdir), (c, cdir)) = (node(), node(), node());
+        a.pair_ip(&format!("127.0.0.1:{}", b.port()), &b.state().pin).unwrap();
+        a.pair_ip(&format!("127.0.0.1:{}", c.port()), &c.state().pin).unwrap();
+        wait(|| peers(&bdir).len() == 1 && peers(&cdir).len() == 1);
+        let (bid, cid) = (load(&bdir).unwrap().device_id, load(&cdir).unwrap().device_id);
+        let aid = load(&adir).unwrap().device_id;
+        let set = |n: &Node, bitrate| n.set_settings(Settings { bitrate, ..n.state().settings }).unwrap();
+
+        a.connect(&bid).unwrap();
+        set(&a, 32_000); // saved for b
+        a.connect(&cid).unwrap(); // c has nothing saved yet: it starts from the working settings
+        assert_eq!(a.state().settings.bitrate, 32_000);
+        set(&a, 48_000); // saved for c
+        a.connect(&bid).unwrap();
+        assert_eq!((a.state().settings.bitrate, a.state().current), (32_000, Some(bid.clone())));
+        a.connect(&cid).unwrap();
+        assert_eq!(a.state().settings.bitrate, 48_000);
+
+        // b configures a while a talks to c: only a's settings for b change, the session stays
+        a.set_settings(Settings { remote_config: true, ..a.state().settings }).unwrap();
+        let ctl = a.st().session.as_ref().unwrap().ctl.clone();
+        b.remote_set(&aid, Settings { bitrate: 16_000, ..b.state().settings }, None).unwrap();
+        assert_eq!(a.state().settings.bitrate, 48_000);
+        assert!(Arc::ptr_eq(&ctl, &a.st().session.as_ref().unwrap().ctl), "session with c not restarted");
+        assert_eq!(b.remote_get(&aid).unwrap().settings.bitrate, 16_000);
+        a.connect(&bid).unwrap();
+        assert_eq!(a.state().settings.bitrate, 16_000);
+
+        a.forget(&bid).unwrap();
+        assert!(a.state().current.is_none());
+        for d in [adir, bdir, cdir] {
+            let _ = std::fs::remove_dir_all(d);
+        }
+    }
+
+    #[test]
     fn music_mode_is_link_wide_and_live() {
         let ((a, adir), (b, bdir)) = (node(), node());
         a.pair_ip(&format!("127.0.0.1:{}", b.port()), &b.state().pin).unwrap();
@@ -1389,7 +1491,7 @@ mod tests {
                 "peers":[{"id":"1","name":"c","secret":"00"}]}"#,
         )
         .unwrap();
-        assert!(cfg.peers[0].addr.is_none() && cfg.last_peer.is_none());
+        assert!(cfg.peers[0].addr.is_none() && cfg.last_peer.is_none() && cfg.current.is_none() && cfg.peers[0].audio.is_none());
         assert!(!cfg.settings.remote_config && !cfg.settings.music_mode && cfg.settings.auto_reconnect);
 
         let m: Msg = serde_json::from_str(r#"{"type":"pair","id":"a","name":"b"}"#).unwrap();
