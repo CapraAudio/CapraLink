@@ -4,3 +4,4 @@ node_modules/
 drivers/macos/build/
 MASTER.md
 HANDOFF.md
+.claude/
