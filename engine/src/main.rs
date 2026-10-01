@@ -1,16 +1,17 @@
 use capralink_engine::{input_devices, output_devices, Node, VIRTUAL_INPUT, VIRTUAL_OUTPUT};
 use std::time::Duration;
 
-const USAGE: &str = "usage: capralinkd [--port N] [--pair NAME_OR_ID PIN] [--connect NAME_OR_ID]
+const USAGE: &str = "usage: capralinkd [--port N] [--open-pairing] [--pair NAME_OR_ID PIN] [--connect NAME_OR_ID]
        capralinkd [--port N] --daemon
        capralinkd --list
 Runs a headless CapraLink node. --pair alone pairs and exits; --connect keeps running.
+--open-pairing lets another computer pair with this one using the PIN, for 2 minutes.
 --daemon runs the engine like `capralink --daemon` (local RPC on port+1, no console output).
 Config dir: $CAPRALINK_CONFIG_DIR, else the OS config dir.";
 
 fn main() -> anyhow::Result<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();
-    let (mut port, mut pair, mut connect, mut daemon) = (47800, None, None, false);
+    let (mut port, mut pair, mut connect, mut daemon, mut open) = (47800, None, None, false, false);
     let mut it = args.iter();
     while let Some(flag) = it.next() {
         match flag.as_str() {
@@ -25,6 +26,7 @@ fn main() -> anyhow::Result<()> {
             "--pair" => pair = Some((next(&mut it, flag)?, next(&mut it, flag)?)),
             "--connect" => connect = Some(next(&mut it, flag)?),
             "--daemon" => daemon = true,
+            "--open-pairing" => open = true,
             _ => anyhow::bail!("unknown flag {flag}\n{USAGE}"),
         }
     }
@@ -54,6 +56,10 @@ fn main() -> anyhow::Result<()> {
             shown_err.clone_from(&st.error);
         }
     };
+    if open {
+        node.open_pairing()?;
+        println!("Pairing open for 2 minutes");
+    }
     header(&node.state());
     match node.state().virtual_error {
         Some(e) => println!("{e}"),

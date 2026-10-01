@@ -179,6 +179,7 @@ enum End {
     Stop, // the peer chose to end it
     Dead, // keepalive timeout
     Lost, // TCP error / failed send
+    Device(String), // our capture/playback device went away: ended on purpose, not retried
 }
 
 struct St {
@@ -720,6 +721,11 @@ impl Node {
             }
             if last_report.elapsed() >= REPORT {
                 last_report = Instant::now();
+                let failure = self.st().session.as_ref().filter(|s| Arc::ptr_eq(&s.ctl, &ctl)).and_then(|s| s.link.as_ref()?.failure());
+                if let Some(f) = failure {
+                    let _ = ctl.send(&Msg::Stop); // the peer shouldn't keep redialing a link that can't play
+                    break End::Device(f);
+                }
                 let m = match self.link_delta(&ctl, &mut last_counts) {
                     Some((received, lost, underruns, jitter_ms)) => Msg::Report { received, lost, underruns, jitter_ms },
                     None => Msg::Ping, // no link (e.g. tests): keepalive only
@@ -737,9 +743,12 @@ impl Node {
         }
         let Some(s) = st.session.take() else { return };
         match end {
-            End::Stop => {
+            End::Stop | End::Device(_) => {
                 if st.cfg.last_peer.take().is_some() {
                     let _ = save(&self.0.dir, &st.cfg);
+                }
+                if let End::Device(f) = end {
+                    st.error = Some(format!("{f} — pick another device and connect again"));
                 }
             }
             _ if s.mine && st.cfg.settings.auto_reconnect && st.cfg.last_peer.as_deref() == Some(&s.peer_id) => self.start_retry(&mut st, s.peer_id),
