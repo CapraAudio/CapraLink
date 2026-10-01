@@ -29,7 +29,8 @@ impl App {
 
     /// Connects to the running daemon, starting one if none answers.
     fn connect(&self) -> anyhow::Result<Client> {
-        let local = || Client::local(self.dir.clone(), self.port + 1);
+        let rpc = self.port.checked_add(1).ok_or_else(|| anyhow::anyhow!("port 65535 leaves no room for the engine port above it"))?;
+        let local = || Client::local(self.dir.clone(), rpc);
         if let Ok(c) = local() {
             return Ok(c);
         }
@@ -105,6 +106,11 @@ fn pair_ip(app: State<App>, addr: String, pin: String) -> Result<String, String>
 #[tauri::command(async)]
 fn connect(app: State<App>, id: String) -> Result<(), String> {
     app.run(|c| c.connect(&id))
+}
+
+#[tauri::command(async)]
+fn open_pairing(app: State<App>) -> Result<(), String> {
+    app.run(Client::open_pairing)
 }
 
 #[tauri::command(async)]
@@ -226,7 +232,7 @@ fn main() {
         // a second launch (no tray on stock GNOME, Start menu on Windows) brings this window back
         .plugin(tauri_plugin_single_instance::init(|app, _, _| show_window(app)))
         .manage(app)
-        .invoke_handler(tauri::generate_handler![devices, state, levels, fit, pair, pair_ip, connect, disconnect, forget, set_settings, set_peer_addr, set_name, remote_get, remote_set])
+        .invoke_handler(tauri::generate_handler![devices, state, levels, fit, pair, pair_ip, open_pairing, connect, disconnect, forget, set_settings, set_peer_addr, set_name, remote_get, remote_set])
         .setup(|app| {
             #[cfg(target_os = "macos")]
             app.set_activation_policy(tauri::ActivationPolicy::Accessory);

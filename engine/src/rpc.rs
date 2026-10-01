@@ -1,22 +1,34 @@
 //! Service mode (MASTER.md §3.6): the headless daemon, its token-authenticated loopback RPC
-//! (one JSON request/response per TCP connection) and the "run at login" agent.
+//! (one request/response per TCP connection) and the "run at login" agent.
+//!
+//! RPC wire (newline-delimited JSON; the token never crosses the socket, and the daemon proves
+//! it knows the token before the client sends anything that matters):
+//!   client → `{"nonce": nc}`
+//!   daemon → `{"nonce": ns, "proof": HMAC(token, "daemon" nc ns)}`  (client checks it)
+//!   client → `{"proof": HMAC(token, "client" ns nc), "cmd": .., "args": ..}`  (daemon checks it)
+//!   daemon → `{"ok": ..}` or `{"err": ..}`, then closes.
+//! Nonces are 64 hex chars; the HMACs are HMAC-SHA256 over the strings, hex-encoded.
 
 use crate::node::{config_dir_or_default, hex, random, write_private};
 use crate::{Node, NodeState, RemoteConfig, Settings};
 use anyhow::{anyhow, bail, ensure, Context, Result};
+use hmac::{Hmac, KeyInit, Mac};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use std::io::{self, Read, Write};
-use std::net::{Ipv4Addr, Shutdown, SocketAddr, TcpListener, TcpStream};
+use sha2::Sha256;
+use std::io::{self, BufRead, BufReader, Read, Write};
+use std::net::{Ipv4Addr, SocketAddr, TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
+use std::sync::Arc;
 use std::time::Duration;
 
 const TOKEN_FILE: &str = "rpc.token";
 const IO_TIMEOUT: Duration = Duration::from_secs(5);
 const CALL_TIMEOUT: Duration = Duration::from_secs(30); // pair/connect wait on the other computer
 const MAX_REQUEST: u64 = 64 * 1024;
+const MAX_HANDLERS: usize = 16;
 
 #[derive(Serialize, Deserialize)]
 pub struct Devices {
@@ -28,7 +40,8 @@ pub struct Devices {
 /// `shutdown` command or a termination signal.
 pub fn daemon(config_dir: Option<PathBuf>, port: u16) -> Result<()> {
     let node = Node::start(config_dir, port, true)?;
-    if let Err(e) = serve_rpc(node.clone(), node.port() + 1) {
+    let rpc = node.port().checked_add(1).ok_or_else(|| anyhow!("port 65535 leaves no room for the engine port above it"));
+    if let Err(e) = rpc.and_then(|p| serve_rpc(node.clone(), p)) {
         node.shutdown();
         return Err(e);
     }
@@ -48,10 +61,17 @@ pub fn daemon(config_dir: Option<PathBuf>, port: u16) -> Result<()> {
 pub fn serve_rpc(node: Node, port: u16) -> Result<()> {
     let token = token(node.dir())?;
     let l = TcpListener::bind((Ipv4Addr::LOCALHOST, port)).with_context(|| format!("engine port {port} is in use"))?;
+    let live = Arc::new(()); // one clone per running handler
     std::thread::Builder::new().name("capralink-rpc".into()).spawn(move || {
         for s in l.incoming().flatten() {
-            let (node, token) = (node.clone(), token.clone());
-            let _ = std::thread::Builder::new().name("capralink-rpc-conn".into()).spawn(move || handle(&node, &token, s));
+            if Arc::strong_count(&live) > MAX_HANDLERS {
+                continue; // dropped
+            }
+            let (node, token, live) = (node.clone(), token.clone(), live.clone());
+            let _ = std::thread::Builder::new().name("capralink-rpc-conn".into()).spawn(move || {
+                handle(&node, &token, s);
+                drop(live);
+            });
         }
     })?;
     Ok(())
@@ -69,9 +89,16 @@ fn token(dir: &Path) -> Result<String> {
 }
 
 #[derive(Deserialize)]
+struct Hello {
+    nonce: String,
+    #[serde(default)]
+    proof: String,
+}
+
+#[derive(Deserialize)]
 struct Req {
     #[serde(default)]
-    token: String,
+    proof: String,
     cmd: String,
     #[serde(default)]
     args: Value,
@@ -80,11 +107,8 @@ struct Req {
 fn handle(node: &Node, token: &str, mut s: TcpStream) {
     let _ = s.set_read_timeout(Some(IO_TIMEOUT));
     let _ = s.set_write_timeout(Some(IO_TIMEOUT));
-    let mut buf = Vec::new();
-    let req = (&s).take(MAX_REQUEST).read_to_end(&mut buf).map_err(anyhow::Error::from).and_then(|_| Ok(serde_json::from_slice::<Req>(&buf)?));
-    let (reply, quit) = match req {
+    let (reply, quit) = match authenticate(token, &s) {
         Err(e) => (Err(e), false),
-        Ok(r) if !same(r.token.as_bytes(), token.as_bytes()) => (Err(anyhow!("unauthorized")), false),
         Ok(r) => (dispatch(node, &r.cmd, r.args), r.cmd == "shutdown"),
     };
     let body = match reply {
@@ -97,6 +121,34 @@ fn handle(node: &Node, token: &str, mut s: TcpStream) {
         node.shutdown();
         std::process::exit(0);
     }
+}
+
+/// The daemon's side of the handshake (see the module docs): proves itself, then returns the
+/// request if the client's proof checks out.
+fn authenticate(token: &str, mut s: &TcpStream) -> Result<Req> {
+    let mut r = BufReader::new(s.take(MAX_REQUEST));
+    let theirs: Hello = line(&mut r)?;
+    ensure!(theirs.nonce.len() == 64, "bad nonce");
+    let mine = hex(&random::<32>());
+    writeln!(s, "{}", json!({ "nonce": mine, "proof": proof(token, "daemon", &theirs.nonce, &mine) }))?;
+    let req: Req = line(&mut r)?;
+    ensure!(same(req.proof.as_bytes(), proof(token, "client", &mine, &theirs.nonce).as_bytes()), "unauthorized");
+    Ok(req)
+}
+
+fn proof(token: &str, role: &str, first: &str, second: &str) -> String {
+    let mut m = <Hmac<Sha256> as KeyInit>::new_from_slice(token.as_bytes()).expect("HMAC takes any key length");
+    for part in [role, first, second] {
+        m.update(part.as_bytes());
+    }
+    hex(&m.finalize().into_bytes())
+}
+
+/// One JSON line.
+fn line<T: DeserializeOwned>(r: &mut impl BufRead) -> Result<T> {
+    let mut l = String::new();
+    r.read_line(&mut l)?;
+    Ok(serde_json::from_str(&l)?)
 }
 
 /// Constant-time equality.
@@ -123,6 +175,7 @@ fn dispatch(node: &Node, cmd: &str, args: Value) -> Result<Value> {
         "pair" => done(node.pair(&a.id, &a.pin)),
         "pair_ip" => node.pair_ip(&a.addr, &a.pin).map(Value::from),
         "connect" => done(node.connect(&a.id)),
+        "open_pairing" => done(node.open_pairing()),
         "disconnect" => {
             node.disconnect();
             Ok(Value::Null)
@@ -156,13 +209,20 @@ impl Client {
     }
 
     fn call<T: DeserializeOwned>(&self, cmd: &str, args: Value) -> Result<T> {
-        let mut s = TcpStream::connect_timeout(&SocketAddr::from((Ipv4Addr::LOCALHOST, self.port)), Duration::from_secs(1))?;
+        let s = TcpStream::connect_timeout(&SocketAddr::from((Ipv4Addr::LOCALHOST, self.port)), Duration::from_secs(1))?;
         s.set_read_timeout(Some(CALL_TIMEOUT))?;
         s.set_write_timeout(Some(IO_TIMEOUT))?;
-        s.write_all(json!({ "token": self.token, "cmd": cmd, "args": args }).to_string().as_bytes())?;
-        s.shutdown(Shutdown::Write)?;
+        let mine = hex(&random::<32>());
+        writeln!(&s, "{}", json!({ "nonce": mine }))?;
+        let mut r = BufReader::new(&s);
+        let theirs: Hello = line(&mut r).context("bad reply from the engine")?;
+        // whatever answers here must know the token before it gets anything
+        if !same(theirs.proof.as_bytes(), proof(&self.token, "daemon", &mine, &theirs.nonce).as_bytes()) {
+            bail!("unauthorized");
+        }
+        writeln!(&s, "{}", json!({ "proof": proof(&self.token, "client", &theirs.nonce, &mine), "cmd": cmd, "args": args }))?;
         let mut buf = Vec::new();
-        s.read_to_end(&mut buf)?;
+        r.read_to_end(&mut buf)?;
         #[derive(Deserialize)]
         struct Resp {
             ok: Option<Value>,
@@ -198,6 +258,11 @@ impl Client {
 
     pub fn connect(&self, id: &str) -> Result<()> {
         self.call("connect", json!({ "id": id }))
+    }
+
+    /// Opens this computer's pairing window (see `Node::open_pairing`).
+    pub fn open_pairing(&self) -> Result<()> {
+        self.call("open_pairing", Value::Null)
     }
 
     pub fn disconnect(&self) -> Result<()> {
@@ -377,6 +442,17 @@ mod tests {
         let bad = Client { port, token: "0".repeat(64) };
         assert_eq!(bad.state().map(drop).unwrap_err().to_string(), "unauthorized");
         assert_eq!(Client { port, token: String::new() }.state().map(drop).unwrap_err().to_string(), "unauthorized");
+        // the daemon refuses a client that can't prove the token, too
+        let s = TcpStream::connect(("127.0.0.1", port)).unwrap();
+        writeln!(&s, "{}", json!({ "nonce": "0".repeat(64) })).unwrap();
+        let mut r = BufReader::new(&s);
+        let h: Hello = line(&mut r).unwrap();
+        let token = std::fs::read_to_string(dir.join(TOKEN_FILE)).unwrap();
+        assert_eq!(h.proof, proof(token.trim(), "daemon", &"0".repeat(64), &h.nonce));
+        writeln!(&s, "{}", json!({ "proof": "0".repeat(64), "cmd": "state" })).unwrap();
+        assert_eq!(line::<Value>(&mut r).unwrap(), json!({ "err": "unauthorized" }));
+        c.open_pairing().unwrap();
+        assert!(c.state().unwrap().pairing_secs > 0);
 
         // `service` is a no-op agent install under test
         let s = Settings { input: Some("Mic".into()), bitrate: 32_000, channels: 2, service: true, ..Settings::default() };

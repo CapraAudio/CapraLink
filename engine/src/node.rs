@@ -13,9 +13,10 @@ use sha2::Sha256;
 use spake2::{Ed25519Group, Identity, Password, Spake2};
 use std::collections::HashMap;
 use std::io::{self, Read, Write};
-use std::net::{Ipv4Addr, Shutdown, SocketAddr, TcpListener, TcpStream};
+use std::net::{IpAddr, Ipv4Addr, Shutdown, SocketAddr, TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Condvar, Mutex, MutexGuard};
+use std::sync::mpsc::{self, RecvTimeoutError};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, TryLockError};
 use std::time::{Duration, Instant};
 
 const SERVICE: &str = "_capralink._udp.local.";
@@ -25,7 +26,15 @@ const DIAL_TIMEOUT: Duration = Duration::from_secs(1); // per advertised address
 const LINK_TIMEOUT: Duration = Duration::from_secs(10); // peer may be opening audio devices
 const REPORT: Duration = Duration::from_secs(1); // also doubles as the session keepalive
 const DEAD: Duration = Duration::from_secs(15);
-const MAX_FAILURES: u32 = 5;
+// pairing only while the user has the PIN showing; each wrong PIN locks it, doubling (short under test)
+const PAIR_WINDOW: Duration = Duration::from_millis(if cfg!(test) { 3000 } else { 120_000 });
+const LOCK_FIRST: Duration = Duration::from_millis(if cfg!(test) { 300 } else { 60_000 });
+const LOCK_MAX: Duration = Duration::from_millis(if cfg!(test) { 1000 } else { 3_600_000 });
+// incoming connections before they authenticate: how many at once, per source IP, and for how long
+const MAX_PENDING: usize = 8;
+const MAX_PENDING_PER_IP: usize = 2;
+const AUTH_DEADLINE: Duration = Duration::from_secs(10);
+const NO_IPV6: &str = "IPv6 addresses aren't supported yet — use the computer's IPv4 address";
 // auto-reconnect backoff (MASTER.md §3.9); short under test
 const RETRY_FIRST: Duration = Duration::from_millis(if cfg!(test) { 100 } else { 2000 });
 const RETRY_MAX: Duration = Duration::from_millis(if cfg!(test) { 400 } else { 30_000 });
@@ -34,6 +43,10 @@ const RETRY_MAX: Duration = Duration::from_millis(if cfg!(test) { 400 } else { 3
 pub struct NodeState {
     pub name: String,
     pub pin: String,
+    /// Seconds left in the pairing window (0 = closed; see `Node::open_pairing`).
+    pub pairing_secs: u64,
+    /// Seconds pairing stays locked after a wrong PIN (0 = not locked).
+    pub pairing_locked_secs: u64,
     pub devices: Vec<Device>,
     pub stats: Option<Stats>,
     pub settings: Settings,
@@ -171,7 +184,9 @@ enum End {
 struct St {
     cfg: Config,
     pin: String,
-    failures: u32,
+    failures: u32, // consecutive wrong PINs
+    pairing_until: Option<Instant>,
+    locked_until: Option<Instant>,
     found: HashMap<String, Found>,
     session: Option<Session>,
     error: Option<String>,
@@ -188,6 +203,8 @@ struct Inner {
     mdns: Option<ServiceDaemon>,
     st: Mutex<St>,
     wake: Condvar, // wakes a sleeping retry loop when `retry` changes
+    pending: Mutex<Vec<IpAddr>>, // sources of unauthenticated incoming connections
+    pairing: Mutex<()>,          // held by the one PIN attempt allowed at a time
 }
 
 #[derive(Clone)]
@@ -212,8 +229,8 @@ impl Node {
         } else {
             (None, None)
         };
-        let st = St { cfg, pin: new_pin(), failures: 0, found: HashMap::new(), session: None, error: None, vdev: Virtual::setup(), retry: 0, retrying: None };
-        let node = Node(Arc::new(Inner { dir, port, mdns: daemon, st: Mutex::new(st), wake: Condvar::new() }));
+        let st = St { cfg, pin: new_pin(), failures: 0, pairing_until: None, locked_until: None, found: HashMap::new(), session: None, error: None, vdev: Virtual::setup(), retry: 0, retrying: None };
+        let node = Node(Arc::new(Inner { dir, port, mdns: daemon, st: Mutex::new(st), wake: Condvar::new(), pending: Mutex::default(), pairing: Mutex::default() }));
         if let Some(rx) = browse {
             let n = node.clone();
             std::thread::Builder::new().name("capralink-mdns".into()).spawn(move || {
@@ -300,6 +317,8 @@ impl Node {
         NodeState {
             name: st.cfg.name.clone(),
             pin: st.pin.clone(),
+            pairing_secs: secs_left(st.pairing_until),
+            pairing_locked_secs: secs_left(st.locked_until),
             devices,
             stats: st.session.as_ref().and_then(|s| s.link.as_ref()).map(Link::stats),
             settings: st.cfg.settings.clone(),
@@ -359,7 +378,11 @@ impl Node {
         let mut s = dial(addrs)?;
         let addr = s.peer_addr()?.to_string();
         send_msg(&mut s, &Msg::Pair { id: my_id.clone(), name: my_name, port: Some(self.0.port) })?;
-        let Msg::Hello { id, name } = recv_msg(&mut s)? else { bail!("unexpected reply") };
+        let (id, name) = match recv_msg(&mut s)? {
+            Msg::Hello { id, name } => (id, name),
+            Msg::Error { message } => bail!("{message}"), // pairing isn't open / is locked there
+            _ => bail!("unexpected reply"),
+        };
         check_id(&id)?;
         let secret = pake(&mut s, pin, true, &my_id, &id).map_err(|_| anyhow!("pairing failed — check the PIN"))?;
         let mut st = self.st();
@@ -370,12 +393,21 @@ impl Node {
     }
 
     /// Pairs directly by address, bypassing mDNS discovery (for when multicast is blocked on
-    /// the LAN). `addr` is "ip", "ip:port" (IPv4/IPv6 literal or hostname) or blank port meaning
+    /// the LAN). `addr` is "ip", "ip:port" (IPv4 literal or hostname) or blank port meaning
     /// the default. Returns the paired peer's name.
     pub fn pair_ip(&self, addr: &str, pin: &str) -> Result<String> {
         let id = self.pair_addr(&resolve(addr)?, pin)?;
         let st = self.st();
         Ok(st.cfg.peers.iter().find(|p| p.id == id).map_or(id, |p| p.name.clone()))
+    }
+
+    /// Lets other computers pair with this one using its PIN for the next `PAIR_WINDOW`.
+    pub fn open_pairing(&self) -> Result<()> {
+        let mut st = self.st();
+        let locked = secs_left(st.locked_until);
+        ensure!(locked == 0, "pairing is locked for {locked} more seconds after a wrong PIN");
+        st.pairing_until = Some(Instant::now() + PAIR_WINDOW);
+        Ok(())
     }
 
     pub fn connect(&self, id: &str) -> Result<()> {
@@ -575,8 +607,7 @@ impl Node {
     /// Sets the address to reach paired device `id` at ("ip", "ip:port" or hostname, as in
     /// `pair_ip`). No PIN: the session handshake still checks the pairing secret.
     pub fn set_peer_addr(&self, id: &str, addr: &str) -> Result<()> {
-        let addrs = resolve(addr)?;
-        let a = addrs.iter().find(|a| a.is_ipv4()).unwrap_or(&addrs[0]).to_string();
+        let a = resolve(addr)?[0].to_string();
         let mut st = self.st();
         let p = st.cfg.peers.iter_mut().find(|p| p.id == id).ok_or_else(|| anyhow!("not paired with that device"))?;
         p.addr = Some(a);
@@ -744,57 +775,109 @@ impl Node {
         }
     }
 
-    // ponytail: handshakes run one at a time on the accept thread (which also serializes PIN
-    // guesses); a stalled peer delays others by up to IO_TIMEOUT. Thread per connection if that bites.
+    /// One thread per connection. Until it authenticates (hello + handshake / PIN check) it holds
+    /// one of `MAX_PENDING` slots, and a watchdog closes it at `AUTH_DEADLINE` so trickled bytes
+    /// can't hold a slot; dropping `authed` stops the watchdog and frees the slot.
     fn accept(&self, l: TcpListener) {
         for s in l.incoming().flatten() {
-            let from = s.peer_addr().map(|a| a.ip().to_string()).unwrap_or_default();
-            if let Err(e) = setup(&s).map_err(Into::into).and_then(|_| self.incoming(s)) {
-                self.st().error = Some(format!("incoming connection from {from}: {e:#}"));
+            let (Ok(ip), Ok(s2)) = (s.peer_addr().map(|a| a.ip()), s.try_clone()) else { continue };
+            {
+                let mut p = self.pending();
+                if p.len() >= MAX_PENDING || p.iter().filter(|&&a| a == ip).count() >= MAX_PENDING_PER_IP {
+                    continue; // dropped
+                }
+                p.push(ip);
             }
+            let (authed, rx) = mpsc::channel::<()>();
+            let n = self.clone();
+            let watchdog = move || {
+                if rx.recv_timeout(AUTH_DEADLINE) == Err(RecvTimeoutError::Timeout) {
+                    let _ = s2.shutdown(Shutdown::Both);
+                }
+                n.release(ip);
+            };
+            if std::thread::Builder::new().name("capralink-auth".into()).spawn(watchdog).is_err() {
+                self.release(ip);
+                continue;
+            }
+            let n = self.clone();
+            let _ = std::thread::Builder::new().name("capralink-conn".into()).spawn(move || {
+                if let Err(e) = setup(&s).map_err(Into::into).and_then(|_| n.incoming(s, authed)) {
+                    n.st().error = Some(format!("incoming connection from {ip}: {e:#}"));
+                }
+            });
         }
     }
 
-    fn incoming(&self, mut s: TcpStream) -> Result<()> {
+    fn pending(&self) -> MutexGuard<'_, Vec<IpAddr>> {
+        self.0.pending.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    fn release(&self, ip: IpAddr) {
+        let mut p = self.pending();
+        if let Some(i) = p.iter().position(|&a| a == ip) {
+            p.swap_remove(i);
+        }
+    }
+
+    fn incoming(&self, mut s: TcpStream, authed: mpsc::Sender<()>) -> Result<()> {
         match recv_msg(&mut s)? {
             Msg::Pair { id, name, port } => self.on_pair(s, &id, &name, port),
-            Msg::Session { id } => self.on_session(s, &id),
+            Msg::Session { id } => self.on_session(s, &id, authed),
             _ => bail!("unexpected hello"),
         }
     }
 
+    /// Answers a PIN attempt only while the pairing window is open and not locked, one at a time.
+    /// A wrong PIN rotates the PIN and locks pairing (`LOCK_FIRST`, doubling, up to `LOCK_MAX`).
     fn on_pair(&self, mut s: TcpStream, id: &str, name: &str, port: Option<u16>) -> Result<()> {
         check_id(id)?;
         let addr = match port {
             Some(p) => Some(SocketAddr::new(s.peer_addr()?.ip(), p).to_string()),
             None => None,
         };
-        let (my_id, my_name, pin) = {
+        let one_at_a_time = self.0.pairing.try_lock(); // held until this attempt is counted
+        let busy = matches!(one_at_a_time, Err(TryLockError::WouldBlock));
+        let (my_id, my_name, pin, refused) = {
             let st = self.st();
-            (st.cfg.device_id.clone(), st.cfg.name.clone(), st.pin.clone())
+            let (name, locked) = (&st.cfg.name, secs_left(st.locked_until));
+            let refused = if busy {
+                Some(format!("pairing on {name} is busy, try again in a moment"))
+            } else if locked > 0 {
+                Some(format!("pairing on {name} is locked for {locked} s after a wrong PIN"))
+            } else if secs_left(st.pairing_until) == 0 {
+                Some(format!("pairing isn't open on {name}: press Show next to its PIN"))
+            } else {
+                None
+            };
+            (st.cfg.device_id.clone(), name.clone(), st.pin.clone(), refused)
         };
+        if let Some(message) = refused {
+            send_msg(&mut s, &Msg::Error { message: message.clone() })?;
+            bail!("{message}");
+        }
         send_msg(&mut s, &Msg::Hello { id: my_id.clone(), name: my_name })?;
         let r = pake(&mut s, &pin, false, id, &my_id);
         let mut st = self.st();
         match r {
             Ok(secret) => {
                 add_peer(&mut st.cfg, id, name, &secret, addr);
-                (st.pin, st.failures, st.error) = (new_pin(), 0, None);
+                (st.pin, st.failures, st.error, st.pairing_until, st.locked_until) = (new_pin(), 0, None, None, None);
                 save(&self.0.dir, &st.cfg)
             }
             Err(e) => {
                 st.failures += 1;
-                if st.failures >= MAX_FAILURES {
-                    (st.pin, st.failures) = (new_pin(), 0);
-                }
+                let lock = LOCK_FIRST.saturating_mul(1 << (st.failures - 1).min(16)).min(LOCK_MAX);
+                (st.pin, st.locked_until) = (new_pin(), Some(Instant::now() + lock));
                 Err(e.context("pairing failed (wrong PIN?)"))
             }
         }
     }
 
-    fn on_session(&self, mut s: TcpStream, id: &str) -> Result<()> {
+    fn on_session(&self, mut s: TcpStream, id: &str, authed: mpsc::Sender<()>) -> Result<()> {
         let secret = secret(&self.st().cfg, id).ok_or_else(|| anyhow!("unknown device"))?;
         let (ctl, keys) = handshake(&mut s, &secret, false)?;
+        drop(authed); // the usual per-read timeouts from here on
         let port = match ctl.recv()? {
             Some(Msg::Link { port, .. }) => port,
             Some(Msg::Manage) => return self.on_manage(&ctl, id),
@@ -985,22 +1068,30 @@ fn set_addr(cfg: &mut Config, id: &str, addr: String) {
     }
 }
 
-/// Parses a user-typed "ip" or "ip:port" (IPv4/IPv6 literal or hostname), defaulting to the
-/// standard port when none is given.
+/// Parses a user-typed "ip" or "ip:port" (IPv4 literal or hostname; the sockets are IPv4-only),
+/// defaulting to the standard port when none is given.
 fn resolve(addr: &str) -> Result<Vec<SocketAddr>> {
-    use std::net::{IpAddr, ToSocketAddrs};
+    use std::net::ToSocketAddrs;
     let addr = addr.trim();
     ensure!(!addr.is_empty(), "enter the other computer's IP address");
     if let Ok(sa) = addr.parse::<SocketAddr>() {
+        ensure!(sa.is_ipv4(), NO_IPV6);
         return Ok(vec![sa]);
     }
     if let Ok(ip) = addr.parse::<IpAddr>() {
+        ensure!(ip.is_ipv4(), NO_IPV6);
         return Ok(vec![SocketAddr::new(ip, 47800)]);
     }
+    ensure!(!addr.starts_with('['), NO_IPV6);
     let with_port = if addr.contains(':') { addr.to_string() } else { format!("{addr}:47800") };
-    let addrs: Vec<SocketAddr> = with_port.to_socket_addrs().with_context(|| format!("can't resolve {addr}"))?.collect();
-    ensure!(!addrs.is_empty(), "can't resolve {addr}");
+    let addrs: Vec<SocketAddr> = with_port.to_socket_addrs().with_context(|| format!("can't resolve {addr}"))?.filter(SocketAddr::is_ipv4).collect();
+    ensure!(!addrs.is_empty(), "{addr} has no IPv4 address");
     Ok(addrs)
+}
+
+/// Whole seconds until `t`, rounded up (0 = passed, or none).
+fn secs_left(t: Option<Instant>) -> u64 {
+    t.map_or(0, |t| t.saturating_duration_since(Instant::now()).as_millis().div_ceil(1000) as u64)
 }
 
 fn secret(cfg: &Config, id: &str) -> Option<[u8; 32]> {
@@ -1236,16 +1327,24 @@ mod tests {
     fn pairing() {
         let ((a, adir), (b, bdir)) = (node(), node());
         let pin = b.state().pin;
+        let err = a.pair_addr(&[addr(&b)], &pin).unwrap_err().to_string();
+        assert!(err.contains("pairing isn't open on") && err.contains("press Show"), "{err}");
+        assert_eq!(b.state().pin, pin, "a closed window costs no PIN");
+
+        b.open_pairing().unwrap();
+        assert!(b.state().pairing_secs > 0);
         let wrong = format!("{:06}", (pin.parse::<u32>().unwrap() + 1) % 1_000_000);
         assert!(a.pair_addr(&[addr(&b)], &wrong).is_err());
         assert!(peers(&adir).is_empty() && peers(&bdir).is_empty());
-        assert_eq!(b.state().pin, pin, "one failure keeps the PIN");
-        for _ in 0..4 {
-            assert!(a.pair_addr(&[addr(&b)], &wrong).is_err());
-        }
-        assert_ne!(b.state().pin, pin, "5 failures rotate the PIN");
-
         let pin = b.state().pin;
+        assert!(b.state().pairing_locked_secs > 0, "a wrong PIN locks pairing");
+        assert!(b.open_pairing().unwrap_err().to_string().contains("locked"));
+        let err = a.pair_addr(&[addr(&b)], &pin).unwrap_err().to_string();
+        assert!(err.contains("is locked for"), "locked refuses even the right PIN: {err}");
+        assert_eq!(b.state().pin, pin, "a refused attempt costs no PIN");
+        wait(|| b.state().pairing_locked_secs == 0);
+
+        b.open_pairing().unwrap();
         // pair by IP address (no mDNS involved either side)
         let bname = a.pair_ip(&format!("127.0.0.1:{}", b.port()), &pin).unwrap();
         wait(|| peers(&bdir).len() == 1); // the responder saves just after sending its confirmation
@@ -1258,6 +1357,8 @@ mod tests {
         assert_eq!(pa[0].addr.as_deref(), Some(format!("127.0.0.1:{}", b.port())).as_deref());
         assert_eq!(pb[0].addr.as_deref(), Some(format!("127.0.0.1:{}", a.port())).as_deref(), "responder records the initiator's listening port");
         assert_ne!(b.state().pin, pin, "PIN rotates after pairing");
+        let s = b.state();
+        assert_eq!((s.pairing_secs, s.pairing_locked_secs), (0, 0), "success closes the window and resets the lock");
 
         // session: mDNS is off on both, so `connect` must fall back to the remembered address
         a.connect(&bid).unwrap();
@@ -1275,6 +1376,7 @@ mod tests {
     #[test]
     fn remote_config() {
         let ((a, adir), (b, bdir)) = (node(), node());
+        b.open_pairing().unwrap();
         a.pair_ip(&format!("127.0.0.1:{}", b.port()), &b.state().pin).unwrap();
         wait(|| peers(&bdir).len() == 1);
         let bid = peers(&adir)[0].id.clone();
@@ -1316,7 +1418,9 @@ mod tests {
     #[test]
     fn audio_settings_are_per_connection() {
         let ((a, adir), (b, bdir), (c, cdir)) = (node(), node(), node());
+        b.open_pairing().unwrap();
         a.pair_ip(&format!("127.0.0.1:{}", b.port()), &b.state().pin).unwrap();
+        c.open_pairing().unwrap();
         a.pair_ip(&format!("127.0.0.1:{}", c.port()), &c.state().pin).unwrap();
         wait(|| peers(&bdir).len() == 1 && peers(&cdir).len() == 1);
         let (bid, cid) = (load(&bdir).unwrap().device_id, load(&cdir).unwrap().device_id);
@@ -1353,6 +1457,7 @@ mod tests {
     #[test]
     fn music_mode_is_link_wide_and_live() {
         let ((a, adir), (b, bdir)) = (node(), node());
+        b.open_pairing().unwrap();
         a.pair_ip(&format!("127.0.0.1:{}", b.port()), &b.state().pin).unwrap();
         wait(|| peers(&bdir).len() == 1);
         let bid = peers(&adir)[0].id.clone();
@@ -1381,6 +1486,7 @@ mod tests {
     /// Two nodes, paired, `a` connected to `b`; returns b's id.
     fn connected() -> ((Node, PathBuf), (Node, PathBuf), String) {
         let ((a, adir), (b, bdir)) = (node(), node());
+        b.open_pairing().unwrap();
         a.pair_ip(&format!("127.0.0.1:{}", b.port()), &b.state().pin).unwrap();
         wait(|| peers(&bdir).len() == 1);
         let bid = peers(&adir)[0].id.clone();
@@ -1505,6 +1611,28 @@ mod tests {
         let st: Stats = serde_json::from_str(r#"{"sent":0,"received":0,"lost":0,"fec_recovered":0,"underruns":0,"buffer_ms":0,"target_ms":0,
             "in_peak":0,"out_peak":0,"tx_gap_ms":0,"rx_gap_ms":0,"bitrate":0,"complexity":0}"#).unwrap();
         assert!(!st.music, "old Stats JSON without `music` parses");
+    }
+
+    #[test]
+    fn resolve_is_ipv4_only() {
+        for a in ["::1", "[::1]:47800", "[fe80::1]"] {
+            assert!(resolve(a).unwrap_err().to_string().contains("IPv6 addresses aren't supported"), "{a}");
+        }
+        assert_eq!(resolve(" 10.0.0.2 ").unwrap(), vec![SocketAddr::from(([10, 0, 0, 2], 47800))]);
+        assert!(resolve("localhost:1").unwrap().iter().all(SocketAddr::is_ipv4));
+    }
+
+    #[test]
+    fn unauthenticated_connections_are_capped_per_ip() {
+        let (b, bdir) = node();
+        let idle: Vec<_> = (0..MAX_PENDING_PER_IP).map(|_| TcpStream::connect(addr(&b)).unwrap()).collect();
+        wait(|| b.pending().len() == MAX_PENDING_PER_IP);
+        let mut extra = TcpStream::connect(addr(&b)).unwrap();
+        extra.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+        assert_eq!(extra.read(&mut [0u8; 1]).unwrap(), 0, "over the limit: closed at once");
+        drop(idle);
+        wait(|| b.pending().is_empty());
+        let _ = std::fs::remove_dir_all(bdir);
     }
 
     #[test]
