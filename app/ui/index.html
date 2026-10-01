@@ -472,8 +472,7 @@ function fill(sel, list, special, hint) {
   const names = list.includes(special) ? [special, ...list.filter((n) => n !== special)] : list;
   for (const name of names) {
     const o = document.createElement('option');
-    const shown = name.startsWith('app:') ? name.slice(4).replace(/\.exe$/i, '') + ' (app audio)' : name; // Windows app capture
-    o.value = name; o.textContent = name === special ? shown + ' — ' + hint : shown;
+    o.value = name; o.textContent = name === special ? name + ' — ' + hint : name;
     sel.appendChild(o);
   }
 }

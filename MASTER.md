@@ -313,6 +313,7 @@ is admin, remote access via Windows' built-in OpenSSH Server. Role: both A and B
 | D5 | 2026-09-29 | UDP + per-packet encryption keyed by PIN pairing | Low latency, LAN-safe |
 | D6 | 2026-09-29 | "Service" = headless login agent, not system service | OS audio is per-user-session |
 | D7 | 2026-09-29 | One peer at a time (1:1 link) | Covers the use case; simplest |
+| D18 | 2026-10-01 | Per-app (process loopback) capture removed; Windows Output side = "Everything this PC plays" | Owner: VB-Cable + Everything cover the use case; less unsafe Win32 code |
 | D17 | 2026-09-29 | Windows goes driverless first (supersedes D4 for now): per-app / whole-system WASAPI loopback for the Output side; VB-Cable (user-installed, signed) for the Input side | Keeps Secure Boot + anti-cheat; no signing cost; D4 test-signed driver kept as a fallback |
 | D16 | 2026-09-29 | Tray: single click shows the menu on all OSes (owner choice); double-click opens the window where reported (Windows only) | Keeps Quit/Music Mode discoverable on macOS |
 | D15 | 2026-09-29 | Music Mode = link-wide (either side on → both directions): stereo, 20 ms frames, 160 kbps ceiling, complexity 10 w/ back-off, 40 ms min cushion; AIMD floor unchanged | Owner answers (quality over latency, smooth over pristine on bad Wi-Fi) |
@@ -346,6 +347,7 @@ See `HANDOFF.md` → "Pending owner actions" for the live list. Answers get move
 | Date | Change |
 |---|---|
 | 2026-09-29 | Project started. Master plan written. No Rust toolchain on the Mac yet. |
+| 2026-10-01 | Per-app capture removed (wincap.rs + windows crate dep deleted, D18). Owner verified None and Everything on Windows. |
 | 2026-10-01 | "None" option for Send from / Play to (value `none`): turns that direction off, e.g. alongside Moonlight. VB-Cable 16ch entry hidden. |
 | 2026-09-30 | M4b/M4c code (engine/src/wincap.rs): process loopback for `app:<exe>`, system loopback "Everything this PC plays" (cpal), VB-Cable → CapraLink Input mapping, UI hints/note. Compiled + type-checked for Windows; runtime untested. |
 | 2026-09-30 | M4a passed: CI Windows build runs on Win 11 Pro (window, tray, daemon, mDNS, pairing, audio both ways with Mac). Windows default devices were Steam Streaming → pick headset explicitly. |

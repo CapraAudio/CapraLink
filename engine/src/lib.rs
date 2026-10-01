@@ -4,8 +4,6 @@ mod dsp;
 mod node;
 mod rpc;
 mod vdev;
-#[cfg(windows)]
-mod wincap;
 
 pub use node::{Device, Node, NodeState, RemoteConfig};
 pub use rpc::{daemon, daemon_exe, serve_rpc, Client, Devices};
@@ -45,12 +43,7 @@ pub const EVERYTHING: &str = "Everything this PC plays";
 pub const NO_DEVICE: &str = "none";
 
 pub fn input_devices() -> Vec<String> {
-    #[allow(unused_mut)]
-    let mut v: Vec<String> = devices(&cpal::default_host(), true).into_iter().map(|(n, _)| n).collect();
-    // ponytail: app list is a snapshot taken when the lists load; refresh it live if people miss apps started later.
-    #[cfg(windows)]
-    v.extend(app_entries(wincap::sessions().into_iter().map(|(_, exe)| exe)));
-    v
+    devices(&cpal::default_host(), true).into_iter().map(|(n, _)| n).collect()
 }
 
 pub fn output_devices() -> Vec<String> {
@@ -104,27 +97,6 @@ fn win_label(input: bool, name: String) -> Option<String> {
         false if name.contains("16ch") => None, // the 16-channel variant: same cable, just clutter
         false => Some(VIRTUAL_INPUT.into()),
     }
-}
-
-/// Windows Send-from value for one app's audio: `app:Discord.exe` -> `Discord.exe`.
-fn app_exe(name: &str) -> Option<&str> {
-    name.strip_prefix("app:")
-}
-
-/// What people call an app: `Discord.exe` -> `Discord`.
-#[cfg_attr(not(windows), allow(dead_code))]
-fn app_title(exe: &str) -> &str {
-    exe.strip_suffix(".exe").or_else(|| exe.strip_suffix(".EXE")).unwrap_or(exe)
-}
-
-/// Send-from values for the apps with audio sessions: deduped, sorted, never CapraLink itself
-/// (it would capture its own playback), and always Discord (a saved choice shows while it's closed).
-#[cfg_attr(not(windows), allow(dead_code))]
-fn app_entries(exes: impl IntoIterator<Item = String>) -> Vec<String> {
-    let mut v: Vec<String> = exes.into_iter().chain(["Discord.exe".to_string()]).filter(|e| !e.to_lowercase().starts_with("capralink")).map(|e| format!("app:{e}")).collect();
-    v.sort_by_key(|s| s.to_lowercase());
-    v.dedup_by(|a, b| a.eq_ignore_ascii_case(b));
-    v
 }
 
 /// Audio settings (saved in the node's config). `None` device = system default.
@@ -203,7 +175,7 @@ pub struct Link {
     shared: Arc<Shared>,
     stop: Arc<AtomicBool>,
     rx: Option<JoinHandle<()>>,
-    _input: Box<dyn Send>, // cpal stream, or an app capture on Windows
+    _input: Option<cpal::Stream>, // None when Send from is off
     _output: Option<cpal::Stream>, // None when Play to is off
 }
 
@@ -217,12 +189,7 @@ impl Link {
             None => default.ok_or_else(|| anyhow!("no default device")),
         };
         let off = |want: &Option<String>| want.as_deref() == Some(NO_DEVICE);
-        let app = cfg.input.as_deref().and_then(app_exe).filter(|_| cfg!(windows));
-        let in_dev = match app {
-            _ if off(&cfg.input) => None,
-            Some(_) => None,
-            None => Some(find(true, &cfg.input, host.default_input_device())?),
-        };
+        let in_dev = if off(&cfg.input) { None } else { Some(find(true, &cfg.input, host.default_input_device())?) };
         let out_dev = if off(&cfg.output) { None } else { Some(find(false, &cfg.output, host.default_output_device())?) };
 
         let sock = UdpSocket::bind(("0.0.0.0", port)).with_context(|| format!("bind UDP port {port}"))?;
@@ -240,20 +207,14 @@ impl Link {
         // (it just stays full); skip decoding in the RX thread if that CPU ever matters.
         let output = out_dev.map(|d| build_output(&d, cons, shared.clone())).transpose()?;
         let pk = Packetizer::new(cfg.channels, cfg.bitrate, &keys.send)?;
-        let input: Box<dyn Send> = match (in_dev, app) {
-            _ if off(&cfg.input) => Box::new(()), // sending off: nothing captured or sent
-            (Some(d), _) => {
+        // None when Send from is off: nothing captured or sent
+        let input = in_dev
+            .map(|d| -> anyhow::Result<cpal::Stream> {
                 let s = build_input(&d, cfg, pk, sock.try_clone()?, peer, shared.clone())?;
                 s.play()?;
-                Box::new(s)
-            }
-            #[cfg(windows)]
-            (None, Some(exe)) => {
-                let mut tx = Tx::new(cfg, pk, sock.try_clone()?, peer, shared.clone(), 2, RATE);
-                Box::new(wincap::start(exe, move |d: &[f32]| tx.process(d))?)
-            }
-            _ => unreachable!("app capture is Windows-only"),
-        };
+                Ok(s)
+            })
+            .transpose()?;
 
         let rx = {
             let (shared, stop, mut rx) = (shared.clone(), stop.clone(), Rx::new(&keys.recv));
@@ -646,18 +607,6 @@ fn windows_labels() {
     let ins = ["Microphone (USB Mic)", "CABLE Output (VB-Audio Virtual Cable)"];
     assert_eq!(shown(true, &ins), ["Microphone (USB Mic)"]);
     assert_eq!(shown(true, &outs), ["Speakers (Realtek(R) Audio)"], "no VB-Cable endpoint is ever offered as Send from");
-}
-
-#[cfg(test)]
-#[test]
-fn app_entries_and_names() {
-    let e = app_entries(["chrome.exe", "Spotify.exe", "chrome.exe", "CapraLink.exe", "discord.exe"].map(String::from));
-    assert_eq!(e, ["app:chrome.exe", "app:discord.exe", "app:Spotify.exe"]);
-    assert_eq!(app_entries([]), ["app:Discord.exe"], "Discord always listed");
-    assert_eq!(app_exe("app:Discord.exe"), Some("Discord.exe"));
-    assert_eq!(app_exe("Microphone"), None);
-    assert_eq!(app_title("Discord.exe"), "Discord");
-    assert_eq!(app_title("GAME.EXE"), "GAME");
 }
 
 #[cfg(test)]
