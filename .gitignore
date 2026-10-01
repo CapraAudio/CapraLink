@@ -2,3 +2,5 @@ target/
 node_modules/
 .DS_Store
 drivers/macos/build/
+MASTER.md
+HANDOFF.md
