@@ -1022,6 +1022,7 @@ fn load(dir: &Path) -> Result<Config> {
     match std::fs::read(&path) {
         Ok(b) => {
             let mut cfg: Config = serde_json::from_slice(&b).with_context(|| format!("invalid config file {}", path.display()))?;
+            cfg.name = clean_name(&cfg.name); // saved before names were limited in bytes too
             // "CapraLink" is the fallback when no hostname could be read; retry so the real name shows up
             if cfg.name == "CapraLink" {
                 cfg.name = hostname();
@@ -1148,8 +1149,17 @@ fn check_id(id: &str) -> Result<()> {
     Ok(())
 }
 
+/// At most 64 characters and 250 bytes: mDNS refuses a TXT entry (`name=` + the name) over 255
+/// bytes, and the engine can't start without advertising its name.
 fn clean_name(n: &str) -> String {
-    n.chars().filter(|c| !c.is_control()).take(64).collect()
+    let mut out = String::new();
+    for c in n.chars().filter(|c| !c.is_control()).take(64) {
+        if out.len() + c.len_utf8() > 250 {
+            break;
+        }
+        out.push(c);
+    }
+    out
 }
 
 fn hkdf(ikm: &[u8], info: &[u8]) -> [u8; 32] {
@@ -1710,4 +1720,26 @@ mod tests {
         let _ = std::fs::remove_dir_all(adir);
         let _ = std::fs::remove_dir_all(bdir);
     }
+
+    #[test]
+    fn long_names_still_fit_the_mdns_record() {
+        let long = "😀".repeat(64); // 64 characters, 256 bytes
+        let (a, adir) = node();
+        a.set_name(&long).unwrap();
+        let name = a.state().name;
+        assert!(name.len() <= 250 && long.starts_with(&name), "{} bytes", name.len());
+        // what `advertise` registers at every start; mdns-sd refuses a TXT entry over 255 bytes
+        let id = "0".repeat(32);
+        ServiceInfo::new(SERVICE, &id, &format!("{id}.local."), "", 47800, &[("id", id.as_str()), ("name", name.as_str()), ("v", "2")][..]).unwrap();
+        // a name saved before the byte limit is shortened when the config loads
+        {
+            let mut st = a.st();
+            st.cfg.name = long.clone();
+            save(&adir, &st.cfg).unwrap();
+        }
+        assert_eq!(load(&adir).unwrap().name, name);
+        a.shutdown();
+        let _ = std::fs::remove_dir_all(adir);
+    }
+
 }
