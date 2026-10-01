@@ -235,8 +235,20 @@ els.channels.addEventListener('click', (e) => {
 els.bitrate.addEventListener('input', showMusic);
 els.music.addEventListener('change', () => { showMusic(); saveSettings(); });
 els.bitrate.addEventListener('change', saveSettings);
-els.input.addEventListener('change', saveSettings);
-els.output.addEventListener('change', saveSettings);
+// "Refresh devices…" re-reads this computer's devices and keeps both selections
+async function refreshDevices() {
+  const keep = [els.input.dataset.prev, els.output.dataset.prev];
+  try { await loadDevices(); } catch (e) { actionError = String(e); }
+  setSel(els.input, keep[0]);
+  setSel(els.output, keep[1]);
+}
+for (const sel of [els.input, els.output]) {
+  sel.addEventListener('change', () => {
+    if (isRefresh(sel)) return refreshDevices();
+    sel.dataset.prev = sel.value;
+    saveSettings();
+  });
+}
 els.service.addEventListener('change', saveSettings);
 els.remoteCfg.addEventListener('change', saveSettings);
 els.autoRc.addEventListener('change', saveSettings);
@@ -400,7 +412,12 @@ function remotePanel() {
     const sel = el('select');
     fill(sel, list, special, hint);
     setSel(sel, s[key]);
-    sel.addEventListener('change', () => { s[key] = sel.value || null; });
+    sel.addEventListener('change', async () => {
+      if (!isRefresh(sel)) { s[key] = sel.value || null; return; }
+      try { const c = await invoke('remote_get', { id: r.id }); r.inputs = c.inputs; r.outputs = c.outputs; }
+      catch (e) { actionError = String(e); }
+      lastDevices = ''; render(); // rebuilds the panel from the draft, so choices stay
+    });
     box.appendChild(sel);
   };
   box.appendChild(el('h2', 'sub', 'Sending'));
@@ -448,13 +465,16 @@ function remotePanel() {
 
 // keeps a saved device selectable even while it is unplugged
 function setSel(sel, v) {
-  if (v && ![...sel.options].some((o) => o.value === v)) {
+  if (v && ![...sel.options].some((o) => o.value === v && !o.dataset.refresh)) {
     const o = document.createElement('option');
     o.value = v; o.textContent = v + ' (not found)';
-    sel.appendChild(o);
+    sel.insertBefore(o, sel.querySelector('option[data-refresh]')); // Refresh stays last
   }
   sel.value = v || '';
+  sel.dataset.prev = v || '';
 }
+
+const isRefresh = (sel) => !!(sel.selectedOptions[0] && sel.selectedOptions[0].dataset.refresh);
 
 // ---- PIN: hidden until asked for, hides itself again after 30 s ----
 function showPin(on) {
@@ -539,6 +559,9 @@ function fill(sel, list, special, hint) {
     o.value = name; o.textContent = name === special ? name + ' — ' + hint : name;
     sel.appendChild(o);
   }
+  const refresh = document.createElement('option'); // re-checks for plugged/unplugged devices
+  refresh.value = ''; refresh.dataset.refresh = '1'; refresh.textContent = 'Refresh devices…';
+  sel.appendChild(refresh);
 }
 
 async function loadDevices() {
