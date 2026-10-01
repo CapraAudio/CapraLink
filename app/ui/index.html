@@ -50,7 +50,18 @@
   .me-name input { margin: 0; flex: 1; min-width: 0; }
   .pin { font-size: 30px; font-weight: 700; letter-spacing: .12em; font-variant-numeric: tabular-nums; }
   .hint { font-size: 11px; color: var(--sub); margin-bottom: 8px; }
-  .dev { display: flex; align-items: center; gap: 8px; padding: 6px 0; border-top: 1px solid var(--border); }
+  .dev { padding: 6px 0; border-top: 1px solid var(--border); }
+  .dev .top { display: flex; align-items: center; gap: 6px; position: relative; }
+  .dev .more { border: 1px solid var(--border); background: var(--bg); color: var(--fg); border-radius: 6px;
+    padding: 0 7px; font-size: 14px; line-height: 18px; cursor: pointer; width: auto; margin: 0; }
+  .dev .menu { position: absolute; top: 22px; left: 0; z-index: 5; background: var(--card); border: 1px solid var(--border);
+    border-radius: 8px; box-shadow: 0 6px 18px rgba(0,0,0,.18); padding: 4px; display: flex; flex-direction: column; min-width: 140px; }
+  .dev .menu button { border: none; background: none; color: var(--fg); text-align: left; padding: 6px 10px; border-radius: 5px;
+    font-size: 12px; cursor: pointer; width: auto; margin: 0; }
+  .dev .menu button:hover { background: var(--bg); }
+  .dev .menu button.danger { color: var(--danger); }
+  .dev .bottom { display: flex; align-items: center; gap: 8px; }
+  .dev .bottom .btn { margin-left: auto; }
   .dev:first-of-type { border-top: none; }
   .dev .info { flex: 1; min-width: 0; }
   .dev .name { font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
@@ -77,6 +88,13 @@
     transition: width 70ms linear; }
   .pinrow { display: flex; align-items: baseline; gap: 10px; }
   h2.sub { margin-top: 10px; }
+  h2.withbar { display: flex; align-items: center; gap: 10px; }
+  section.me { position: relative; }
+  .gear { position: absolute; top: 6px; right: 8px; width: auto; margin: 0; border: 1px solid var(--border); background: var(--bg);
+    color: var(--fg); border-radius: 6px; padding: 1px 7px; font-size: 14px; cursor: pointer; }
+  .opts { position: absolute; top: 32px; right: 8px; left: 8px; z-index: 6; background: var(--card); border: 1px solid var(--border);
+    border-radius: 10px; box-shadow: 0 8px 24px rgba(0,0,0,.2); padding: 10px 12px 4px; }
+  h2.withbar .bar { flex: 1; }
   /* fixed width (7 characters + letter spacing) so Show/Hide stays put when dots swap for digits */
   .pinrow .pin { width: calc(7ch + 0.84em); white-space: nowrap; }
   .remote { padding: 6px 0 0; border-top: 1px solid var(--border); }
@@ -89,8 +107,17 @@
     <span class="pill" id="status">Idle</span>
   </header>
 
-  <section>
+  <section class="me">
     <h2>This device</h2>
+    <button class="gear" id="optsBtn" title="Settings">⚙︎</button>
+    <div class="opts" id="opts" hidden>
+      <label class="check"><input id="service" type="checkbox" /> Run in background at login</label>
+    <div class="hint">Keeps CapraLink running without this window, even in Steam Game Mode.</div>
+    <label class="check"><input id="remoteCfg" type="checkbox" /> Allow paired computers to change these settings</label>
+    <div class="hint">Lets them pick this computer's devices, channels, bitrate and Music Mode.</div>
+    <label class="check"><input id="autoRc" type="checkbox" /> Reconnect automatically</label>
+    <div class="hint">If the link drops, or after a restart, reconnect to the last computer you connected to.</div>
+    </div>
     <div class="me-name" id="myNameRow"></div>
     <div class="pinrow"><div class="pin" id="pin">••• •••</div><button class="link" id="pinToggle">Show</button></div>
     <div class="hint">Enter this PIN on the other computer to pair</div>
@@ -108,7 +135,7 @@
   </section>
 
   <section>
-    <h2>Sending</h2>
+    <h2 class="withbar">Sending <div class="bar"><i id="inLevel"></i></div></h2>
     <label>Send from</label>
     <select id="input"></select>
     <label>Channels</label>
@@ -122,7 +149,7 @@
   </section>
 
   <section>
-    <h2>Receiving</h2>
+    <h2 class="withbar">Receiving <div class="bar"><i id="outLevel"></i></div></h2>
     <label>Play to</label>
     <select id="output"></select>
     <div class="hint" id="cableNote" hidden>Windows needs VB-Cable (free) for a CapraLink microphone: vb-audio.com/Cable</div>
@@ -133,19 +160,6 @@
     <div class="hint">Stereo, higher quality, a little more delay — applies to both directions of the link.</div>
   </section>
 
-  <section>
-    <label class="check"><input id="service" type="checkbox" /> Run in background at login</label>
-    <div class="hint">Keeps CapraLink running without this window, even in Steam Game Mode.</div>
-    <label class="check"><input id="remoteCfg" type="checkbox" /> Allow paired computers to change these settings</label>
-    <div class="hint">Lets them pick this computer's devices, channels, bitrate and Music Mode.</div>
-    <label class="check"><input id="autoRc" type="checkbox" /> Reconnect automatically</label>
-    <div class="hint">If the link drops, or after a restart, reconnect to the last computer you connected to.</div>
-  </section>
-
-  <div class="meters">
-    <span>Sending</span><div class="bar"><i id="inLevel"></i></div>
-    <span>Receiving</span><div class="bar"><i id="outLevel"></i></div>
-  </div>
   <div id="stats" style="margin-top:8px;"></div>
   <div id="error"></div>
 
@@ -172,6 +186,7 @@ let devices = [];
 let remote = null;      // open "Settings on <name>" panel: {id, name, inputs, outputs, draft}
 let renaming = null;    // draft name while the "This device" name is being edited, else null
 let lastNameSig = '';
+let menuFor = null; // device whose ⋯ menu is open
 let currentPin = '';
 let pinShown = false, pinTimer = null;
 
@@ -284,7 +299,7 @@ function button(text, cls, onclick) {
 
 function render() {
   // rebuild only when something changed, so a half-typed PIN survives the 1 s poll
-  const sig = JSON.stringify([devices, pairingId, busy, remote && remote.id, editAddr && editAddr.id]);
+  const sig = JSON.stringify([devices, pairingId, busy, remote && remote.id, editAddr && editAddr.id, menuFor]);
   if (sig === lastDevices) return;
   lastDevices = sig;
   const list = els.devices;
@@ -295,28 +310,36 @@ function render() {
   }
   for (const d of devices) {
     const row = el('div', 'dev');
-    const info = el('div', 'info');
-    info.appendChild(el('div', 'name', d.name));
+    const top = el('div', 'top');
+    top.appendChild(el('div', 'name', d.name));
+    if (d.paired) {
+      top.appendChild(button('⋯', 'more', (e) => { e.stopPropagation(); menuFor = menuFor === d.id ? null : d.id; lastDevices = ''; render(); }));
+      if (menuFor === d.id) {
+        const m = el('div', 'menu');
+        const item = (t, f, cls) => { const b = button(t, cls || '', () => { menuFor = null; lastDevices = ''; f(); }); m.appendChild(b); };
+        if (d.reachable) item('Configure', () => openRemote(d.id));
+        item('Edit address', () => { editAddr = { id: d.id, draft: d.addr || '' }; render(); });
+        item('Forget', () => act('forget', { id: d.id }), 'danger');
+        top.appendChild(m);
+      }
+    }
+    row.appendChild(top);
     const status = d.connected ? 'Paired · Connected'
       : d.reconnecting ? 'Paired · Reconnecting…'
       : !d.paired ? 'Not paired'
       : d.online ? 'Paired · Online'
       : d.reachable ? 'Paired · Offline (last seen at ' + d.addr + ')'
       : 'Paired · Offline';
-    info.appendChild(el('div', 'st', status));
-    row.appendChild(info);
-    if (d.paired && d.reachable) row.appendChild(button('Configure', 'link', () => openRemote(d.id)));
-    if (d.paired) row.appendChild(button('Edit address', 'link', () => {
-      editAddr = editAddr && editAddr.id === d.id ? null : { id: d.id, draft: d.addr || '' }; render();
-    }));
-    if (d.paired) row.appendChild(button('Forget', 'link', () => act('forget', { id: d.id })));
+    const bottom = el('div', 'bottom');
+    bottom.appendChild(el('div', 'st', status));
     if (!d.paired) {
-      row.appendChild(button('Pair', 'btn', () => { pairingId = pairingId === d.id ? null : d.id; pinDraft = ''; render(); }));
+      bottom.appendChild(button('Pair', 'btn', () => { pairingId = pairingId === d.id ? null : d.id; pinDraft = ''; render(); }));
     } else if (d.connected) {
-      row.appendChild(button('Disconnect', 'btn stop', () => act('disconnect')));
+      bottom.appendChild(button('Disconnect', 'btn stop', () => act('disconnect')));
     } else if (d.reachable) {
-      row.appendChild(button('Connect', 'btn', () => act('connect', { id: d.id })));
+      bottom.appendChild(button('Connect', 'btn', () => act('connect', { id: d.id })));
     }
+    row.appendChild(bottom);
     list.appendChild(row);
     if (pairingId === d.id && !d.paired) {
       const box = el('div', 'pairbox');
@@ -537,6 +560,12 @@ async function fitWindow() {
   } catch (_) {}
 }
 new ResizeObserver(fitWindow).observe(document.body);
+
+document.addEventListener('click', () => { if (menuFor) { menuFor = null; lastDevices = ''; render(); } });
+
+$('optsBtn').addEventListener('click', (e) => { e.stopPropagation(); $('opts').hidden = !$('opts').hidden; });
+$('opts').addEventListener('click', (e) => e.stopPropagation()); // clicks inside keep it open
+document.addEventListener('click', () => { $('opts').hidden = true; });
 
 (async function init() {
   // options must exist before saved selections can apply; the engine may still be starting
