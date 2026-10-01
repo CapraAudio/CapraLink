@@ -40,6 +40,9 @@ pub const VIRTUAL_INPUT: &str = "CapraLink Input";
 
 /// Windows Send-from name: loopback of the default playback device (MASTER.md §3.8).
 pub const EVERYTHING: &str = "Everything this PC plays";
+/// Send-from / Play-to value that turns that direction off (e.g. while another app such as a
+/// remote-desktop client already carries this computer's audio).
+pub const NO_DEVICE: &str = "none";
 
 pub fn input_devices() -> Vec<String> {
     #[allow(unused_mut)]
@@ -94,6 +97,7 @@ fn win_label(input: bool, name: String) -> Option<String> {
     let cable = |side: &str| name.starts_with(side) && name.ends_with("(VB-Audio Virtual Cable)");
     match input {
         false if cable("CABLE Input") => Some(VIRTUAL_INPUT.into()),
+        false if cable("CABLE In ") => None, // VB-Cable's 16-channel variant: same cable, just clutter
         true if cable("CABLE Output") => None,
         _ => Some(name),
     }
@@ -197,7 +201,7 @@ pub struct Link {
     stop: Arc<AtomicBool>,
     rx: Option<JoinHandle<()>>,
     _input: Box<dyn Send>, // cpal stream, or an app capture on Windows
-    _output: cpal::Stream,
+    _output: Option<cpal::Stream>, // None when Play to is off
 }
 
 impl Link {
@@ -209,12 +213,14 @@ impl Link {
             Some(n) => devices(&host, input).into_iter().find(|(s, _)| s == n).map(|(_, d)| d).ok_or_else(|| anyhow!("device not found: {n}")),
             None => default.ok_or_else(|| anyhow!("no default device")),
         };
+        let off = |want: &Option<String>| want.as_deref() == Some(NO_DEVICE);
         let app = cfg.input.as_deref().and_then(app_exe).filter(|_| cfg!(windows));
         let in_dev = match app {
+            _ if off(&cfg.input) => None,
             Some(_) => None,
             None => Some(find(true, &cfg.input, host.default_input_device())?),
         };
-        let out_dev = find(false, &cfg.output, host.default_output_device())?;
+        let out_dev = if off(&cfg.output) { None } else { Some(find(false, &cfg.output, host.default_output_device())?) };
 
         let sock = UdpSocket::bind(("0.0.0.0", port)).with_context(|| format!("bind UDP port {port}"))?;
         sock.set_read_timeout(Some(Duration::from_millis(200)))?;
@@ -227,9 +233,12 @@ impl Link {
         let stop = Arc::new(AtomicBool::new(false));
         let (mut prod, cons) = HeapRb::<f32>::new(RATE as usize).split(); // 500 ms of stereo
 
-        let output = build_output(&out_dev, cons, shared.clone())?;
+        // ponytail: with Play to = none, packets are still decoded into a ring nobody drains
+        // (it just stays full); skip decoding in the RX thread if that CPU ever matters.
+        let output = out_dev.map(|d| build_output(&d, cons, shared.clone())).transpose()?;
         let pk = Packetizer::new(cfg.channels, cfg.bitrate, &keys.send)?;
         let input: Box<dyn Send> = match (in_dev, app) {
+            _ if off(&cfg.input) => Box::new(()), // sending off: nothing captured or sent
             (Some(d), _) => {
                 let s = build_input(&d, cfg, pk, sock.try_clone()?, peer, shared.clone())?;
                 s.play()?;
@@ -265,7 +274,9 @@ impl Link {
                 }
             })?
         };
-        output.play()?;
+        if let Some(o) = &output {
+            o.play()?;
+        }
         Ok(Link { shared, stop, rx: Some(rx), _input: input, _output: output })
     }
 
@@ -625,6 +636,7 @@ fn windows_labels() {
     let shown = |input, names: &[&str]| names.iter().filter_map(|n| win_label(input, n.to_string())).collect::<Vec<_>>();
     let outs = ["Speakers (Realtek(R) Audio)", "CABLE Input (VB-Audio Virtual Cable)"];
     assert_eq!(shown(false, &outs), ["Speakers (Realtek(R) Audio)", VIRTUAL_INPUT]);
+    assert!(shown(false, &["CABLE In 16ch (VB-Audio Virtual Cable)"]).is_empty(), "16-channel variant hidden");
     assert_eq!(shown(false, &outs[..1]), ["Speakers (Realtek(R) Audio)"], "no VB-Cable, no CapraLink Input");
     let ins = ["Microphone (USB Mic)", "CABLE Output (VB-Audio Virtual Cable)"];
     assert_eq!(shown(true, &ins), ["Microphone (USB Mic)"]);

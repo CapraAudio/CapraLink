@@ -466,6 +466,9 @@ function fill(sel, list, special, hint) {
   const def = document.createElement('option');
   def.value = ''; def.textContent = 'System default';
   sel.appendChild(def);
+  const none = document.createElement('option'); // turns this direction off
+  none.value = 'none'; none.textContent = 'None';
+  sel.appendChild(none);
   const names = list.includes(special) ? [special, ...list.filter((n) => n !== special)] : list;
   for (const name of names) {
     const o = document.createElement('option');
