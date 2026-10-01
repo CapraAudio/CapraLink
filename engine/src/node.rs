@@ -918,7 +918,9 @@ impl Node {
             Some(Msg::GetConfig) => Msg::Config(RemoteConfig { name, settings: match theirs { Some(a) => a.apply(local), None => local }, inputs: crate::input_devices(), outputs: crate::output_devices() }),
             // `service` and `remote_config` only change locally
             Some(Msg::SetSettings { settings, name: new_name }) => {
+                // validated before anything is renamed or stored for a peer that isn't connected
                 let r = match new_name {
+                    _ if !matches!(settings.channels, 1 | 2) => Err(anyhow!("channels must be 1 or 2")),
                     Some(n) => self.set_name(&n),
                     None => Ok(()),
                 }
@@ -1676,5 +1678,36 @@ mod tests {
         assert!(wrong.is_err() && bad_rejected, "wrong pairing secret must fail the handshake");
         ctl_a.send(&Msg::Ping).unwrap();
         assert!(matches!(ctl_b.recv().unwrap(), Some(Msg::Ping)));
+    }
+
+    /// Paired nodes without a session, plus each one's id.
+    fn paired_nodes() -> ((Node, PathBuf), (Node, PathBuf), String, String) {
+        let ((a, adir), (b, bdir)) = (node(), node());
+        b.open_pairing().unwrap();
+        a.pair_addr(&[addr(&b)], &b.state().pin).unwrap();
+        wait(|| b.state().devices.iter().filter(|d| d.paired).count() == 1);
+        let (aid, bid) = (a.st().cfg.device_id.clone(), b.st().cfg.device_id.clone());
+        ((a, adir), (b, bdir), aid, bid)
+    }
+
+    #[test]
+    fn invalid_remote_audio_does_not_change_name_or_saved_peer_settings() {
+        let ((a, adir), (b, bdir), _aid, bid) = paired_nodes();
+        b.set_settings(Settings { remote_config: true, ..b.state().settings }).unwrap();
+        let before = std::fs::read(bdir.join("config.json")).unwrap();
+        // b has no current connection: the per-peer save path must validate channels too.
+        assert!(b.state().current.is_none());
+        for channels in [0, 3, u16::MAX] {
+            let settings = Settings { channels, ..b.state().settings };
+            let err = a.remote_set(&bid, settings, Some("Invalid rename".into())).unwrap_err().to_string();
+            assert!(err.contains("channels must be 1 or 2"), "{err}");
+            assert_eq!(std::fs::read(bdir.join("config.json")).unwrap(), before);
+        }
+        a.connect(&bid).unwrap();
+        wait(|| is(&b, |d| d.connected));
+        a.shutdown();
+        b.shutdown();
+        let _ = std::fs::remove_dir_all(adir);
+        let _ = std::fs::remove_dir_all(bdir);
     }
 }
