@@ -455,6 +455,7 @@ $('opts').addEventListener('click', (e) => e.stopPropagation()); // clicks insid
 document.addEventListener('click', () => { $('opts').hidden = true; });
 
 (async function init() {
+  invoke('version').then((v) => { $('version').textContent = 'v' + v; }, () => {});
   // options must exist before saved selections can apply; the engine may still be starting
   for (;;) {
     try { await loadDevices(); break; } catch (e) { els.error.textContent = String(e); }

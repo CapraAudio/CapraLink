@@ -88,6 +88,12 @@ fn fit(window: tauri::WebviewWindow, height: f64) {
     let _ = window.set_size(tauri::LogicalSize::new(width, height.clamp(300.0, 1000.0)));
 }
 
+/// This build's version (the Cargo/Tauri version), shown in the window's corner.
+#[tauri::command]
+fn version() -> &'static str {
+    env!("CARGO_PKG_VERSION")
+}
+
 #[tauri::command(async)]
 fn levels(app: State<App>) -> Result<Option<(f32, f32)>, String> {
     app.run(Client::levels)
@@ -232,7 +238,7 @@ fn main() {
         // a second launch (no tray on stock GNOME, Start menu on Windows) brings this window back
         .plugin(tauri_plugin_single_instance::init(|app, _, _| show_window(app)))
         .manage(app)
-        .invoke_handler(tauri::generate_handler![devices, state, levels, fit, pair, pair_ip, open_pairing, connect, disconnect, forget, set_settings, set_peer_addr, set_name, remote_get, remote_set])
+        .invoke_handler(tauri::generate_handler![devices, state, version, levels, fit, pair, pair_ip, open_pairing, connect, disconnect, forget, set_settings, set_peer_addr, set_name, remote_get, remote_set])
         .setup(|app| {
             #[cfg(target_os = "macos")]
             app.set_activation_policy(tauri::ActivationPolicy::Accessory);
