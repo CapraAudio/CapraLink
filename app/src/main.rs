@@ -123,6 +123,11 @@ fn set_settings(app: State<App>, settings: Settings) -> Result<(), String> {
 }
 
 #[tauri::command(async)]
+fn set_peer_addr(app: State<App>, id: String, addr: String) -> Result<(), String> {
+    app.run(|c| c.set_peer_addr(&id, &addr))
+}
+
+#[tauri::command(async)]
 fn set_name(app: State<App>, name: String) -> Result<(), String> {
     app.run(|c| c.set_name(&name))
 }
@@ -221,7 +226,7 @@ fn main() {
         // a second launch (no tray on stock GNOME, Start menu on Windows) brings this window back
         .plugin(tauri_plugin_single_instance::init(|app, _, _| show_window(app)))
         .manage(app)
-        .invoke_handler(tauri::generate_handler![devices, state, levels, fit, pair, pair_ip, connect, disconnect, forget, set_settings, set_name, remote_get, remote_set])
+        .invoke_handler(tauri::generate_handler![devices, state, levels, fit, pair, pair_ip, connect, disconnect, forget, set_settings, set_peer_addr, set_name, remote_get, remote_set])
         .setup(|app| {
             #[cfg(target_os = "macos")]
             app.set_activation_policy(tauri::ActivationPolicy::Accessory);

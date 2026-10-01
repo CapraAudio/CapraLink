@@ -15,7 +15,7 @@ use std::collections::HashMap;
 use std::io::{self, Read, Write};
 use std::net::{Ipv4Addr, Shutdown, SocketAddr, TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
 const SERVICE: &str = "_capralink._udp.local.";
@@ -26,6 +26,9 @@ const LINK_TIMEOUT: Duration = Duration::from_secs(10); // peer may be opening a
 const REPORT: Duration = Duration::from_secs(1); // also doubles as the session keepalive
 const DEAD: Duration = Duration::from_secs(15);
 const MAX_FAILURES: u32 = 5;
+// auto-reconnect backoff (MASTER.md §3.9); short under test
+const RETRY_FIRST: Duration = Duration::from_millis(if cfg!(test) { 100 } else { 2000 });
+const RETRY_MAX: Duration = Duration::from_millis(if cfg!(test) { 400 } else { 30_000 });
 
 #[derive(Serialize, Deserialize)]
 pub struct NodeState {
@@ -50,6 +53,8 @@ pub struct Device {
     pub reachable: bool,
     /// Last address that worked for this peer (for "last seen at" display), if any.
     pub addr: Option<String>,
+    /// The link to it dropped and this computer is trying to get it back.
+    pub reconnecting: bool,
 }
 
 /// Another computer's settings and its own device lists, for remote configuration.
@@ -69,6 +74,9 @@ struct Config {
     settings: Settings,
     #[serde(default)]
     peers: Vec<Peer>,
+    /// The device this node last connected to itself, for auto-reconnect (MASTER.md §3.9).
+    #[serde(default)]
+    last_peer: Option<String>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -123,6 +131,14 @@ struct Session {
     link: Option<Link>,
     ctl: Arc<Ctl>,
     peer_music: bool, // the peer's last `Mode`
+    mine: bool,       // this node dialed it (only the initiator auto-reconnects)
+}
+
+/// How a session's control loop ended.
+enum End {
+    Stop, // the peer chose to end it
+    Dead, // keepalive timeout
+    Lost, // TCP error / failed send
 }
 
 struct St {
@@ -133,6 +149,10 @@ struct St {
     session: Option<Session>,
     error: Option<String>,
     vdev: Virtual,
+    /// Bumped to cancel the retry loop (and any own dial that started before it); a loop only
+    /// runs while this still equals the value it started with.
+    retry: u64,
+    retrying: Option<String>, // peer the retry loop is after
 }
 
 struct Inner {
@@ -140,6 +160,7 @@ struct Inner {
     port: u16,
     mdns: Option<ServiceDaemon>,
     st: Mutex<St>,
+    wake: Condvar, // wakes a sleeping retry loop when `retry` changes
 }
 
 #[derive(Clone)]
@@ -164,8 +185,8 @@ impl Node {
         } else {
             (None, None)
         };
-        let st = St { cfg, pin: new_pin(), failures: 0, found: HashMap::new(), session: None, error: None, vdev: Virtual::setup() };
-        let node = Node(Arc::new(Inner { dir, port, mdns: daemon, st: Mutex::new(st) }));
+        let st = St { cfg, pin: new_pin(), failures: 0, found: HashMap::new(), session: None, error: None, vdev: Virtual::setup(), retry: 0, retrying: None };
+        let node = Node(Arc::new(Inner { dir, port, mdns: daemon, st: Mutex::new(st), wake: Condvar::new() }));
         if let Some(rx) = browse {
             let n = node.clone();
             std::thread::Builder::new().name("capralink-mdns".into()).spawn(move || {
@@ -176,12 +197,26 @@ impl Node {
         }
         let n = node.clone();
         std::thread::Builder::new().name("capralink-ctl".into()).spawn(move || n.accept(listener))?;
+        {
+            let mut st = node.st();
+            if let Some(id) = st.cfg.last_peer.clone().filter(|_| st.cfg.settings.auto_reconnect) {
+                node.start_retry(&mut st, id);
+            }
+        }
         Ok(node)
     }
 
-    /// Clean exit: stops the session and tells the network we're gone.
+    /// Clean exit: drops the session and tells the network we're gone. No `stop` and `last_peer`
+    /// is kept, so the session comes back after a restart (ours or, if it dialed, the peer's).
     pub fn shutdown(&self) {
-        self.disconnect();
+        let old = {
+            let mut st = self.st();
+            self.cancel_retry(&mut st);
+            st.session.take()
+        };
+        if let Some(s) = old {
+            let _ = s.ctl.stream.shutdown(Shutdown::Both);
+        }
         self.st().vdev.unload();
         if let Some(d) = &self.0.mdns {
             let id = self.st().cfg.device_id.clone();
@@ -225,12 +260,13 @@ impl Node {
                     connected: conn == Some(&p.id),
                     reachable: online || p.addr.is_some(),
                     addr: p.addr.clone(),
+                    reconnecting: st.retrying.as_deref() == Some(&p.id),
                 }
             })
             .collect();
         for (id, f) in &st.found {
             if !st.cfg.peers.iter().any(|p| p.id == *id) {
-                devices.push(Device { id: id.clone(), name: f.name.clone(), paired: false, online: true, connected: false, reachable: true, addr: None });
+                devices.push(Device { id: id.clone(), name: f.name.clone(), paired: false, online: true, connected: false, reachable: true, addr: None, reconnecting: false });
             }
         }
         devices.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()).then(a.id.cmp(&b.id)));
@@ -309,8 +345,6 @@ impl Node {
     /// the LAN). `addr` is "ip", "ip:port" (IPv4/IPv6 literal or hostname) or blank port meaning
     /// the default. Returns the paired peer's name.
     pub fn pair_ip(&self, addr: &str, pin: &str) -> Result<String> {
-        let addr = addr.trim();
-        ensure!(!addr.is_empty(), "enter the other computer's IP address");
         let id = self.pair_addr(&resolve(addr)?, pin)?;
         let st = self.st();
         Ok(st.cfg.peers.iter().find(|p| p.id == id).map_or(id, |p| p.name.clone()))
@@ -323,9 +357,15 @@ impl Node {
     }
 
     /// Starts a session with paired device `id` at the first of `addrs` that answers,
-    /// replacing any current one.
+    /// replacing any current one (and any reconnect attempts).
     pub fn connect_to(&self, id: &str, addrs: &[SocketAddr]) -> Result<()> {
-        self.disconnect(); // one link at a time; also frees our UDP port
+        let gen = self.cancel_retry(&mut self.st());
+        self.end_session(); // one link at a time; also frees our UDP port
+        self.dial_link(id, addrs, gen)
+    }
+
+    /// Dials a session; `gen` = the `St::retry` value it belongs to (a later cancel voids it).
+    fn dial_link(&self, id: &str, addrs: &[SocketAddr], gen: u64) -> Result<()> {
         let (my_id, secret, channels) = {
             let st = self.st();
             (st.cfg.device_id.clone(), secret(&st.cfg, id).ok_or_else(|| anyhow!("not paired with that device"))?, st.cfg.settings.channels)
@@ -341,22 +381,81 @@ impl Node {
             Some(Msg::Error { message }) => bail!("other computer: {message}"),
             _ => bail!("unexpected reply"),
         }
-        self.activate(id, addr, &keys, ctl.clone())?;
+        self.activate(id, addr, &keys, ctl.clone(), Some(gen))?;
         self.send_mode(&ctl);
-        let mut st = self.st();
-        set_addr(&mut st.cfg, id, addr.to_string());
-        save(&self.0.dir, &st.cfg)
+        Ok(())
     }
 
+    /// Ends the session by choice: no auto-reconnect, here or (via `stop`) on the peer.
     pub fn disconnect(&self) {
+        let old = {
+            let mut st = self.st();
+            self.cancel_retry(&mut st);
+            if st.cfg.last_peer.take().is_some() {
+                let _ = save(&self.0.dir, &st.cfg);
+            }
+            st.session.take()
+        };
+        if let Some(s) = old {
+            s.ctl.close();
+        }
+    }
+
+    fn end_session(&self) {
         let old = self.st().session.take();
         if let Some(s) = old {
             s.ctl.close();
         }
     }
 
+    /// Stops the retry loop (if any); returns the new generation.
+    fn cancel_retry(&self, st: &mut St) -> u64 {
+        st.retry += 1;
+        st.retrying = None;
+        self.0.wake.notify_all();
+        st.retry
+    }
+
+    fn start_retry(&self, st: &mut St, id: String) {
+        let gen = self.cancel_retry(st);
+        st.retrying = Some(id.clone());
+        let n = self.clone();
+        let _ = std::thread::Builder::new().name("capralink-retry".into()).spawn(move || n.retry_loop(gen, &id));
+    }
+
+    /// Redials `id` with backoff until connected or cancelled (MASTER.md §3.9). Each attempt
+    /// uses the current `addrs`; failures only show as `Device::reconnecting`.
+    fn retry_loop(&self, gen: u64, id: &str) {
+        let mut wait = RETRY_FIRST;
+        loop {
+            {
+                let st = self.st();
+                let (mut st, _) = self.0.wake.wait_timeout_while(st, wait, |st| st.retry == gen).unwrap_or_else(|e| e.into_inner());
+                if st.retry != gen {
+                    return;
+                }
+                if st.session.is_some() || !st.cfg.settings.auto_reconnect {
+                    st.retrying = None;
+                    return;
+                }
+            }
+            let r = self.addrs(id).and_then(|(addrs, fullname)| {
+                let r = self.dial_link(id, &addrs, gen);
+                self.recheck(fullname, r)
+            });
+            if r.is_ok() {
+                return;
+            }
+            wait = (wait * 2).min(RETRY_MAX);
+        }
+    }
+
     pub fn forget(&self, id: &str) -> Result<()> {
-        if self.st().session.as_ref().is_some_and(|s| s.peer_id == id) {
+        let ours = {
+            let st = self.st();
+            st.session.as_ref().is_some_and(|s| s.peer_id == id) || st.cfg.last_peer.as_deref() == Some(id)
+        };
+        if ours {
             self.disconnect();
         }
         let mut st = self.st();
@@ -376,7 +475,10 @@ impl Node {
         let music = s.music_mode;
         let (running, notify) = {
             let mut st = self.st();
-            let audio_changed = Settings { service: s.service, remote_config: s.remote_config, music_mode: music, ..old } != s;
+            let audio_changed = Settings { service: s.service, remote_config: s.remote_config, music_mode: music, auto_reconnect: s.auto_reconnect, ..old } != s;
+            if !s.auto_reconnect && st.retrying.is_some() {
+                self.cancel_retry(&mut st);
+            }
             st.cfg.settings = s;
             save(&self.0.dir, &st.cfg)?;
             apply_mode(&st);
@@ -434,6 +536,17 @@ impl Node {
         Ok(())
     }
 
+    /// Sets the address to reach paired device `id` at ("ip", "ip:port" or hostname, as in
+    /// `pair_ip`). No PIN: the session handshake still checks the pairing secret.
+    pub fn set_peer_addr(&self, id: &str, addr: &str) -> Result<()> {
+        let addrs = resolve(addr)?;
+        let a = addrs.iter().find(|a| a.is_ipv4()).unwrap_or(&addrs[0]).to_string();
+        let mut st = self.st();
+        let p = st.cfg.peers.iter_mut().find(|p| p.id == id).ok_or_else(|| anyhow!("not paired with that device"))?;
+        p.addr = Some(a);
+        save(&self.0.dir, &st.cfg)
+    }
+
     /// One request over its own management session (a separate connection; any audio session
     /// with that device is left alone).
     fn manage(&self, id: &str, req: &Msg) -> Result<Msg> {
@@ -462,9 +575,19 @@ impl Node {
         }
     }
 
-    /// Installs a new session: stops the old one, starts the Link, watches the control channel.
-    fn activate(&self, id: &str, addr: SocketAddr, keys: &Keys, ctl: Arc<Ctl>) -> Result<()> {
+    /// Installs a new session: stops the old one, starts the Link, watches the control channel,
+    /// remembers the peer's address. `own` = this node dialed it, as part of retry generation
+    /// `own` (refused if that was cancelled meanwhile); it becomes `last_peer`. An incoming
+    /// session clears `last_peer`: the side that dialed owns reconnecting.
+    fn activate(&self, id: &str, addr: SocketAddr, keys: &Keys, ctl: Arc<Ctl>, own: Option<u64>) -> Result<()> {
         let mut st = self.st();
+        // ponytail: a cancelled dial is refused only here, after the peer has accepted it; if the
+        // peer took it after a newer session from us, that newer one drops too. Serialize own dials if seen.
+        if own.is_some_and(|g| g != st.retry) {
+            drop(st);
+            ctl.close();
+            bail!("cancelled");
+        }
         if let Some(old) = st.session.take() {
             old.ctl.close(); // Link drop below frees the UDP port before the new bind
         }
@@ -476,8 +599,14 @@ impl Node {
                 return Err(e);
             }
         };
-        st.session = Some(Session { peer_id: id.to_string(), addr, link, ctl: ctl.clone(), peer_music: false });
+        self.cancel_retry(&mut st);
+        st.session = Some(Session { peer_id: id.to_string(), addr, link, ctl: ctl.clone(), peer_music: false, mine: own.is_some() });
         st.error = None;
+        set_addr(&mut st.cfg, id, addr.to_string());
+        st.cfg.last_peer = own.map(|_| id.to_string());
+        if let Err(e) = save(&self.0.dir, &st.cfg) {
+            st.error = Some(format!("{e:#}"));
+        }
         apply_mode(&st);
         drop(st);
         let n = self.clone();
@@ -493,9 +622,9 @@ impl Node {
         let mut rate = RateControl::new(ceiling(self.st().cfg.settings.bitrate, false));
         let mut last_counts = (0u64, 0u64, 0u64);
         let (mut last_rx, mut last_report) = (Instant::now(), Instant::now());
-        let lost = loop {
+        let end = loop {
             match ctl.recv() {
-                Ok(Some(Msg::Stop)) => break false,
+                Ok(Some(Msg::Stop)) => break End::Stop,
                 Ok(Some(Msg::Report { received, lost, underruns, .. })) => {
                     last_rx = Instant::now();
                     rate.set_ceiling({
@@ -516,31 +645,41 @@ impl Node {
                 Ok(_) => last_rx = Instant::now(),
                 Err(e) if matches!(e.kind(), io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut) => {
                     if last_rx.elapsed() > DEAD {
-                        break true;
+                        break End::Dead;
                     }
                 }
-                Err(_) => break false,
+                Err(_) => break End::Lost,
             }
             if last_report.elapsed() >= REPORT {
                 last_report = Instant::now();
-                match self.link_delta(&ctl, &mut last_counts) {
-                    Some((received, lost, underruns, jitter_ms)) => {
-                        let _ = ctl.send(&Msg::Report { received, lost, underruns, jitter_ms });
-                    }
-                    None => {
-                        let _ = ctl.send(&Msg::Ping); // no link (e.g. tests): keepalive only
-                    }
+                let m = match self.link_delta(&ctl, &mut last_counts) {
+                    Some((received, lost, underruns, jitter_ms)) => Msg::Report { received, lost, underruns, jitter_ms },
+                    None => Msg::Ping, // no link (e.g. tests): keepalive only
+                };
+                if ctl.send(&m).is_err() {
+                    break End::Lost;
                 }
             }
         };
-        ctl.close();
+        // no `stop`: after a loss the peer should treat it as a loss too (and may reconnect)
+        let _ = ctl.stream.shutdown(Shutdown::Both);
         let mut st = self.st();
-        if st.session.as_ref().is_some_and(|s| Arc::ptr_eq(&s.ctl, &ctl)) {
-            let s = st.session.take();
-            if lost {
-                let name = s.and_then(|s| st.cfg.peers.iter().find(|p| p.id == s.peer_id).map(|p| p.name.clone()));
+        if !st.session.as_ref().is_some_and(|s| Arc::ptr_eq(&s.ctl, &ctl)) {
+            return; // ended here (disconnect, replaced, shutdown): nothing to do
+        }
+        let Some(s) = st.session.take() else { return };
+        match end {
+            End::Stop => {
+                if st.cfg.last_peer.take().is_some() {
+                    let _ = save(&self.0.dir, &st.cfg);
+                }
+            }
+            _ if s.mine && st.cfg.settings.auto_reconnect && st.cfg.last_peer.as_deref() == Some(&s.peer_id) => self.start_retry(&mut st, s.peer_id),
+            End::Dead => {
+                let name = st.cfg.peers.iter().find(|p| p.id == s.peer_id).map(|p| p.name.clone());
                 st.error = Some(format!("lost connection to {}", name.unwrap_or_default()));
             }
+            End::Lost => {}
         }
     }
 
@@ -625,14 +764,10 @@ impl Node {
             _ => bail!("expected link request"),
         };
         let addr = SocketAddr::new(s.peer_addr()?.ip(), port);
-        if let Err(e) = self.activate(id, addr, &keys, ctl.clone()) {
+        if let Err(e) = self.activate(id, addr, &keys, ctl.clone(), None) {
             let _ = ctl.send(&Msg::Error { message: format!("{e:#}") });
             return Err(e);
         }
-        let mut st = self.st();
-        set_addr(&mut st.cfg, id, addr.to_string());
-        save(&self.0.dir, &st.cfg)?;
-        drop(st);
         ctl.send(&Msg::Ok)?;
         self.send_mode(&ctl); // after Ok: an old initiator expects Ok first
         Ok(())
@@ -746,7 +881,7 @@ fn load(dir: &Path) -> Result<Config> {
             Ok(cfg)
         }
         Err(e) if e.kind() == io::ErrorKind::NotFound => {
-            let cfg = Config { device_id: hex(&random::<16>()), name: hostname(), settings: Settings::default(), peers: vec![] };
+            let cfg = Config { device_id: hex(&random::<16>()), name: hostname(), settings: Settings::default(), peers: vec![], last_peer: None };
             save(dir, &cfg)?;
             Ok(cfg)
         }
@@ -789,6 +924,8 @@ fn set_addr(cfg: &mut Config, id: &str, addr: String) {
 /// standard port when none is given.
 fn resolve(addr: &str) -> Result<Vec<SocketAddr>> {
     use std::net::{IpAddr, ToSocketAddrs};
+    let addr = addr.trim();
+    ensure!(!addr.is_empty(), "enter the other computer's IP address");
     if let Ok(sa) = addr.parse::<SocketAddr>() {
         return Ok(vec![sa]);
     }
@@ -1139,6 +1276,102 @@ mod tests {
         let _ = std::fs::remove_dir_all(bdir);
     }
 
+    /// Two nodes, paired, `a` connected to `b`; returns b's id.
+    fn connected() -> ((Node, PathBuf), (Node, PathBuf), String) {
+        let ((a, adir), (b, bdir)) = (node(), node());
+        a.pair_ip(&format!("127.0.0.1:{}", b.port()), &b.state().pin).unwrap();
+        wait(|| peers(&bdir).len() == 1);
+        let bid = peers(&adir)[0].id.clone();
+        a.connect(&bid).unwrap();
+        wait(|| is(&b, |d| d.connected));
+        ((a, adir), (b, bdir), bid)
+    }
+
+    fn is(n: &Node, f: impl Fn(&Device) -> bool) -> bool {
+        n.state().devices.iter().any(f)
+    }
+
+    /// The TCP connection drops with no `stop` (network loss, crash).
+    fn lose(n: &Node) {
+        let s = n.st().session.take();
+        let _ = s.unwrap().ctl.stream.shutdown(Shutdown::Both);
+    }
+
+    /// Waits longer than a few backoff rounds, then checks nothing reconnected.
+    fn stays_down(a: &Node, b: &Node) {
+        std::thread::sleep(RETRY_MAX * 3);
+        assert!(!is(a, |d| d.connected || d.reconnecting) && !is(b, |d| d.connected || d.reconnecting));
+    }
+
+    #[test]
+    fn reconnects_after_loss_at_current_address() {
+        let ((a, adir), (b, bdir), bid) = connected();
+        assert_eq!(load(&adir).unwrap().last_peer.as_deref(), Some(bid.as_str()));
+        assert_eq!(load(&bdir).unwrap().last_peer, None, "only the dialing side reconnects");
+
+        // set_peer_addr: paired ids only, needs an address
+        assert!(a.set_peer_addr("0".repeat(32).as_str(), "127.0.0.1:1").unwrap_err().to_string().contains("not paired"));
+        assert!(a.set_peer_addr(&bid, "  ").unwrap_err().to_string().contains("IP address"));
+
+        // b goes away (its stand-in refuses a from now on), then comes back on another port
+        b.st().cfg.peers.clear();
+        lose(&b);
+        wait(|| is(&a, |d| d.id == bid && d.reconnecting && !d.connected));
+        std::thread::sleep(RETRY_MAX * 2);
+        assert!(is(&a, |d| d.reconnecting) && a.state().error.is_none(), "failed attempts don't set an error");
+        let b2 = Node::start(Some(bdir.clone()), 0, false).unwrap();
+        a.set_peer_addr(&bid, &format!(" localhost:{} ", b2.port())).unwrap();
+        assert_eq!(peers(&adir)[0].addr, Some(format!("127.0.0.1:{}", b2.port())));
+        wait(|| is(&a, |d| d.connected && !d.reconnecting) && is(&b2, |d| d.connected));
+        assert!(!is(&b2, |d| d.reconnecting));
+        let _ = std::fs::remove_dir_all(adir);
+        let _ = std::fs::remove_dir_all(bdir);
+    }
+
+    #[test]
+    fn no_reconnect_when_ended_on_purpose() {
+        let ((a, adir), (b, bdir), bid) = connected();
+        a.disconnect();
+        assert_eq!(load(&adir).unwrap().last_peer, None);
+        stays_down(&a, &b);
+
+        a.connect(&bid).unwrap();
+        wait(|| is(&b, |d| d.connected));
+        b.disconnect(); // the peer's `stop`
+        wait(|| !is(&a, |d| d.connected));
+        stays_down(&a, &b);
+        assert_eq!(load(&adir).unwrap().last_peer, None);
+
+        a.connect(&bid).unwrap();
+        wait(|| is(&b, |d| d.connected));
+        a.set_settings(Settings { auto_reconnect: false, ..a.state().settings }).unwrap();
+        lose(&b);
+        wait(|| !is(&a, |d| d.connected));
+        stays_down(&a, &b);
+
+        // the responder never redials, even with auto_reconnect on
+        a.set_settings(Settings { auto_reconnect: true, ..a.state().settings }).unwrap();
+        a.connect(&bid).unwrap();
+        wait(|| is(&b, |d| d.connected));
+        lose(&a);
+        wait(|| !is(&b, |d| d.connected));
+        stays_down(&a, &b);
+        let _ = std::fs::remove_dir_all(adir);
+        let _ = std::fs::remove_dir_all(bdir);
+    }
+
+    #[test]
+    fn reconnects_to_last_peer_at_start() {
+        let ((a, adir), (b, bdir), _) = connected();
+        a.shutdown();
+        wait(|| !is(&b, |d| d.connected));
+        assert!(load(&adir).unwrap().last_peer.is_some(), "shutdown keeps last_peer");
+        let a2 = Node::start(Some(adir.clone()), 0, false).unwrap();
+        wait(|| is(&a2, |d| d.connected) && is(&b, |d| d.connected));
+        let _ = std::fs::remove_dir_all(adir);
+        let _ = std::fs::remove_dir_all(bdir);
+    }
+
     #[test]
     fn set_name_trims_cleans_and_rejects_empty() {
         let (a, adir) = node();
@@ -1156,8 +1389,8 @@ mod tests {
                 "peers":[{"id":"1","name":"c","secret":"00"}]}"#,
         )
         .unwrap();
-        assert!(cfg.peers[0].addr.is_none());
-        assert!(!cfg.settings.remote_config && !cfg.settings.music_mode);
+        assert!(cfg.peers[0].addr.is_none() && cfg.last_peer.is_none());
+        assert!(!cfg.settings.remote_config && !cfg.settings.music_mode && cfg.settings.auto_reconnect);
 
         let m: Msg = serde_json::from_str(r#"{"type":"pair","id":"a","name":"b"}"#).unwrap();
         assert!(matches!(m, Msg::Pair { port: None, .. }));

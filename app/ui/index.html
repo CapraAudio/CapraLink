@@ -138,6 +138,8 @@
     <div class="hint">Keeps CapraLink running without this window, even in Steam Game Mode.</div>
     <label class="check"><input id="remoteCfg" type="checkbox" /> Allow paired computers to change these settings</label>
     <div class="hint">Lets them pick this computer's devices, channels, bitrate and Music Mode.</div>
+    <label class="check"><input id="autoRc" type="checkbox" /> Reconnect automatically</label>
+    <div class="hint">If the link drops, or after a restart, reconnect to the last computer you connected to.</div>
   </section>
 
   <div class="meters">
@@ -153,7 +155,7 @@ const { invoke } = window.__TAURI__.core;
 const $ = (id) => document.getElementById(id);
 const els = {
   input: $('input'), output: $('output'), channels: $('channels'), bitrate: $('bitrate'),
-  bitrateVal: $('bitrateVal'), service: $('service'), remoteCfg: $('remoteCfg'), music: $('music'), error: $('error'), status: $('status'), stats: $('stats'), devices: $('devices'),
+  bitrateVal: $('bitrateVal'), service: $('service'), remoteCfg: $('remoteCfg'), autoRc: $('autoRc'), music: $('music'), error: $('error'), status: $('status'), stats: $('stats'), devices: $('devices'),
   myNameRow: $('myNameRow'),
 };
 
@@ -164,6 +166,7 @@ let actionError = '';
 let busy = false;
 let pairingId = null;   // device whose PIN box is open
 let pinDraft = '';
+let editAddr = null;    // open "Edit address" box: {id, draft}
 let lastDevices = '';
 let devices = [];
 let remote = null;      // open "Settings on <name>" panel: {id, name, inputs, outputs, draft}
@@ -203,7 +206,7 @@ function saveSettings() {
   act('set_settings', { settings: {
     input: els.input.value || null, output: els.output.value || null,
     bitrate: Number(els.bitrate.value) * 1000, channels, service: els.service.checked,
-    remote_config: els.remoteCfg.checked, music_mode: els.music.checked,
+    remote_config: els.remoteCfg.checked, music_mode: els.music.checked, auto_reconnect: els.autoRc.checked,
   }});
 }
 
@@ -219,6 +222,7 @@ els.input.addEventListener('change', saveSettings);
 els.output.addEventListener('change', saveSettings);
 els.service.addEventListener('change', saveSettings);
 els.remoteCfg.addEventListener('change', saveSettings);
+els.autoRc.addEventListener('change', saveSettings);
 
 // ---- this device's name ----
 function renderName(name) {
@@ -280,7 +284,7 @@ function button(text, cls, onclick) {
 
 function render() {
   // rebuild only when something changed, so a half-typed PIN survives the 1 s poll
-  const sig = JSON.stringify([devices, pairingId, busy, remote && remote.id]);
+  const sig = JSON.stringify([devices, pairingId, busy, remote && remote.id, editAddr && editAddr.id]);
   if (sig === lastDevices) return;
   lastDevices = sig;
   const list = els.devices;
@@ -294,6 +298,7 @@ function render() {
     const info = el('div', 'info');
     info.appendChild(el('div', 'name', d.name));
     const status = d.connected ? 'Paired · Connected'
+      : d.reconnecting ? 'Paired · Reconnecting…'
       : !d.paired ? 'Not paired'
       : d.online ? 'Paired · Online'
       : d.reachable ? 'Paired · Offline (last seen at ' + d.addr + ')'
@@ -301,6 +306,9 @@ function render() {
     info.appendChild(el('div', 'st', status));
     row.appendChild(info);
     if (d.paired && d.reachable) row.appendChild(button('Configure', 'link', () => openRemote(d.id)));
+    if (d.paired) row.appendChild(button('Edit address', 'link', () => {
+      editAddr = editAddr && editAddr.id === d.id ? null : { id: d.id, draft: d.addr || '' }; render();
+    }));
     if (d.paired) row.appendChild(button('Forget', 'link', () => act('forget', { id: d.id })));
     if (!d.paired) {
       row.appendChild(button('Pair', 'btn', () => { pairingId = pairingId === d.id ? null : d.id; pinDraft = ''; render(); }));
@@ -321,6 +329,23 @@ function render() {
       box.appendChild(button('Confirm', 'btn', confirm));
       list.appendChild(box);
       setTimeout(() => pin.focus());
+    }
+    if (editAddr && editAddr.id === d.id && d.paired) {
+      const box = el('div', 'pairbox');
+      const input = el('input', 'ip');
+      input.placeholder = '192.168.1.20'; input.value = editAddr.draft;
+      const cancel = () => { editAddr = null; render(); };
+      const save = async () => { if (await act('set_peer_addr', { id: d.id, addr: input.value })) cancel(); };
+      input.addEventListener('input', () => { editAddr.draft = input.value; });
+      input.addEventListener('keydown', (e) => {
+        if (e.key === 'Enter') save();
+        if (e.key === 'Escape') cancel();
+      });
+      box.appendChild(input);
+      box.appendChild(button('Save', 'btn', save));
+      box.appendChild(button('Cancel', 'link', cancel));
+      list.appendChild(box);
+      setTimeout(() => input.focus());
     }
     if (remote && remote.id === d.id && d.paired) list.appendChild(remotePanel());
   }
@@ -450,6 +475,7 @@ async function poll() {
   }
   els.service.checked = st.settings.service; // also undoes a failed toggle
   els.remoteCfg.checked = st.settings.remote_config;
+  els.autoRc.checked = st.settings.auto_reconnect;
   els.music.checked = !!st.settings.music_mode; // also follows the tray menu's toggle
   effectiveMusic = !!(st.stats && st.stats.music);
   showMusic();

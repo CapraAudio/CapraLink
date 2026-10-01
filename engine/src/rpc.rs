@@ -129,6 +129,7 @@ fn dispatch(node: &Node, cmd: &str, args: Value) -> Result<Value> {
         }
         "forget" => done(node.forget(&a.id)),
         "set_settings" => done(node.set_settings(a.settings.ok_or_else(|| anyhow!("missing settings"))?)),
+        "set_peer_addr" => done(node.set_peer_addr(&a.id, &a.addr)),
         "set_name" => done(node.set_name(&a.name.ok_or_else(|| anyhow!("missing name"))?)),
         "remote_get" => Ok(serde_json::to_value(node.remote_get(&a.id)?)?),
         "remote_set" => done(node.remote_set(&a.id, a.settings.ok_or_else(|| anyhow!("missing settings"))?, a.name)),
@@ -209,6 +210,10 @@ impl Client {
 
     pub fn set_settings(&self, s: &Settings) -> Result<()> {
         self.call("set_settings", json!({ "settings": s }))
+    }
+
+    pub fn set_peer_addr(&self, id: &str, addr: &str) -> Result<()> {
+        self.call("set_peer_addr", json!({ "id": id, "addr": addr }))
     }
 
     pub fn set_name(&self, name: &str) -> Result<()> {
@@ -379,6 +384,7 @@ mod tests {
         assert_eq!(c.state().unwrap().settings, s);
         assert!(c.set_settings(&Settings { channels: 3, ..Settings::default() }).is_err());
         assert!(c.connect("nobody").is_err());
+        assert!(c.set_peer_addr("nobody", "127.0.0.1").unwrap_err().to_string().contains("not paired"));
         c.disconnect().unwrap();
         let _ = std::fs::remove_dir_all(dir);
     }
@@ -387,6 +393,7 @@ mod tests {
     fn old_config_loads_without_service() {
         let s: Settings = serde_json::from_str(r#"{"input":null,"output":null,"bitrate":48000,"channels":1}"#).unwrap();
         assert!(!s.service);
+        assert!(s.auto_reconnect, "auto-reconnect defaults to on");
     }
 
     #[test]

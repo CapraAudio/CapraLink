@@ -113,11 +113,13 @@ pub struct Settings {
     pub remote_config: bool,
     /// Music Mode (MASTER.md §3.7): the link runs in it when either side has this on.
     pub music_mode: bool,
+    /// Reconnect to the last computer this one connected to, after a drop or a restart (MASTER.md §3.9).
+    pub auto_reconnect: bool,
 }
 
 impl Default for Settings {
     fn default() -> Self {
-        Settings { input: None, output: None, bitrate: 64_000, channels: 1, service: false, remote_config: false, music_mode: false }
+        Settings { input: None, output: None, bitrate: 64_000, channels: 1, service: false, remote_config: false, music_mode: false, auto_reconnect: true }
     }
 }
 
