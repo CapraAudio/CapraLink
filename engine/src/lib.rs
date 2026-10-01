@@ -94,12 +94,15 @@ fn label(input: bool, pulse_name: &str, name: String) -> Option<String> {
 // cables aren't recognised); match on the device's driver instead if that ever matters.
 #[cfg_attr(not(windows), allow(dead_code))]
 fn win_label(input: bool, name: String) -> Option<String> {
-    let cable = |side: &str| name.starts_with(side) && name.ends_with("(VB-Audio Virtual Cable)");
+    // Windows keeps the "(VB-Audio Virtual Cable)" suffix when a user renames the endpoint
+    // (e.g. the recording side to "CapraLink"), so match on that, not on the default names.
+    if !name.ends_with("(VB-Audio Virtual Cable)") {
+        return Some(name);
+    }
     match input {
-        false if cable("CABLE Input") => Some(VIRTUAL_INPUT.into()),
-        false if cable("CABLE In ") => None, // VB-Cable's 16-channel variant: same cable, just clutter
-        true if cable("CABLE Output") => None,
-        _ => Some(name),
+        true => None,                       // the cable's recording side: sending it would loop
+        false if name.contains("16ch") => None, // the 16-channel variant: same cable, just clutter
+        false => Some(VIRTUAL_INPUT.into()),
     }
 }
 
@@ -637,6 +640,8 @@ fn windows_labels() {
     let outs = ["Speakers (Realtek(R) Audio)", "CABLE Input (VB-Audio Virtual Cable)"];
     assert_eq!(shown(false, &outs), ["Speakers (Realtek(R) Audio)", VIRTUAL_INPUT]);
     assert!(shown(false, &["CABLE In 16ch (VB-Audio Virtual Cable)"]).is_empty(), "16-channel variant hidden");
+    assert!(shown(true, &["CapraLink (VB-Audio Virtual Cable)"]).is_empty(), "renamed recording side still hidden");
+    assert_eq!(shown(false, &["Discord mic feed (VB-Audio Virtual Cable)"]), [VIRTUAL_INPUT], "renamed playback side still mapped");
     assert_eq!(shown(false, &outs[..1]), ["Speakers (Realtek(R) Audio)"], "no VB-Cable, no CapraLink Input");
     let ins = ["Microphone (USB Mic)", "CABLE Output (VB-Audio Virtual Cable)"];
     assert_eq!(shown(true, &ins), ["Microphone (USB Mic)"]);
