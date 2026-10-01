@@ -27,7 +27,7 @@ use ringbuf::traits::{Consumer, Observer, Producer, Split};
 use ringbuf::{HeapCons, HeapRb};
 use std::net::{SocketAddr, UdpSocket};
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, AtomicU8, Ordering::Relaxed};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
@@ -170,6 +170,7 @@ struct Shared {
     bitrate: AtomicI32, // currently applied, for Stats
     complexity: AtomicU8,
     music: AtomicBool, // effective Music Mode, set by the node
+    failure: Mutex<Option<String>>, // an audio device went away (see `err_cb`)
 }
 
 /// A running TX + RX link. Dropping it stops everything.
@@ -207,7 +208,14 @@ impl Link {
 
         // ponytail: with Play to = none, packets are still decoded into a ring nobody drains
         // (it just stays full); skip decoding in the RX thread if that CPU ever matters.
-        let output = out_dev.map(|d| build_output(&d, cons, shared.clone())).transpose()?;
+        // All fallible stream setup happens before the RX thread exists, so an error can't leak it.
+        let output = out_dev
+            .map(|d| -> anyhow::Result<cpal::Stream> {
+                let s = build_output(&d, cons, shared.clone())?;
+                s.play()?;
+                Ok(s)
+            })
+            .transpose()?;
         let pk = Packetizer::new(cfg.channels, cfg.bitrate, &keys.send)?;
         // None when Send from is off: nothing captured or sent
         let input = in_dev
@@ -240,9 +248,6 @@ impl Link {
                 }
             })?
         };
-        if let Some(o) = &output {
-            o.play()?;
-        }
         Ok(Link { shared, stop, rx: Some(rx), _input: input, _output: output })
     }
 
@@ -280,6 +285,11 @@ impl Link {
     pub fn set_rate(&self, bitrate: i32, loss_perc: u8) {
         self.shared.target_bitrate.store(bitrate, Relaxed);
         self.shared.target_loss_perc.store(loss_perc, Relaxed);
+    }
+
+    /// Why the link can't go on (e.g. "Play to device stopped: …"), once an audio device is gone.
+    pub fn failure(&self) -> Option<String> {
+        self.shared.failure.lock().ok()?.clone()
     }
 
     /// This link's own receive-side counters (cumulative) plus current jitter, for building
@@ -327,8 +337,16 @@ fn meter(level: &AtomicU32, samples: &[f32]) {
     level.store(p.max(old * 0.97).to_bits(), Relaxed);
 }
 
-fn err_cb(e: cpal::Error) {
-    eprintln!("audio stream error: {e}");
+/// Logs stream errors; a device that went away is also recorded as the link's `failure()`.
+fn err_cb(shared: Arc<Shared>, what: &'static str) -> impl FnMut(cpal::Error) + Send + 'static {
+    move |e| {
+        eprintln!("audio stream error: {e}");
+        if e.kind() == cpal::ErrorKind::DeviceNotAvailable {
+            if let Ok(mut f) = shared.failure.lock() {
+                *f = Some(format!("{what}: {e}"));
+            }
+        }
+    }
 }
 
 struct Tx {
@@ -473,6 +491,7 @@ fn build_input(dev: &cpal::Device, cfg: &Settings, pk: Packetizer, sock: UdpSock
     // "Everything this PC plays" is a playback device: its mix format is the one loopback takes.
     let sc = if cfg.input.as_deref() == Some(EVERYTHING) { dev.default_output_config()? } else { pick_config(dev.default_input_config()?, dev.supported_input_configs()?) };
     let (dev_ch, rate, fmt) = (sc.channels() as usize, sc.sample_rate(), sc.sample_format());
+    let err_cb = err_cb(shared.clone(), "Send from device stopped");
     let mut tx = Tx::new(cfg, pk, sock, peer, shared, dev_ch, rate);
     let mut c = sc.config();
     // Ask for 10 ms capture buffers so packets leave evenly instead of in bursts
@@ -556,6 +575,7 @@ impl Playback {
 fn build_output(dev: &cpal::Device, cons: HeapCons<f32>, shared: Arc<Shared>) -> anyhow::Result<cpal::Stream> {
     let sc = pick_config(dev.default_output_config()?, dev.supported_output_configs()?);
     let (rate, fmt) = (sc.sample_rate(), sc.sample_format());
+    let err_cb = err_cb(shared.clone(), "Play to device stopped");
     let mut pb = Playback {
         cons,
         plan: Playout::default(),

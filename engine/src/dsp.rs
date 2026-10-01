@@ -117,9 +117,10 @@ impl Packetizer {
 
     /// `pcm` must be exactly one frame (`frame()` * channels samples).
     pub fn packet(&mut self, pcm: &[f32]) -> anyhow::Result<&[u8]> {
-        // ponytail: u32 seq wraps after ~497 days of one session (nonce reuse); rekey by reconnecting before then
+        // seq is the nonce: never wrap it (~497 days of one session); reconnecting rekeys
         let seq = self.seq;
-        self.seq = seq.wrapping_add(1);
+        anyhow::ensure!(seq != u32::MAX, "sequence numbers used up: reconnect to rekey");
+        self.seq = seq + 1;
         self.buf[3..HEADER].copy_from_slice(&seq.to_be_bytes());
         self.buf[HEADER] = self.channels;
         let n = self.enc.encode_float(pcm, &mut self.buf[HEADER + 1..MAX_PACKET - TAG])?;
@@ -159,35 +160,35 @@ impl Rx {
         Rx { aead: cipher(key), dec: None, expected: None, last_len: FRAME, pcm: vec![0.0; MAX_OPUS_FRAME * 2], stereo: vec![0.0; MAX_OPUS_FRAME * 2] }
     }
 
-    /// Returns the stream's channel count for authentic packets, None for junk (dropped silently).
-    /// Decrypts `packet` in place.
-    // ponytail: an authentic packet replayed from far back makes the seq logic resync (a glitch);
-    // add a replay window if spoofed-source replays ever matter on the LAN.
+    /// Returns the stream's channel count for authentic packets, None for junk and for late,
+    /// duplicate or replayed packets (dropped silently). Decrypts `packet` in place.
     pub fn handle(&mut self, packet: &mut [u8], c: &Counters, out: &mut impl FnMut(&[f32])) -> Option<u8> {
         let (ch, seq, opus) = open(&self.aead, packet)?;
+        // seq never wraps under one key (`Packetizer::packet`), so older than expected is never played
+        let gap = match self.expected {
+            Some(e) if seq < e => return None,
+            Some(e) => seq - e,
+            None => 0,
+        };
         inc(&c.received, 1);
         if self.dec.as_ref().is_none_or(|(dch, _)| *dch != ch) {
             let chans = if ch == 1 { opus::Channels::Mono } else { opus::Channels::Stereo };
             self.dec = Some((ch, opus::Decoder::new(RATE, chans).ok()?));
-            self.expected = None;
-        }
-        let gap = self.expected.map_or(0, |e| seq.wrapping_sub(e) as i32);
-        // A jump this big means the peer restarted (or ~10 s of loss): resync instead of dropping forever.
-        let gap = if !(-50..=1000).contains(&gap) { 0 } else { gap };
-        if gap < 0 {
-            return Some(ch); // late or duplicate
         }
         if gap == 1 {
             self.decode(opus, true, ch, out);
             inc(&c.fec_recovered, 1);
-        } else if gap > 1 {
-            for _ in 0..(gap as u32).min(MAX_PLC) {
+        } else if gap > 1 && gap <= 1000 {
+            for _ in 0..gap.min(MAX_PLC) {
                 self.decode(&[], false, ch, out);
             }
+        }
+        // A bigger jump is ~10 s of loss: resync without concealing or counting it.
+        if gap <= 1000 {
             inc(&c.lost, gap as u64);
         }
         self.decode(opus, false, ch, out);
-        self.expected = Some(seq.wrapping_add(1));
+        self.expected = Some(seq.saturating_add(1));
         Some(ch)
     }
 
@@ -502,10 +503,10 @@ mod tests {
                 rx.handle(&mut p.clone(), &c, &mut |s: &[f32]| pcm.extend_from_slice(s));
             }
         }
-        rx.handle(&mut packets[10].clone(), &c, never); // late packet
+        assert_eq!(rx.handle(&mut packets[10].clone(), &c, never), None); // late (or replayed) packet
         assert_eq!(c.fec_recovered.load(Relaxed), 1);
-        assert_eq!(c.lost.load(Relaxed), 0);
-        assert_eq!(c.received.load(Relaxed), 50);
+        assert_eq!(c.lost.load(Relaxed), 1, "a single loss counts as lost too");
+        assert_eq!(c.received.load(Relaxed), 49);
         assert_eq!(pcm.len(), 50 * FRAME * 2);
         let rms = (pcm.iter().map(|s| s * s).sum::<f32>() / pcm.len() as f32).sqrt();
         assert!(rms > 0.2, "rms {rms}");
@@ -537,12 +538,44 @@ mod tests {
         assert_eq!(&sizes[..10], &[FRAME; 10], "10 ms mono decodes");
         // the two lost 20 ms packets are concealed (PLC) with 20 ms each, then packet 17 decodes
         assert_eq!(&sizes[10..], &[2 * FRAME; 10]);
+        // a mono packet replayed after the switch to stereo is dropped, not played
+        assert_eq!(rx.handle(&mut packets[3].clone(), &c, &mut |_: &[f32]| panic!("replay played")), None);
+        assert_eq!(c.lost.load(Relaxed), 2);
 
         // and back to normal
         tx.set_mode(1, false).unwrap();
         assert_eq!(tx.frame(), FRAME);
         let p = tx.packet(&tone(FRAME, 1)).unwrap();
         assert_eq!(u32::from_be_bytes([p[3], p[4], p[5], p[6]]), 20);
+    }
+
+    #[test]
+    fn replay_and_seq_limits() {
+        let key = [7u8; 32];
+        let mut tx = Packetizer::new(1, 64_000, &key).unwrap();
+        let mut packets: Vec<Vec<u8>> = (0..5).map(|_| tx.packet(&[0.0; FRAME]).unwrap().to_vec()).collect();
+        let (mut rx, c) = (Rx::new(&key), Counters::default());
+        for p in &packets {
+            rx.handle(&mut p.clone(), &c, &mut |_: &[f32]| {}).unwrap();
+        }
+        let never = &mut |_: &[f32]| panic!("replay played");
+        for i in [0, 2, 4] {
+            assert_eq!(rx.handle(&mut packets[i].clone(), &c, never), None, "replayed packet {i}");
+        }
+        assert_eq!(rx.expected, Some(5), "replays don't move expected");
+        // a big forward jump resyncs without concealment
+        tx.seq = 5000;
+        packets.push(tx.packet(&[0.0; FRAME]).unwrap().to_vec());
+        let mut calls = 0;
+        rx.handle(&mut packets[5].clone(), &c, &mut |_: &[f32]| calls += 1).unwrap();
+        assert_eq!((calls, rx.expected), (1, Some(5001)));
+        assert_eq!(rx.handle(&mut packets[4].clone(), &c, never), None);
+        // seq (the nonce) never wraps: the last one is u32::MAX - 1, then packet() refuses
+        tx.seq = u32::MAX - 1;
+        let p = tx.packet(&[0.0; FRAME]).unwrap();
+        assert_eq!(u32::from_be_bytes([p[3], p[4], p[5], p[6]]), u32::MAX - 1);
+        assert!(tx.packet(&[0.0; FRAME]).is_err());
+        assert!(tx.packet(&[0.0; FRAME]).is_err(), "stays refused");
     }
 
     #[test]
