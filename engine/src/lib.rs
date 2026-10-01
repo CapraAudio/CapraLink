@@ -645,7 +645,7 @@ fn windows_labels() {
     assert_eq!(shown(false, &outs[..1]), ["Speakers (Realtek(R) Audio)"], "no VB-Cable, no CapraLink Input");
     let ins = ["Microphone (USB Mic)", "CABLE Output (VB-Audio Virtual Cable)"];
     assert_eq!(shown(true, &ins), ["Microphone (USB Mic)"]);
-    assert_eq!(shown(true, &outs), outs, "direction matters");
+    assert_eq!(shown(true, &outs), ["Speakers (Realtek(R) Audio)"], "no VB-Cable endpoint is ever offered as Send from");
 }
 
 #[cfg(test)]
