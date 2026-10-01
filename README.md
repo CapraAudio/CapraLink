@@ -63,29 +63,43 @@ next to a game. CapraLink is meant to be set up once, stay in the tray, and get 
 - **Reconnects by itself** — after a Wi-Fi drop, an IP address change or a restart.
 - **Encrypted** — pairing uses SPAKE2; every session is encrypted with fresh keys (Noise + ChaCha20-Poly1305).
 
-## Platform notes
+## Install
 
-| | Virtual devices | Notes |
+Download from the [Releases](../../releases) page. Check a download against `SHA256SUMS.txt`
+if you like (`shasum -a 256 <file>` / `certutil -hashfile <file> SHA256`).
+
+| | Download | Supported |
 |---|---|---|
-| **macOS** | Built-in audio driver (based on BlackHole), installed once with `sudo drivers/macos/install.sh` | Grant microphone access on first run |
-| **Linux** | Created automatically with PipeWire / PulseAudio | Works in Steam Deck Game Mode with the background service on |
-| **Windows** | Uses [VB-Cable](https://vb-audio.com/Cable/) (free) as CapraLink Input; "Everything this PC plays" captures system audio without a driver | Pick "CABLE Output" as the microphone in your apps |
+| **macOS** | `CapraLink-<version>-macOS.pkg`: the app plus the CapraLink Input/Output audio driver | macOS 12.3 or later, Apple silicon and Intel |
+| **Windows** | `CapraLink_<version>_x64-setup.exe` | Windows 10 and 11, 64-bit |
+| **Linux** | `.AppImage` (any distro, incl. SteamOS), `.deb` or `.rpm` | x86-64 with PipeWire or PulseAudio |
 
-Wired Ethernet gives the smoothest audio; Wi-Fi works, with a slightly larger buffer on busy networks.
+The installers aren't code-signed yet, so the first launch needs one extra step:
+
+- **macOS:** if the package won't open, go to System Settings → Privacy & Security and
+  click **Open Anyway**. Allow microphone access when CapraLink asks.
+- **Windows:** if SmartScreen appears, click **More info → Run anyway**. For a CapraLink microphone,
+  install [VB-Cable](https://vb-audio.com/Cable/) (free). "Everything this PC plays" needs no driver.
+- **Linux:** make the AppImage executable (`chmod +x`). The virtual devices are created automatically.
+  On a Steam Deck, turn on "Run in background" (⚙ in the window) to use CapraLink in Game Mode.
+
+Wired Ethernet gives the smoothest audio. Wi-Fi works, with a slightly larger buffer on busy networks.
+
+To remove the macOS audio driver: `sudo drivers/macos/uninstall.sh` from this repository, or delete
+`/Library/Audio/Plug-Ins/HAL/CapraLink*.driver` and restart.
 
 ## Status
 
-Working day to day between macOS, a Steam Deck and Windows 11. One-click installers and signed
-releases are still to come. Until then, build from source or grab the latest build from the
-[Actions](../../actions) tab (macOS app, Linux AppImage/deb/rpm, Windows exe).
+Working day to day between macOS, a Steam Deck and Windows 11. Every push also builds the
+installers: see the latest run in the [Actions](../../actions) tab.
 
 ## Building from source
 
-Needs [Rust](https://rustup.rs) and CMake. On Linux, also the Tauri system packages (see
-`.github/workflows/ci.yml`).
+Needs [Rust](https://rustup.rs) (the version is pinned in `rust-toolchain.toml`) and CMake. On
+Linux, also the Tauri system packages (see `.github/workflows/ci.yml`).
 
 ```bash
-cargo install tauri-cli --version "^2"
+cargo install tauri-cli --version 2.12.0 --locked
 cd app && cargo tauri build
 ```
 
@@ -94,6 +108,9 @@ macOS virtual devices:
 ```bash
 drivers/macos/build.sh && sudo drivers/macos/install.sh
 ```
+
+How it works, the security model, and what CapraLink stores and shares: [ARCHITECTURE.md](ARCHITECTURE.md).
+Reporting a security problem: [SECURITY.md](SECURITY.md).
 
 ## License
 

@@ -1,0 +1,4 @@
+#!/bin/sh
+# load the CapraLink Input/Output plug-ins (launchd restarts coreaudiod)
+killall coreaudiod 2>/dev/null || true
+exit 0
