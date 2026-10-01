@@ -1577,7 +1577,9 @@ impl Ctl {
 
     fn close(&self) {
         let _ = self.send(&Msg::Stop);
-        let _ = self.stream.shutdown(Shutdown::Both);
+        // FIN, not RST: on Windows, shutting down the read side with data still unread resets the
+        // connection, and the peer can lose the `stop` (it would then redial). Our `serve` closes the rest.
+        let _ = self.stream.shutdown(Shutdown::Write);
     }
 }
 
@@ -2134,4 +2136,23 @@ mod tests {
         let _ = std::fs::remove_dir_all(adir);
     }
 
+
+    /// Both ends of an authenticated control channel.
+    fn control_pair() -> (Arc<Ctl>, Arc<Ctl>) {
+        let l = TcpListener::bind("127.0.0.1:0").unwrap();
+        let at = l.local_addr().unwrap();
+        let responder = std::thread::spawn(move || handshake(&mut l.accept().unwrap().0, &[7; 32], false).unwrap().0);
+        let initiator = handshake(&mut TcpStream::connect(at).unwrap(), &[7; 32], true).unwrap().0;
+        (initiator, responder.join().unwrap())
+    }
+
+    #[test]
+    fn stop_arrives_although_the_closer_had_unread_data() {
+        let (x, y) = control_pair();
+        y.stream.set_read_timeout(Some(IO_TIMEOUT)).unwrap();
+        y.send(&Msg::Ping).unwrap(); // x never reads it, like a report in flight when Disconnect is pressed
+        std::thread::sleep(Duration::from_millis(100));
+        x.close();
+        assert!(matches!(y.recv().unwrap(), Some(Msg::Stop)), "the peer must see a chosen end, not a lost connection");
+    }
 }
