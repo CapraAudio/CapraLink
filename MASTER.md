@@ -259,6 +259,25 @@ is admin, remote access via Windows' built-in OpenSSH Server. Role: both A and B
 - **Later (optional):** own signed driver (D4 path) only if VB-Cable proves insufficient.
 - Installer (NSIS/MSI via the Tauri bundler) belongs to M7.
 
+### 3.9 Auto-reconnect and address editing (design, owner-approved 2026-10-01)
+
+- `Settings.auto_reconnect: bool` (default **true**; UI "Reconnect automatically" in the background
+  section; remote config may change it). Config gains `last_peer: Option<String>` (device id).
+- **Who retries:** only the side that initiated the session (avoids both sides dialing and replacing
+  each other's sessions). `last_peer` is set when this node's own `connect` succeeds and cleared on a
+  manual `disconnect`, `forget`, or when the peer sends `stop` (the other side chose to end it).
+- **When:** a session lost without a stop (keepalive timeout / TCP error) and auto_reconnect on → a
+  retry loop in its own thread: dial `addrs(id)` (mDNS addresses + remembered `addr`) after 2 s, then
+  backoff ×2 up to 30 s, forever, until connected, the user acts (connect elsewhere / disconnect /
+  forget), auto_reconnect is turned off, or the node shuts down. At node start, if `last_peer` is set
+  and auto_reconnect on → the same loop (covers app restarts and reboots).
+- **Visible state:** `Device.reconnecting: bool`; UI row status "Reconnecting…"; status pill stays Idle.
+- **Edit address:** `Node::set_peer_addr(id, addr)` — paired peers only; accepts ip / ip:port / host
+  (default port 47800), stores `Peer.addr`. No PIN: the Noise handshake with the stored secret still
+  authenticates the peer. RPC `set_peer_addr {id, addr}`; UI "Edit address" link on paired rows → inline
+  input + Save/Cancel (poll-safe like the other inline editors).
+- Responder side unchanged: it already records the initiator's current IP on each session.
+
 ## 4. Feasibility notes (owner asked for honest feedback)
 
 1. **Virtual devices on Windows are the hardest part.** Windows has no user-mode way to create
@@ -313,6 +332,7 @@ is admin, remote access via Windows' built-in OpenSSH Server. Role: both A and B
 | D5 | 2026-09-29 | UDP + per-packet encryption keyed by PIN pairing | Low latency, LAN-safe |
 | D6 | 2026-09-29 | "Service" = headless login agent, not system service | OS audio is per-user-session |
 | D7 | 2026-09-29 | One peer at a time (1:1 link) | Covers the use case; simplest |
+| D19 | 2026-10-01 | Auto-reconnect by the initiating side only (backoff 2→30 s, forever; also after restart via last_peer); paired peers' addresses editable without a PIN | IP changes / Wi-Fi drops / reboots shouldn't need a click; initiator-only avoids dueling reconnects |
 | D18 | 2026-10-01 | Per-app (process loopback) capture removed; Windows Output side = "Everything this PC plays" | Owner: VB-Cable + Everything cover the use case; less unsafe Win32 code |
 | D17 | 2026-09-29 | Windows goes driverless first (supersedes D4 for now): per-app / whole-system WASAPI loopback for the Output side; VB-Cable (user-installed, signed) for the Input side | Keeps Secure Boot + anti-cheat; no signing cost; D4 test-signed driver kept as a fallback |
 | D16 | 2026-09-29 | Tray: single click shows the menu on all OSes (owner choice); double-click opens the window where reported (Windows only) | Keeps Quit/Music Mode discoverable on macOS |
