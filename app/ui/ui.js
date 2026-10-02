@@ -47,28 +47,26 @@ function showMusic() {
 async function act(cmd, args) {
   busy = true; actionError = ''; lastDevices = ''; render();
   let ok = true;
-  try { await invoke(cmd, args); } catch (e) { actionError = String(e); ok = false; }
+  try { await invoke(cmd, typeof args === 'function' ? await args() : args); } catch (e) { actionError = String(e); ok = false; }
   busy = false; lastDevices = '';
   await poll();
   return ok;
 }
 
-function saveSettings() {
-  act('set_settings', { settings: {
-    input: els.input.value || null, output: els.output.value || null,
-    bitrate: Number(els.bitrate.value) * 1000, channels, service: els.service.checked,
-    remote_config: els.remoteCfg.checked, music_mode: els.music.checked, auto_reconnect: els.autoRc.checked,
-  }});
+// Save only the field(s) the user changed, on top of the engine's current settings, so a remote
+// change to another field (e.g. the microphone) made while a control was being edited isn't undone.
+function saveSetting(patch) {
+  act('set_settings', async () => ({ settings: { ...(await invoke('state')).settings, ...patch() } }));
 }
 
 els.channels.addEventListener('click', (e) => {
   if (e.target.tagName !== 'BUTTON') return;
   setChannels(Number(e.target.dataset.v));
-  saveSettings();
+  saveSetting(() => ({ channels }));
 });
 els.bitrate.addEventListener('input', showMusic);
-els.music.addEventListener('change', () => { showMusic(); saveSettings(); });
-els.bitrate.addEventListener('change', saveSettings);
+els.music.addEventListener('change', () => { showMusic(); saveSetting(() => ({ music_mode: els.music.checked })); });
+els.bitrate.addEventListener('change', () => saveSetting(() => ({ bitrate: Number(els.bitrate.value) * 1000 })));
 // "Refresh devices…" re-reads this computer's devices and keeps both selections
 async function refreshDevices() {
   const keep = [els.input.dataset.prev, els.output.dataset.prev];
@@ -80,12 +78,12 @@ for (const sel of [els.input, els.output]) {
   sel.addEventListener('change', () => {
     if (isRefresh(sel)) return refreshDevices();
     sel.dataset.prev = sel.value;
-    saveSettings();
+    saveSetting(() => ({ [sel === els.input ? 'input' : 'output']: sel.value || null }));
   });
 }
-els.service.addEventListener('change', saveSettings);
-els.remoteCfg.addEventListener('change', saveSettings);
-els.autoRc.addEventListener('change', saveSettings);
+els.service.addEventListener('change', () => saveSetting(() => ({ service: els.service.checked })));
+els.remoteCfg.addEventListener('change', () => saveSetting(() => ({ remote_config: els.remoteCfg.checked })));
+els.autoRc.addEventListener('change', () => saveSetting(() => ({ auto_reconnect: els.autoRc.checked })));
 
 // ---- this device's name ----
 function renderName(name) {
