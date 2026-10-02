@@ -238,6 +238,9 @@ pub const TARGET: usize = RATE as usize / 100; // 10 ms: minimum cushion ...
 pub const MUSIC_TARGET: usize = 15 * TARGET; // ... 150 ms in Music Mode (covers a typical Wi-Fi stall from the start)
 const MARGIN: usize = RATE as usize / 200; // 5 ms on top of measured jitter
 const HEADROOM: usize = RATE as usize / 10; // fill beyond need + target + 100 ms is discarded
+// Music Mode never drops audio to shrink the buffer (an audible skip): the ≤ 0.5% speed-up drains it
+// instead (300 ms in about a minute). Only fill that wouldn't fit the 1.5 s playback ring is dropped.
+const MUSIC_HEADROOM: usize = RATE as usize * 2 / 5; // 400 ms over a target of up to 1 s
 const GROW: usize = RATE as usize / 100; // +10 ms boost per underrun (spike jitter missed) ...
 const SHRINK: usize = RATE as usize / 1000; // ... fading 1 ms ...
 const RELAX: usize = RATE as usize; // ... per second of clean playback
@@ -275,6 +278,7 @@ pub struct Playout {
     max: usize,
     grow: usize,
     max_adj: f32,
+    headroom: usize,
     playing: bool,
     jitter: usize,
     boost: usize,
@@ -286,7 +290,7 @@ pub struct Playout {
 
 impl Default for Playout {
     fn default() -> Self {
-        Playout { min: TARGET, max: MAX_TARGET, grow: GROW, max_adj: MAX_ADJ, playing: false, jitter: 0, boost: 0, clean: 0, low: usize::MAX, span: 0, adj: 0.0 }
+        Playout { min: TARGET, max: MAX_TARGET, grow: GROW, max_adj: MAX_ADJ, headroom: HEADROOM, playing: false, jitter: 0, boost: 0, clean: 0, low: usize::MAX, span: 0, adj: 0.0 }
     }
 }
 
@@ -297,10 +301,14 @@ impl Playout {
     }
 
     /// Normal: 10 ms minimum, 125 ms ceiling, +10 ms per underrun.
-    /// Music Mode: 150 ms minimum, 1 s ceiling, +30 ms per underrun, speed change ≤ 0.5%.
+    /// Music Mode: 150 ms minimum, 1 s ceiling, +30 ms per underrun, speed change ≤ 0.5%, and a
+    /// shrinking target drains by that speed-up instead of skipping audio.
     pub fn set_music(&mut self, music: bool) {
-        (self.min, self.max, self.grow, self.max_adj) =
-            if music { (MUSIC_TARGET, MUSIC_MAX_TARGET, MUSIC_GROW, MUSIC_MAX_ADJ) } else { (TARGET, MAX_TARGET, GROW, MAX_ADJ) };
+        (self.min, self.max, self.grow, self.max_adj, self.headroom) = if music {
+            (MUSIC_TARGET, MUSIC_MAX_TARGET, MUSIC_GROW, MUSIC_MAX_ADJ, MUSIC_HEADROOM)
+        } else {
+            (TARGET, MAX_TARGET, GROW, MAX_ADJ, HEADROOM)
+        };
     }
 
     pub fn target(&self) -> usize {
@@ -311,7 +319,7 @@ impl Playout {
     pub fn plan(&mut self, fill: usize, need: usize) -> Plan {
         let target = self.target();
         let excess = fill.saturating_sub(need + target);
-        let discard = excess * (excess > HEADROOM) as usize;
+        let discard = excess * (excess > self.headroom) as usize;
         let fill = fill - discard;
         if !self.playing && fill < need + target {
             return Plan::Silence;
@@ -638,6 +646,28 @@ mod tests {
         assert_eq!(u32::from_be_bytes([p[3], p[4], p[5], p[6]]), u32::MAX - 1);
         assert!(tx.packet(&[0.0; FRAME]).is_err());
         assert!(tx.packet(&[0.0; FRAME]).is_err(), "stays refused");
+    }
+
+    #[test]
+    fn music_mode_drains_instead_of_skipping() {
+        // the stall memory expires: the target falls to its minimum with the old target's worth
+        // buffered (Music Mode: ~450 → 150 ms; normal: ~120 → 10 ms, its ceiling is 125 ms)
+        let need = 480;
+        for (music, high, skips) in [(true, RATE as usize * 450 / 1000, false), (false, RATE as usize * 120 / 1000, true)] {
+            let mut p = Playout::default();
+            p.set_music(music);
+            p.set_jitter(high);
+            let full = need + p.target(); // exactly the old target buffered: playing, nothing to drop
+            assert!(matches!(p.plan(full, need), Plan::Play { discard: 0, .. }), "music {music}");
+            p.set_jitter(0);
+            let r = (0..200).map(|_| p.plan(full, need)).find(|r| matches!(r, Plan::Play { discard, .. } if *discard > 0));
+            assert_eq!(r.is_some(), skips, "music {music}: {r:?}");
+            if music {
+                // ...it plays (slightly) fast instead, up to the pitch-safe 0.5%
+                let Plan::Play { ratio, .. } = p.plan(full, need) else { panic!() };
+                assert!(ratio > 1.0 && ratio <= 1.0 + MUSIC_MAX_ADJ as f64 + 1e-9, "{ratio}");
+            }
+        }
     }
 
     #[test]
