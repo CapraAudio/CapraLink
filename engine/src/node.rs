@@ -1604,13 +1604,14 @@ fn handshake(s: &mut TcpStream, secret: &[u8; 32], initiator: bool) -> Result<(A
     };
     let (i2r, r2i) = (key(&i2r), key(&r2i));
     let keys = if initiator { Keys { send: i2r, recv: r2i } } else { Keys { send: r2i, recv: i2r } };
-    Ok((Arc::new(Ctl { stream: s.try_clone()?, noise: Mutex::new(hs.into_transport_mode()?) }), keys))
+    Ok((Arc::new(Ctl { stream: s.try_clone()?, noise: Mutex::new(hs.into_transport_mode()?), inbox: Mutex::default() }), keys))
 }
 
 /// The encrypted control channel of a session.
 struct Ctl {
     stream: TcpStream,
     noise: Mutex<snow::TransportState>,
+    inbox: Mutex<Vec<u8>>, // bytes read but not yet a whole frame (a read timeout keeps them)
 }
 
 impl Ctl {
@@ -1622,9 +1623,25 @@ impl Ctl {
         send(&mut &self.stream, &ct[..n])
     }
 
-    /// `Ok(None)` = authentic but unknown message (newer peer).
+    /// `Ok(None)` = authentic but unknown message (newer peer). A timeout mid-frame loses nothing:
+    /// the next call carries on with the same frame.
     fn recv(&self) -> io::Result<Option<Msg>> {
-        let ct = recv(&mut &self.stream)?;
+        let ct = {
+            let mut inbox = self.inbox.lock().unwrap_or_else(|e| e.into_inner());
+            loop {
+                let len = inbox.get(..2).map_or(usize::MAX, |l| 2 + u16::from_be_bytes([l[0], l[1]]) as usize);
+                if inbox.len() >= len {
+                    break inbox.drain(..len).skip(2).collect::<Vec<u8>>();
+                }
+                let mut b = [0u8; 4096];
+                match (&self.stream).read(&mut b) {
+                    Ok(0) => return Err(io::ErrorKind::UnexpectedEof.into()),
+                    Ok(n) => inbox.extend_from_slice(&b[..n]),
+                    Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+                    Err(e) => return Err(e),
+                }
+            }
+        };
         let mut pt = vec![0u8; ct.len()];
         let n = self.noise.lock().unwrap_or_else(|e| e.into_inner()).read_message(&ct, &mut pt).map_err(io::Error::other)?;
         Ok(serde_json::from_slice(&pt[..n]).ok())
@@ -1690,8 +1707,8 @@ fn send(s: &mut impl Write, b: &[u8]) -> Result<()> {
     Ok(())
 }
 
-// ponytail: a read timeout landing mid-frame desyncs the stream and ends the session; frames
-// are tiny so it hasn't been seen. Buffer partial frames if it ever is.
+/// For the steps before a session (pairing, handshake), where any timeout ends the connection;
+/// sessions read with `Ctl::recv`.
 fn recv(s: &mut impl Read) -> io::Result<Vec<u8>> {
     let mut len = [0u8; 2];
     s.read_exact(&mut len)?;
@@ -2210,6 +2227,26 @@ mod tests {
         x.close();
         assert!(matches!(y.recv().unwrap(), Some(Msg::Stop)), "the peer must see a chosen end, not a lost connection");
     }
+    #[test]
+    fn a_frame_split_by_read_timeouts_arrives_intact() {
+        let (x, y) = control_pair();
+        y.stream.set_read_timeout(Some(Duration::from_millis(200))).unwrap();
+        let pt = serde_json::to_vec(&Msg::Ping).unwrap();
+        let mut ct = vec![0u8; pt.len() + 16];
+        let n = x.noise.lock().unwrap().write_message(&pt, &mut ct).unwrap();
+        let frame = [&(n as u16).to_be_bytes()[..], &ct[..n]].concat();
+        // a stalled sender: half the length, then part of the payload, each followed by a timeout
+        for part in [&frame[..1], &frame[1..5]] {
+            (&x.stream).write_all(part).unwrap();
+            let e = y.recv().map(drop).unwrap_err();
+            assert!(matches!(e.kind(), io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut), "{e}");
+        }
+        (&x.stream).write_all(&frame[5..]).unwrap();
+        assert!(matches!(y.recv().unwrap(), Some(Msg::Ping)));
+        x.send(&Msg::Stop).unwrap();
+        assert!(matches!(y.recv().unwrap(), Some(Msg::Stop)), "the channel keeps working");
+    }
+
     /// A session `a` authenticated with `b` but hasn't sent its first request yet (as a modified
     /// client could hold it).
     fn pending(a: &Node, b: &Node, aid: &str, bid: &str) -> Arc<Ctl> {
