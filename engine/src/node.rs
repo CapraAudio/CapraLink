@@ -35,7 +35,7 @@ const LOCK_MAX: Duration = Duration::from_millis(if cfg!(test) { 1000 } else { 3
 // incoming connections before they authenticate: how many at once, per source IP, and for how long
 const MAX_PENDING: usize = 8;
 const MAX_PENDING_PER_IP: usize = 2;
-const AUTH_DEADLINE: Duration = Duration::from_secs(10);
+const AUTH_DEADLINE: Duration = Duration::from_millis(if cfg!(test) { 2000 } else { 10_000 });
 const NO_IPV6: &str = "IPv6 addresses aren't supported yet — use the computer's IPv4 address";
 // auto-reconnect backoff (MASTER.md §3.9); short under test
 const RETRY_FIRST: Duration = Duration::from_millis(if cfg!(test) { 100 } else { 2000 });
@@ -599,7 +599,7 @@ impl Node {
             Some(Msg::Error { message }) => bail!("other computer: {message}"),
             _ => bail!("unexpected reply"),
         }
-        self.activate(id, addr, &keys, ctl.clone(), Some(gen))?;
+        self.activate(id, &secret, addr, &keys, ctl.clone(), Some(gen))?;
         self.send_mode(&ctl);
         Ok(())
     }
@@ -811,7 +811,7 @@ impl Node {
     /// remembers the peer's address. `own` = this node dialed it, as part of retry generation
     /// `own` (refused if that was cancelled meanwhile); it becomes `last_peer`. An incoming
     /// session clears `last_peer`: the side that dialed owns reconnecting.
-    fn activate(&self, id: &str, addr: SocketAddr, keys: &Keys, ctl: Arc<Ctl>, own: Option<u64>) -> Result<()> {
+    fn activate(&self, id: &str, secret: &[u8; 32], addr: SocketAddr, keys: &Keys, ctl: Arc<Ctl>, own: Option<u64>) -> Result<()> {
         let mut st = self.st();
         // ponytail: a cancelled dial is refused only here, after the peer has accepted it; if the
         // peer took it after a newer session from us, that newer one drops too. Serialize own dials if seen.
@@ -820,6 +820,9 @@ impl Node {
             ctl.close();
             bail!("cancelled");
         }
+        // forgotten (or paired again with a new key) since this session's handshake: refuse it
+        // (the caller reports it to the peer, then the connection drops)
+        ensure!(still_paired(&st.cfg, id, secret), "pairing was removed or changed");
         if let Some(old) = st.session.take() {
             old.ctl.close(); // Link drop below frees the UDP port before the new bind
         }
@@ -1087,14 +1090,16 @@ impl Node {
     fn on_session(&self, mut s: TcpStream, id: &str, authed: mpsc::Sender<()>) -> Result<()> {
         let secret = secret(&self.st().cfg, id).ok_or_else(|| anyhow!("unknown device"))?;
         let (ctl, keys) = handshake(&mut s, &secret, false)?;
-        drop(authed); // the usual per-read timeouts from here on
+        // the connection deadline (`authed` still alive) also covers the first request, so an
+        // authenticated peer can't hold it open by trickling bytes
         let port = match ctl.recv()? {
             Some(Msg::Link { port, .. }) => port,
-            Some(Msg::Manage) => return self.on_manage(&ctl, id),
+            Some(Msg::Manage) => return self.on_manage(&ctl, id, &secret, authed),
             _ => bail!("expected link request"),
         };
+        drop(authed); // the usual per-read timeouts from here on
         let addr = SocketAddr::new(s.peer_addr()?.ip(), port);
-        if let Err(e) = self.activate(id, addr, &keys, ctl.clone(), None) {
+        if let Err(e) = self.activate(id, &secret, addr, &keys, ctl.clone(), None) {
             let _ = ctl.send(&Msg::Error { message: format!("{e:#}") });
             return Err(e);
         }
@@ -1106,8 +1111,14 @@ impl Node {
     /// Answers one remote-configuration request from peer `id`. Its audio settings are this
     /// computer's settings for sessions with `id` (MASTER.md §3.10); the current session restarts
     /// only if it is with `id`.
-    fn on_manage(&self, ctl: &Ctl, id: &str) -> Result<()> {
+    fn on_manage(&self, ctl: &Ctl, id: &str, secret: &[u8; 32], authed: mpsc::Sender<()>) -> Result<()> {
         let req = ctl.recv()?; // read before replying, so closing can't reset the reply away
+        drop(authed);
+        if !still_paired(&self.st().cfg, id, secret) {
+            let r = ctl.send(&Msg::Error { message: "pairing was removed or changed".into() });
+            ctl.close();
+            return r;
+        }
         let (name, local, theirs) = {
             let st = self.st();
             let theirs = st.cfg.peers.iter().find(|p| p.id == id).and_then(|p| p.audio.clone()).filter(|_| st.cfg.current.as_deref() != Some(id));
@@ -1440,6 +1451,11 @@ fn resolve(addr: &str) -> Result<Vec<SocketAddr>> {
 /// Whole seconds until `t`, rounded up (0 = passed, or none).
 fn secs_left(t: Option<Instant>) -> u64 {
     t.map_or(0, |t| t.saturating_duration_since(Instant::now()).as_millis().div_ceil(1000) as u64)
+}
+
+/// `id` is still paired with the key a session's handshake used (not forgotten or re-paired since).
+fn still_paired(cfg: &Config, id: &str, key: &[u8; 32]) -> bool {
+    secret(cfg, id).is_some_and(|s| s == *key)
 }
 
 fn secret(cfg: &Config, id: &str) -> Option<[u8; 32]> {
@@ -2159,4 +2175,60 @@ mod tests {
         x.close();
         assert!(matches!(y.recv().unwrap(), Some(Msg::Stop)), "the peer must see a chosen end, not a lost connection");
     }
+    /// A session `a` authenticated with `b` but hasn't sent its first request yet (as a modified
+    /// client could hold it).
+    fn pending(a: &Node, b: &Node, aid: &str, bid: &str) -> Arc<Ctl> {
+        let key = secret(&a.st().cfg, bid).unwrap();
+        let mut s = TcpStream::connect(addr(b)).unwrap();
+        send_msg(&mut s, &Msg::Session { id: aid.into() }).unwrap();
+        handshake(&mut s, &key, true).unwrap().0
+    }
+
+    fn refused(ctl: &Ctl) -> bool {
+        matches!(ctl.recv(), Ok(Some(Msg::Error { message })) if message.contains("pairing was removed or changed"))
+    }
+
+    #[test]
+    fn forgotten_or_repaired_peer_cannot_use_a_pending_session() {
+        let ((a, adir), (b, bdir), aid, bid) = paired_nodes();
+        b.set_settings(Settings { remote_config: true, ..b.state().settings }).unwrap();
+        let link = |ctl: &Ctl| ctl.send(&Msg::Link { channels: 1, port: a.port() }).unwrap();
+
+        // forgotten after the handshake: no audio session, no remote configuration
+        let (l, m) = (pending(&a, &b, &aid, &bid), pending(&a, &b, &aid, &bid));
+        b.forget(&aid).unwrap();
+        link(&l);
+        assert!(refused(&l));
+        m.send(&Msg::Manage).unwrap();
+        m.send(&Msg::SetSettings { settings: Settings { music_mode: true, ..b.state().settings }, name: Some("Taken over".into()) }).unwrap();
+        assert!(refused(&m));
+        assert!(!is(&b, |d| d.connected) && b.state().current.is_none() && b.state().name != "Taken over" && !b.state().settings.music_mode);
+
+        // paired again (new key) after the handshake: the old key's session is refused too
+        b.open_pairing().unwrap();
+        a.pair_addr(&[addr(&b)], &b.state().pin).unwrap();
+        wait(|| is(&b, |d| d.paired));
+        let old = pending(&a, &b, &aid, &bid);
+        b.open_pairing().unwrap();
+        a.pair_addr(&[addr(&b)], &b.state().pin).unwrap();
+        wait(|| secret(&b.st().cfg, &aid) == secret(&a.st().cfg, &bid));
+        link(&old);
+        assert!(refused(&old));
+        assert!(!is(&b, |d| d.connected));
+        let _ = std::fs::remove_dir_all(adir);
+        let _ = std::fs::remove_dir_all(bdir);
+    }
+
+    #[test]
+    fn first_request_must_arrive_before_the_deadline() {
+        let ((a, adir), (b, bdir), aid, bid) = paired_nodes();
+        let ctl = pending(&a, &b, &aid, &bid);
+        std::thread::sleep(AUTH_DEADLINE + Duration::from_millis(500));
+        let _ = ctl.send(&Msg::Link { channels: 1, port: a.port() });
+        assert!(!matches!(ctl.recv(), Ok(Some(Msg::Ok))), "a session held open past the deadline was accepted");
+        assert!(!is(&b, |d| d.connected));
+        let _ = std::fs::remove_dir_all(adir);
+        let _ = std::fs::remove_dir_all(bdir);
+    }
+
 }
