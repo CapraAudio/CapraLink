@@ -1,0 +1,5 @@
+#!/bin/sh
+# remember the installed drivers, so postinstall restarts audio only if they change
+HAL=/Library/Audio/Plug-Ins/HAL
+shasum -a 256 "$HAL"/CapraLink*.driver/Contents/MacOS/* > /tmp/capralink-drivers.before 2>/dev/null
+exit 0

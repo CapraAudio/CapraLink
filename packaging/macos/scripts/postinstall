@@ -1,4 +1,10 @@
 #!/bin/sh
-# load the CapraLink Input/Output plug-ins (launchd restarts coreaudiod)
-killall coreaudiod 2>/dev/null || true
+# Load new or changed CapraLink Input/Output drivers. Restarting coreaudiod interrupts all sound on
+# the Mac for a while (it re-scans every device), so it happens only when a driver actually changed.
+HAL=/Library/Audio/Plug-Ins/HAL
+shasum -a 256 "$HAL"/CapraLink*.driver/Contents/MacOS/* > /tmp/capralink-drivers.after 2>/dev/null
+if ! cmp -s /tmp/capralink-drivers.before /tmp/capralink-drivers.after; then
+    killall coreaudiod 2>/dev/null || true # launchd restarts it
+fi
+rm -f /tmp/capralink-drivers.before /tmp/capralink-drivers.after
 exit 0
