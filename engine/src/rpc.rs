@@ -22,13 +22,15 @@ use std::net::{Ipv4Addr, SocketAddr, TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 const TOKEN_FILE: &str = "rpc.token";
 const IO_TIMEOUT: Duration = Duration::from_secs(5);
 const CALL_TIMEOUT: Duration = Duration::from_secs(30); // pair/connect wait on the other computer
 const MAX_REQUEST: u64 = 64 * 1024;
 const MAX_HANDLERS: usize = 16;
+// the whole handshake + request, so a trickling client can't hold a handler slot (short under test)
+const AUTH_DEADLINE: Duration = Duration::from_millis(if cfg!(test) { 1500 } else { 5000 });
 
 #[derive(Serialize, Deserialize)]
 pub struct Devices {
@@ -137,7 +139,7 @@ fn handle(node: &Node, token: &str, mut s: TcpStream) {
 /// The daemon's side of the handshake (see the module docs): proves itself, then returns the
 /// request if the client's proof checks out.
 fn authenticate(token: &str, mut s: &TcpStream) -> Result<Req> {
-    let mut r = BufReader::new(s.take(MAX_REQUEST));
+    let mut r = BufReader::new(Deadline(s, Instant::now() + AUTH_DEADLINE).take(MAX_REQUEST));
     let theirs: Hello = line(&mut r)?;
     ensure!(theirs.nonce.len() == 64, "bad nonce");
     let mine = hex(&random::<32>());
@@ -145,6 +147,20 @@ fn authenticate(token: &str, mut s: &TcpStream) -> Result<Req> {
     let req: Req = line(&mut r)?;
     ensure!(same(req.proof.as_bytes(), proof(token, "client", &mine, &theirs.nonce).as_bytes()), "unauthorized");
     Ok(req)
+}
+
+/// Reads that time out at an absolute deadline, however the bytes arrive.
+struct Deadline<'a>(&'a TcpStream, Instant);
+
+impl Read for Deadline<'_> {
+    fn read(&mut self, b: &mut [u8]) -> io::Result<usize> {
+        let left = self.1.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            return Err(io::ErrorKind::TimedOut.into());
+        }
+        self.0.set_read_timeout(Some(left))?;
+        self.0.read(b)
+    }
 }
 
 fn proof(token: &str, role: &str, first: &str, second: &str) -> String {
@@ -511,6 +527,40 @@ mod tests {
         assert!(c.checks().unwrap()[0].ok);
         let d = c.diagnostics(true, Some("nobody")).unwrap();
         assert!(!d.lines().any(|l| l.starts_with("This computer:")) && d.contains("Couldn't get its diagnostics"), "{d}"); // the name line is left out when hidden
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn trickling_clients_are_cut_off_at_the_deadline() {
+        let dir = std::env::temp_dir().join(format!("capralink-rpc-{}", hex(&random::<8>())));
+        let node = Node::start(Some(dir.clone()), 0, false).unwrap();
+        let port = TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
+        serve_rpc(node, port).unwrap();
+        let start = Instant::now();
+        // every handler slot taken by a client sending a byte every 100 ms, well inside the per-read timeout
+        let slow: Vec<TcpStream> = (0..MAX_HANDLERS)
+            .map(|_| {
+                let s = TcpStream::connect(("127.0.0.1", port)).unwrap();
+                let w = s.try_clone().unwrap();
+                std::thread::spawn(move || {
+                    while start.elapsed() < AUTH_DEADLINE * 3 && (&w).write_all(b" ").is_ok() {
+                        std::thread::sleep(Duration::from_millis(100));
+                    }
+                });
+                s
+            })
+            .collect();
+        for mut s in slow {
+            s.set_read_timeout(Some(AUTH_DEADLINE * 3)).unwrap();
+            // closed (a reset is fine: it was still sending), not left waiting
+            if let Err(e) = s.read_to_end(&mut Vec::new()) {
+                assert!(!matches!(e.kind(), io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut), "{e}");
+            }
+        }
+        assert!(start.elapsed() < AUTH_DEADLINE * 2, "{:?}", start.elapsed());
+        // and the slots are free again
+        std::thread::sleep(Duration::from_millis(100));
+        Client::local(Some(dir.clone()), port).unwrap();
         let _ = std::fs::remove_dir_all(dir);
     }
 
