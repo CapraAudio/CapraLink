@@ -2,7 +2,7 @@ const { invoke } = window.__TAURI__.core;
 const $ = (id) => document.getElementById(id);
 const els = {
   input: $('input'), output: $('output'), channels: $('channels'), bitrate: $('bitrate'),
-  bitrateVal: $('bitrateVal'), service: $('service'), remoteCfg: $('remoteCfg'), autoRc: $('autoRc'), music: $('music'), error: $('error'), status: $('status'), stats: $('stats'), devices: $('devices'),
+  bitrateVal: $('bitrateVal'), service: $('service'), remoteCfg: $('remoteCfg'), autoRc: $('autoRc'), music: $('music'), error: $('error'), status: $('status'), stats: $('stats'), quality: $('quality'), devices: $('devices'),
   myNameRow: $('myNameRow'),
 };
 
@@ -398,8 +398,77 @@ async function poll() {
   } else {
     els.stats.textContent = '';
   }
+  showQuality(st.quality, cur);
+  showPeerLog(cur);
   els.error.textContent = [actionError || st.error, st.virtual_error].filter(Boolean).join(' · ');
 }
+
+// ---- connection quality: the bottom line (click for the detailed stats) and the Troubleshooting panel ----
+let statsOpen = false;
+function gradeLine(box, q, text) {
+  box.replaceChildren(el('b', q.grade, text), el('span', 'qhint', q.hint || ''));
+  box.lastChild.hidden = !q.hint;
+}
+function showQuality(q, cur) {
+  const word = q ? q.grade[0].toUpperCase() + q.grade.slice(1) : '';
+  els.quality.hidden = !q;
+  els.stats.hidden = !q || !statsOpen;
+  if (q) gradeLine(els.quality, q, 'Connection: ' + word);
+  if (q) gradeLine($('tConn'), q, word); else $('tConn').textContent = 'Not connected';
+  if (q && cur) $('tConn').firstChild.after(' to ' + cur.name);
+}
+els.quality.addEventListener('click', () => { statsOpen = !statsOpen; els.stats.hidden = !statsOpen; });
+
+// ---- Troubleshooting panel: a static section the poll only updates in place ----
+let peerForLog = null; // current device id while its log can be included, else null
+function showPeerLog(cur) {
+  peerForLog = cur && cur.paired && cur.reachable ? cur.id : null;
+  $('peerLogRow').hidden = !peerForLog;
+  if (cur) $('peerLogText').textContent = "Include " + cur.name + "'s log";
+}
+async function runChecks() {
+  const ul = $('checks');
+  ul.replaceChildren(el('li', null, 'Checking…'));
+  try {
+    const rows = await invoke('checks');
+    ul.replaceChildren(...rows.map((c) => {
+      const li = el('li');
+      const txt = el('span', null, c.title);
+      if (!c.ok && c.fix) txt.append(el('br'), el('span', 'fix', c.fix));
+      li.append(el('span', 'ic ' + (c.ok ? 'ok' : 'warn'), c.ok ? '✓' : '⚠'), txt);
+      return li;
+    }));
+  } catch (e) { ul.replaceChildren(); $('audioResult').textContent = String(e); }
+}
+$('troubleBtn').addEventListener('click', () => {
+  $('opts').hidden = true;
+  $('trouble').hidden = !$('trouble').hidden;
+  if (!$('trouble').hidden) runChecks();
+});
+$('troubleClose').addEventListener('click', () => { $('trouble').hidden = true; });
+// runs one audio test with its button disabled; `go` returns the result line
+async function audioTest(btn, go) {
+  btn.disabled = true;
+  try { $('audioResult').textContent = await go(); } catch (e) { $('audioResult').textContent = String(e); }
+  btn.disabled = false;
+}
+$('tone').addEventListener('click', () => audioTest($('tone'), async () => {
+  await invoke('test_tone');
+  return 'Played a test sound on ' + (els.output.value || 'System default') + '.';
+}));
+$('micCheck').addEventListener('click', () => audioTest($('micCheck'), async () => {
+  $('audioResult').textContent = 'Listening for 3 s…';
+  return (await invoke('mic_check')).message;
+}));
+$('export').addEventListener('click', async () => {
+  const out = $('exportResult');
+  $('export').disabled = true; out.textContent = '';
+  try {
+    const path = await invoke('export_diagnostics', { redact: $('redact').checked, peer: peerForLog && $('peerLog').checked ? peerForLog : null });
+    if (path) out.textContent = 'Saved ' + path.split(/[\\/]/).pop();
+  } catch (e) { out.textContent = String(e); }
+  $('export').disabled = false;
+});
 
 // the CapraLink virtual device (if present) goes first, right after System default
 function fill(sel, list, special, hint) {

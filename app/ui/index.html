@@ -80,6 +80,20 @@
   .empty { color: var(--sub); font-size: 12px; padding: 4px 0 10px; }
   #error { color: var(--danger); font-size: 11px; margin-top: 6px; min-height: 14px; }
   #stats { font-size: 11px; color: var(--sub); text-align: center; }
+  .trouble h2 { display: flex; justify-content: space-between; align-items: center; }
+  .checks { list-style: none; padding: 0; margin: 0 0 8px; }
+  .checks li { display: flex; gap: 8px; padding: 3px 0; font-size: 12px; }
+  .checks .ic { width: 14px; flex: none; text-align: center; }
+  .checks .ok { color: #2fa85a; } .checks .warn { color: #e0a400; }
+  .checks .fix { color: var(--sub); font-size: 11px; }
+  .trow { display: flex; gap: 8px; margin-bottom: 6px; }
+  .trow .btn { flex: 1; }
+  .btn.ghost { background: var(--bg); color: var(--fg); border: 1px solid var(--border); }
+  .result { font-size: 11px; color: var(--sub); min-height: 14px; margin-bottom: 8px; }
+  .quality { font-size: 12px; text-align: center; margin-top: 8px; cursor: pointer; }
+  .quality b.good { color: #2fa85a; } .quality b.fair { color: #e0a400; } .quality b.poor { color: var(--danger); }
+  .quality .qhint { display: block; color: var(--sub); font-size: 11px; }
+  .opts .menuitem { display: block; width: 100%; text-align: left; border: none; border-top: 1px solid var(--border); background: none; color: var(--fg); padding: 8px 2px 4px; margin-top: 4px; font-size: 13px; cursor: pointer; }
   #version { font-size: 10px; color: var(--sub); text-align: right; }
   /* VU bars: a fixed green→red scale, uncovered from the left by the level */
   .bar { position: relative; height: 8px; border-radius: 4px; overflow: hidden;
@@ -119,10 +133,31 @@
     <div class="hint">Lets them pick this computer's devices, channels, bitrate and Music Mode.</div>
     <label class="check"><input id="autoRc" type="checkbox" /> Reconnect automatically</label>
     <div class="hint">If the link drops, or after a restart, reconnect to the last computer you connected to.</div>
+    <button class="menuitem" id="troubleBtn">Troubleshooting…</button>
     </div>
     <div class="me-name" id="myNameRow"></div>
     <div class="pinrow"><div class="pin" id="pin">••• •••</div><button class="link" id="pinToggle">Show</button></div>
     <div class="hint" id="pinHint"></div>
+  </section>
+
+  <section class="trouble" id="trouble" hidden>
+    <h2>Troubleshooting <button class="link" id="troubleClose">Close</button></h2>
+    <label>Connection</label>
+    <div class="quality" id="tConn" style="text-align:left;margin:0 0 8px;cursor:default"></div>
+    <label>Setup checks</label>
+    <ul class="checks" id="checks"></ul>
+    <label>Audio</label>
+    <div class="trow">
+      <button class="btn ghost" id="tone">Play test sound</button>
+      <button class="btn ghost" id="micCheck">Check microphone</button>
+    </div>
+    <div class="result" id="audioResult"></div>
+    <label>Diagnostics</label>
+    <label class="check"><input id="redact" type="checkbox" checked /> Hide names and addresses</label>
+    <label class="check" id="peerLogRow" hidden><input id="peerLog" type="checkbox" checked /> <span id="peerLogText"></span></label>
+    <div class="hint">One text file with the version, settings, devices, these checks and the recent log. No audio, PINs or keys.</div>
+    <div class="trow"><button class="btn" id="export">Export diagnostics…</button></div>
+    <div class="result" id="exportResult"></div>
   </section>
 
   <section>
@@ -162,7 +197,8 @@
     <div class="hint">Stereo, higher quality, a little more delay — applies to both directions of the link.</div>
   </section>
 
-  <div id="stats" style="margin-top:8px;"></div>
+  <div class="quality" id="quality" hidden></div>
+  <div id="stats" style="margin-top:4px;" hidden></div>
   <div id="error"></div>
   <div id="version"></div>
 
