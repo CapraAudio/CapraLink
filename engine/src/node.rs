@@ -4,7 +4,7 @@
 use crate::dsp::{ceiling, RateControl, MUSIC_TARGET, RATE, TARGET};
 use crate::log::log;
 use crate::vdev::Virtual;
-use crate::{Failure, Keys, Link, Settings, Stats, EVERYTHING, NO_DEVICE, VIRTUAL_INPUT, VIRTUAL_OUTPUT};
+use crate::{AudioDevice, Failure, Keys, Link, Settings, Stats, EVERYTHING, NO_DEVICE, VIRTUAL_INPUT, VIRTUAL_OUTPUT};
 use anyhow::{anyhow, bail, ensure, Context, Result};
 use hkdf::Hkdf;
 use hmac::{Hmac, KeyInit, Mac};
@@ -100,12 +100,19 @@ pub struct Device {
 }
 
 /// Another computer's settings and its own device lists, for remote configuration.
+/// `inputs`/`outputs` are the listed names, all that 0.1.x reads (it would reject the whole reply
+/// over entries it can't parse); `input_devices`/`output_devices` are the entries, absent from a
+/// 0.1.x reply, whose settings hold names.
 #[derive(Serialize, Deserialize)]
 pub struct RemoteConfig {
     pub name: String,
     pub settings: Settings,
     pub inputs: Vec<String>,
     pub outputs: Vec<String>,
+    #[serde(default)]
+    pub input_devices: Vec<AudioDevice>,
+    #[serde(default)]
+    pub output_devices: Vec<AudioDevice>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -390,7 +397,7 @@ impl Node {
     /// Setup checks, run on demand: engine, virtual devices, Windows network/speaker, peers seen.
     pub fn checks(&self) -> Vec<Check> {
         let check = |ok: bool, title: String, fix: Option<String>| Check { ok, title, fix: fix.filter(|_| !ok) };
-        let has = |list: Vec<String>, n: &str| list.iter().any(|d| d == n);
+        let has = |list: Vec<AudioDevice>, n: &str| list.iter().any(|d| d.id == n);
         let mut v = vec![check(true, format!("CapraLink is running (port {})", self.0.port), None)];
         if cfg!(windows) {
             let ok = has(crate::output_devices(), VIRTUAL_INPUT);
@@ -416,8 +423,8 @@ impl Node {
         }
         let st = self.st();
         for (label, saved, list) in [("Send from", &st.cfg.settings.input, crate::input_devices()), ("Play to", &st.cfg.settings.output, crate::output_devices())] {
-            if let Some(d) = saved.as_deref().filter(|d| *d != crate::NO_DEVICE && !list.iter().any(|n| n == d)) {
-                v.push(check(false, format!("{label} device \"{d}\" isn't connected"), Some("Plug it in, then use Refresh devices… in the list, or pick another device".into())));
+            if let Some(d) = saved.as_deref().filter(|d| *d != crate::NO_DEVICE && crate::pick(&list, d).is_none()) {
+                v.push(check(false, format!("{label} device \"{}\" isn't connected", crate::missing_name(d)), Some("Plug it in, then use Refresh devices… in the list, or pick another device".into())));
             }
         }
         for p in &st.cfg.peers {
@@ -445,17 +452,16 @@ impl Node {
             let _ = writeln!(t, "This computer: {}", st.cfg.name);
         }
         let s = &st.cfg.settings;
-        let dev = |d: &Option<String>, list: &[String]| match d.as_deref() {
+        let dev = |d: &Option<String>, list: &[AudioDevice]| match d.as_deref() {
             None => "System default".to_string(),
             Some(crate::NO_DEVICE) => "None (off)".to_string(),
-            Some(d) if list.iter().any(|n| n == d) => d.to_string(),
-            Some(d) => format!("{d} (not connected)"),
+            Some(d) => crate::pick(list, d).map_or_else(|| format!("{} (not connected)", crate::missing_name(d)), |i| list[i].name.clone()),
         };
         let on = |b: bool| if b { "on" } else { "off" };
         let _ = writeln!(t, "\n== Settings ==\nSend from: {}\nPlay to: {}", dev(&s.input, &ins), dev(&s.output, &outs));
         let _ = writeln!(t, "Channels: {}\nBitrate: {} kbps", if s.channels == 2 { "Stereo" } else { "Mono" }, s.bitrate / 1000);
         let _ = writeln!(t, "Music Mode: {}\nRun in background: {}\nRemote configuration: {}\nReconnect automatically: {}", on(s.music_mode), on(s.service), on(s.remote_config), on(s.auto_reconnect));
-        let _ = writeln!(t, "\n== Audio devices ==\nSend from: {}\nPlay to: {}", ins.join(" | "), outs.join(" | "));
+        let _ = writeln!(t, "\n== Audio devices ==\nSend from: {}\nPlay to: {}", names(&ins).join(" | "), names(&outs).join(" | "));
         let _ = writeln!(t, "\n== Paired devices ==");
         let conn = st.session.as_ref().map(|s| s.peer_id.as_str());
         for p in &st.cfg.peers {
@@ -477,7 +483,9 @@ impl Node {
         }
         let devices: Vec<String> = st.cfg.peers.iter().map(|p| p.name.clone()).chain(st.found.values().map(|f| f.name.clone())).collect();
         let saved = st.cfg.peers.iter().filter_map(|p| p.audio.as_ref()).flat_map(|a| [a.input.clone(), a.output.clone()]);
-        let audio: Vec<String> = ins.into_iter().chain(outs).chain([st.cfg.settings.input.clone(), st.cfg.settings.output.clone()].into_iter().chain(saved).flatten()).collect();
+        // names and ids (an id can hold a serial number), each its own "Audio device N"
+        let listed = ins.into_iter().chain(outs).flat_map(|d| [d.name, d.id]);
+        let audio: Vec<String> = listed.chain([st.cfg.settings.input.clone(), st.cfg.settings.output.clone()].into_iter().chain(saved).flatten()).collect();
         redact_text(&t, &redactions(&st.cfg.name, &devices, &audio))
     }
 
@@ -1204,7 +1212,11 @@ impl Node {
                 log(&format!("sending diagnostics to {peer}"));
                 Msg::Text { text: self.diagnostics(redact), more: false }
             }
-            Some(Msg::GetConfig) => Msg::Config(RemoteConfig { name, settings: match theirs { Some(a) => a.apply(local), None => local }, inputs: crate::input_devices(), outputs: crate::output_devices() }),
+            Some(Msg::GetConfig) => {
+                let (ins, outs) = (crate::input_devices(), crate::output_devices());
+                let settings = match theirs { Some(a) => a.apply(local), None => local };
+                Msg::Config(RemoteConfig { name, settings, inputs: names(&ins), outputs: names(&outs), input_devices: ins, output_devices: outs })
+            }
             // `service` and `remote_config` only change locally
             Some(Msg::SetSettings { settings, name: new_name }) => {
                 log(&format!("{peer} changed this computer's settings{}", if new_name.is_some() { " and name" } else { "" }));
@@ -1339,6 +1351,10 @@ fn log_tail(dir: &Path, n: usize) -> String {
     let all: String = [crate::log::OLD, crate::log::FILE].iter().filter_map(|f| std::fs::read(dir.join(f)).ok()).map(|b| String::from_utf8_lossy(&b).into_owned()).collect();
     let lines: Vec<&str> = all.lines().collect();
     lines[lines.len().saturating_sub(n)..].join("\n")
+}
+
+fn names(list: &[AudioDevice]) -> Vec<String> {
+    list.iter().map(|d| d.name.clone()).collect()
 }
 
 /// Placeholders for diagnostics: this computer, other computers ("Device A"...) and audio devices
@@ -2110,6 +2126,37 @@ mod tests {
             "This computer paired with Device A at <ip-1>:47800; Device B at <ip-2>, Device A again at <ip-1>.\n\
              Send from Audio device 2, Audio device 1, CapraLink Input, CapraLink Output, Everything this PC plays, none. v0.1.0 1.2.3.4.5"
         );
+    }
+
+    #[test]
+    fn redaction_hides_device_ids() {
+        let map = redactions("Me", &[], &["USB Mic".into(), "coreaudio:AppleUSBAudioEngine:Acme:SN12345:1".into(), VIRTUAL_INPUT.into()]);
+        let t = redact_text("device not found: coreaudio:AppleUSBAudioEngine:Acme:SN12345:1 (USB Mic), CapraLink Input", &map);
+        assert_eq!(t, "device not found: Audio device 2 (Audio device 1), CapraLink Input");
+    }
+
+    #[test]
+    fn remote_config_wire_compat() {
+        // a 0.1.x reply: names only, settings saved by name
+        let old = r#"{"name":"Old PC","settings":{"input":"USB Mic"},"inputs":["USB Mic","CapraLink Output"],"outputs":["Speakers"]}"#;
+        let c: RemoteConfig = serde_json::from_str(old).unwrap();
+        assert_eq!((c.inputs.len(), c.input_devices.len(), c.settings.input.as_deref()), (2, 0, Some("USB Mic")));
+        // this version's reply, read the way 0.1.x reads it (same fields, unknown ones ignored)
+        #[derive(Deserialize)]
+        #[allow(dead_code)]
+        struct Old {
+            name: String,
+            settings: Settings,
+            inputs: Vec<String>,
+            outputs: Vec<String>,
+        }
+        let mic = AudioDevice { id: "coreaudio:usb-1".into(), name: "USB Mic".into() };
+        let new = RemoteConfig { name: "New".into(), settings: Settings::default(), inputs: vec![mic.name.clone()], outputs: vec![], input_devices: vec![mic.clone()], output_devices: vec![] };
+        let json = serde_json::to_string(&new).unwrap();
+        let o: Old = serde_json::from_str(&json).unwrap();
+        assert_eq!(o.inputs, ["USB Mic"]);
+        let back: RemoteConfig = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.input_devices, [mic]);
     }
 
     #[test]

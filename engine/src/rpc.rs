@@ -10,7 +10,7 @@
 //! Nonces are 64 hex chars; the HMACs are HMAC-SHA256 over the strings, hex-encoded.
 
 use crate::node::{config_dir_or_default, hex, random, write_private};
-use crate::{Check, MicCheck, Node, NodeState, RemoteConfig, Settings};
+use crate::{AudioDevice, Check, MicCheck, Node, NodeState, RemoteConfig, Settings};
 use anyhow::{anyhow, bail, ensure, Context, Result};
 use hmac::{Hmac, KeyInit, Mac};
 use serde::de::DeserializeOwned;
@@ -34,8 +34,8 @@ const AUTH_DEADLINE: Duration = Duration::from_millis(if cfg!(test) { 1500 } els
 
 #[derive(Serialize, Deserialize)]
 pub struct Devices {
-    pub inputs: Vec<String>,
-    pub outputs: Vec<String>,
+    pub inputs: Vec<AudioDevice>,
+    pub outputs: Vec<AudioDevice>,
 }
 
 /// Headless engine: the node on `port` plus the RPC server on `port + 1`. Runs until the

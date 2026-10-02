@@ -66,27 +66,66 @@ pub(crate) fn pin_audio_host() {
     }
 }
 
-pub fn input_devices() -> Vec<String> {
-    devices(&cpal::default_host(), true).into_iter().map(|(n, _)| n).collect()
+/// One entry of a Send from / Play to list. `id` is what settings store: cpal's stable device id,
+/// or for CapraLink's own devices and "Everything this PC plays" that fixed name (the same on every
+/// computer, which remote configuration relies on). `name` is what the lists show.
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct AudioDevice {
+    pub id: String,
+    pub name: String,
 }
 
-pub fn output_devices() -> Vec<String> {
-    devices(&cpal::default_host(), false).into_iter().map(|(n, _)| n).collect()
+pub fn input_devices() -> Vec<AudioDevice> {
+    devices(&cpal::default_host(), true).into_iter().map(|(e, _)| e).collect()
 }
 
-/// Devices by the name the lists show (and settings store); hidden plumbing left out.
-fn devices(host: &cpal::Host, input: bool) -> Vec<(String, cpal::Device)> {
+pub fn output_devices() -> Vec<AudioDevice> {
+    devices(&cpal::default_host(), false).into_iter().map(|(e, _)| e).collect()
+}
+
+/// The listed devices; hidden plumbing left out.
+fn devices(host: &cpal::Host, input: bool) -> Vec<(AudioDevice, cpal::Device)> {
     let all = if input { host.input_devices() } else { host.output_devices() };
     let shown = |d: &cpal::Device| match d.id() {
         Ok(id) if cfg!(target_os = "linux") => label(input, id.id(), name(d)),
         _ if cfg!(windows) => win_label(input, name(d)),
         _ => Some(name(d)),
     };
-    let mut v: Vec<_> = all.into_iter().flatten().filter_map(|d| Some((shown(&d)?, d))).collect();
+    let id = |d: &cpal::Device| d.id().map(|i| i.to_string()).unwrap_or_default();
+    let mut v: Vec<_> = all.into_iter().flatten().filter_map(|d| Some(((id(&d), shown(&d)?), d))).collect();
     if cfg!(windows) && input {
-        v.extend(host.default_output_device().map(|d| (EVERYTHING.to_string(), d))); // WASAPI records it in loopback mode
+        v.extend(host.default_output_device().map(|d| ((String::new(), EVERYTHING.to_string()), d))); // WASAPI records it in loopback mode
     }
-    v
+    let (raw, devs): (Vec<_>, Vec<_>) = v.into_iter().unzip();
+    listed(raw).into_iter().zip(devs).collect()
+}
+
+/// Entries from (cpal id, shown name) pairs in enumeration order: a repeated name gets " (2)",
+/// " (3)"… so identical devices can be told apart, and CapraLink's own devices and "Everything
+/// this PC plays" take their name as id. A device without an id is found by its name.
+fn listed(raw: Vec<(String, String)>) -> Vec<AudioDevice> {
+    let mut seen: Vec<&str> = Vec::new();
+    raw.iter()
+        .map(|(id, name)| {
+            seen.push(name);
+            let n = seen.iter().filter(|s| **s == name).count();
+            let name = if n == 1 { name.clone() } else { format!("{name} ({n})") };
+            let fixed = id.is_empty() || [VIRTUAL_INPUT, VIRTUAL_OUTPUT, EVERYTHING].contains(&name.as_str());
+            AudioDevice { id: if fixed { name.clone() } else { id.clone() }, name }
+        })
+        .collect()
+}
+
+/// The entry a saved Send from / Play to value means: by id, else by name (versions before 0.2
+/// saved names; the next save stores the id).
+pub(crate) fn pick(list: &[AudioDevice], saved: &str) -> Option<usize> {
+    list.iter().position(|d| d.id == saved).or_else(|| list.iter().position(|d| d.name == saved))
+}
+
+/// How a saved value reads while its device is missing: an old saved name as is, an id (which can
+/// hold serial numbers and means nothing to people) as "Saved device".
+pub(crate) fn missing_name(saved: &str) -> &str {
+    if saved.parse::<cpal::DeviceId>().is_ok() { "Saved device" } else { saved }
 }
 
 fn name(d: &cpal::Device) -> String {
@@ -249,7 +288,7 @@ impl Link {
     /// Streams to/from `peer` over UDP `port`; only packets from exactly `peer` are accepted.
     pub fn start(cfg: &Settings, port: u16, peer: SocketAddr, keys: &Keys) -> anyhow::Result<Link> {
         anyhow::ensure!(matches!(cfg.channels, 1 | 2), "channels must be 1 or 2");
-        let (in_dev, out_dev) = (find(true, &cfg.input)?, find(false, &cfg.output)?);
+        let (in_dev, out_dev) = (find(true, &cfg.input)?.map(|(_, d)| d), find(false, &cfg.output)?.map(|(_, d)| d));
 
         let sock = UdpSocket::bind(("0.0.0.0", port)).with_context(|| format!("bind UDP port {port}"))?;
         sock.set_read_timeout(Some(Duration::from_millis(200)))?;
@@ -384,14 +423,18 @@ impl Drop for Link {
     }
 }
 
-/// The device a Send from (`input`) / Play to setting names: `None` = system default,
-/// `Ok(None)` = that direction is off.
-fn find(input: bool, want: &Option<String>) -> anyhow::Result<Option<cpal::Device>> {
+/// The device (and its listed name) a Send from (`input`) / Play to setting names: `None` =
+/// system default, `Ok(None)` = that direction is off.
+fn find(input: bool, want: &Option<String>) -> anyhow::Result<Option<(String, cpal::Device)>> {
     let host = cpal::default_host();
     Ok(Some(match want.as_deref() {
         Some(NO_DEVICE) => return Ok(None),
-        Some(n) => devices(&host, input).into_iter().find(|(s, _)| s == n).map(|(_, d)| d).ok_or_else(|| anyhow!("device not found: {n}"))?,
-        None => if input { host.default_input_device() } else { host.default_output_device() }.ok_or_else(|| anyhow!("no default device"))?,
+        Some(n) => {
+            let (list, mut devs): (Vec<_>, Vec<_>) = devices(&host, input).into_iter().unzip();
+            let i = pick(&list, n).ok_or_else(|| anyhow!("device not found: {}", missing_name(n)))?;
+            (list[i].name.clone(), devs.swap_remove(i))
+        }
+        None => if input { host.default_input_device() } else { host.default_output_device() }.map(|d| (name(&d), d)).ok_or_else(|| anyhow!("no default device"))?,
     }))
 }
 
@@ -422,7 +465,7 @@ pub(crate) fn default_output_name() -> Option<String> {
 
 /// Plays about a second of a soft 440 Hz tone on the Play to device; returns when it's done.
 pub fn test_tone(output: &Option<String>) -> anyhow::Result<()> {
-    let dev = find(false, output)?.ok_or_else(|| anyhow!("Play to is set to None"))?;
+    let (_, dev) = find(false, output)?.ok_or_else(|| anyhow!("Play to is set to None"))?;
     let sc = pick_config(dev.default_output_config()?, dev.supported_output_configs()?);
     let (ch, rate, c) = (sc.channels() as usize, sc.sample_rate(), sc.config());
     let err = |e: cpal::Error| crate::log::log(&format!("test tone: {e}"));
@@ -459,8 +502,7 @@ pub struct MicCheck {
 
 /// Records 3 s from the Send from device and judges its level.
 pub fn mic_check(input: &Option<String>) -> anyhow::Result<MicCheck> {
-    let dev = find(true, input)?.ok_or_else(|| anyhow!("Send from is set to None"))?;
-    let label = input.clone().unwrap_or_else(|| name(&dev));
+    let (label, dev) = find(true, input)?.ok_or_else(|| anyhow!("Send from is set to None"))?;
     // "Everything this PC plays" is a playback device: its mix format is the one loopback takes.
     let sc = if input.as_deref() == Some(EVERYTHING) { dev.default_output_config()? } else { dev.default_input_config()? };
     let (peak, c) = (Arc::new(AtomicU32::new(0)), sc.config());
@@ -836,6 +878,50 @@ fn windows_labels() {
     let ins = ["Microphone (USB Mic)", "CABLE Output (VB-Audio Virtual Cable)"];
     assert_eq!(shown(true, &ins), ["Microphone (USB Mic)"]);
     assert_eq!(shown(true, &outs), ["Speakers (Realtek(R) Audio)"], "no VB-Cable endpoint is ever offered as Send from");
+}
+
+#[cfg(test)]
+#[test]
+fn device_ids() {
+    let raw = |v: &[(&str, &str)]| v.iter().map(|(i, n)| (i.to_string(), n.to_string())).collect();
+    let l = listed(raw(&[
+        ("coreaudio:usb-1", "USB Mic"),
+        ("coreaudio:builtin", "MacBook Pro Microphone"),
+        ("coreaudio:usb-2", "USB Mic"),
+        ("coreaudio:BlackHoleUID", VIRTUAL_OUTPUT),
+        ("", EVERYTHING),
+        ("coreaudio:usb-3", "USB Mic"),
+    ]));
+    let shown: Vec<_> = l.iter().map(|d| (d.id.as_str(), d.name.as_str())).collect();
+    assert_eq!(
+        shown,
+        [
+            ("coreaudio:usb-1", "USB Mic"),
+            ("coreaudio:builtin", "MacBook Pro Microphone"),
+            ("coreaudio:usb-2", "USB Mic (2)"),
+            (VIRTUAL_OUTPUT, VIRTUAL_OUTPUT),
+            (EVERYTHING, EVERYTHING),
+            ("coreaudio:usb-3", "USB Mic (3)"),
+        ],
+        "duplicates told apart; CapraLink's devices and Everything keep fixed ids"
+    );
+    for (i, d) in l.iter().enumerate() {
+        assert_eq!(pick(&l, &d.id), Some(i), "{} resolves to itself", d.id);
+    }
+    // the same devices enumerated in another order still resolve by id
+    let moved = listed(raw(&[("coreaudio:usb-2", "USB Mic"), ("coreaudio:usb-1", "USB Mic")]));
+    assert_eq!(moved[pick(&moved, "coreaudio:usb-2").unwrap()].id, "coreaudio:usb-2");
+    // settings saved by name (0.1.x) still resolve, to the first match as before
+    assert_eq!(pick(&l, "USB Mic"), Some(0));
+    assert_eq!(pick(&l, "MacBook Pro Microphone"), Some(1));
+    assert_eq!(pick(&l, VIRTUAL_OUTPUT), Some(3));
+    assert_eq!(pick(&l, "coreaudio:gone"), None);
+    // Linux/Windows virtual devices get their fixed id from the label, whatever cpal calls them
+    let lin = listed(raw(&[("pulseaudio:capralink_input_feed", &label(false, "capralink_input_feed", "x".into()).unwrap())]));
+    let win = listed(raw(&[("wasapi:{0.0.0.00000000}.{abc}", &win_label(false, "CABLE Input (VB-Audio Virtual Cable)".into()).unwrap())]));
+    assert_eq!((lin[0].id.as_str(), win[0].id.as_str()), (VIRTUAL_INPUT, VIRTUAL_INPUT));
+    assert_eq!(missing_name(&format!("{}:gone", cpal::default_host().id())), "Saved device");
+    assert_eq!(missing_name("USB Mic"), "USB Mic");
 }
 
 #[cfg(test)]

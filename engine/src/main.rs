@@ -17,9 +17,9 @@ fn main() -> anyhow::Result<()> {
         match flag.as_str() {
             "--list" => {
                 println!("Input devices:");
-                input_devices().iter().for_each(|d| println!("  {d}"));
+                input_devices().iter().for_each(|d| println!("  {}  [{}]", d.name, d.id));
                 println!("Output devices:");
-                output_devices().iter().for_each(|d| println!("  {d}"));
+                output_devices().iter().for_each(|d| println!("  {}  [{}]", d.name, d.id));
                 return Ok(());
             }
             "--port" => port = next(&mut it, flag)?.parse()?,
@@ -63,7 +63,7 @@ fn main() -> anyhow::Result<()> {
     header(&node.state());
     match node.state().virtual_error {
         Some(e) => println!("{e}"),
-        None if input_devices().iter().any(|d| d == VIRTUAL_OUTPUT) && output_devices().iter().any(|d| d == VIRTUAL_INPUT) => {
+        None if input_devices().iter().any(|d| d.id == VIRTUAL_OUTPUT) && output_devices().iter().any(|d| d.id == VIRTUAL_INPUT) => {
             println!("Virtual devices ready: \"{VIRTUAL_OUTPUT}\" (send from it) and \"{VIRTUAL_INPUT}\" (play to it)")
         }
         None => println!("Virtual devices not installed"),

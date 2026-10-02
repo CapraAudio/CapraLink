@@ -17,7 +17,7 @@ let pinDraft = '';
 let editAddr = null;    // open "Edit address" box: {id, draft}
 let lastDevices = '';
 let devices = [];
-let remote = null;      // open "Settings on <name>" panel: {id, name, inputs, outputs, draft}
+let remote = null;      // open "Settings on <name>" panel: {id, name, inputs, outputs, input_devices, output_devices, draft}
 let renaming = null;    // draft name while the "This device" name is being edited, else null
 let lastNameSig = '';
 let menuFor = null; // device whose ⋯ menu is open
@@ -246,21 +246,22 @@ function remotePanel() {
   nameInput.value = r.nameDraft;
   nameInput.addEventListener('input', () => { r.nameDraft = nameInput.value; });
   box.appendChild(nameInput);
-  const pick = (label, list, special, hint, key) => {
+  const pick = (label, special, hint, key) => {
     box.appendChild(el('label', null, label));
     const sel = el('select');
-    fill(sel, list, special, hint);
+    const devs = r[key + '_devices']; // absent from an older computer: its lists are names
+    fill(sel, devs && devs.length ? devs : r[key + 's'], special, hint);
     setSel(sel, s[key]);
     sel.addEventListener('change', async () => {
       if (!isRefresh(sel)) { s[key] = sel.value || null; return; }
-      try { const c = await invoke('remote_get', { id: r.id }); r.inputs = c.inputs; r.outputs = c.outputs; }
+      try { const c = await invoke('remote_get', { id: r.id }); for (const k of ['inputs', 'outputs', 'input_devices', 'output_devices']) r[k] = c[k]; }
       catch (e) { actionError = String(e); }
       lastDevices = ''; render(); // rebuilds the panel from the draft, so choices stay
     });
     box.appendChild(sel);
   };
   box.appendChild(el('h2', 'sub', 'Sending'));
-  pick('Send from', r.inputs, 'CapraLink Output', 'apps on that computer play into it', 'input');
+  pick('Send from', 'CapraLink Output', 'apps on that computer play into it', 'input');
   box.appendChild(el('label', null, 'Channels'));
   const seg = el('div', 'seg');
   const rate = el('input');
@@ -284,7 +285,7 @@ function remotePanel() {
   box.appendChild(rate);
   box.appendChild(val);
   box.appendChild(el('h2', 'sub', 'Receiving'));
-  pick('Play to', r.outputs, 'CapraLink Input', 'apps on that computer record from it', 'output');
+  pick('Play to', 'CapraLink Input', 'apps on that computer record from it', 'output');
   const music = el('label', 'check');
   const cb = el('input');
   cb.type = 'checkbox'; cb.checked = !!s.music_mode;
@@ -302,11 +303,16 @@ function remotePanel() {
   return box;
 }
 
-// keeps a saved device selectable even while it is unplugged
+// keeps a saved device selectable even while it is unplugged. Settings saved before 0.2 hold
+// the device's name: that selects its entry (the next save stores the id).
 function setSel(sel, v) {
-  if (v && ![...sel.options].some((o) => o.value === v && !o.dataset.refresh)) {
+  const opts = [...sel.options].filter((o) => !o.dataset.refresh);
+  const named = v && !opts.some((o) => o.value === v) && opts.find((o) => o.dataset.name === v);
+  if (named) v = named.value;
+  else if (v && !opts.some((o) => o.value === v)) {
     const o = document.createElement('option');
-    o.value = v; o.textContent = v + ' (not found)';
+    // an id ("coreaudio:…", "wasapi:…") means nothing to people
+    o.value = v; o.textContent = /^[a-z]+:/.test(v) ? 'Saved device (not connected)' : v + ' (not found)';
     sel.insertBefore(o, sel.querySelector('option[data-refresh]')); // Refresh stays last
   }
   sel.value = v || '';
@@ -468,7 +474,8 @@ $('export').addEventListener('click', async () => {
   $('export').disabled = false;
 });
 
-// the CapraLink virtual device (if present) goes first, right after System default
+// the CapraLink virtual device (if present) goes first, right after System default.
+// `list` holds {id, name} entries, or names (an older computer's lists), where id = name.
 function fill(sel, list, special, hint) {
   sel.innerHTML = '';
   const def = document.createElement('option');
@@ -477,10 +484,10 @@ function fill(sel, list, special, hint) {
   const none = document.createElement('option'); // turns this direction off
   none.value = 'none'; none.textContent = 'None';
   sel.appendChild(none);
-  const names = list.includes(special) ? [special, ...list.filter((n) => n !== special)] : list;
-  for (const name of names) {
+  const devs = list.map((d) => (typeof d === 'string' ? { id: d, name: d } : d));
+  for (const d of [...devs.filter((d) => d.id === special), ...devs.filter((d) => d.id !== special)]) {
     const o = document.createElement('option');
-    o.value = name; o.textContent = name === special ? name + ' — ' + hint : name;
+    o.value = d.id; o.dataset.name = d.name; o.textContent = d.id === special ? d.name + ' — ' + hint : d.name;
     sel.appendChild(o);
   }
   const refresh = document.createElement('option'); // re-checks for plugged/unplugged devices
@@ -494,7 +501,7 @@ async function loadDevices() {
   // Windows: CapraLink Input is VB-Cable's "CABLE Input"; apps record from its other end
   const win = navigator.userAgent.includes('Windows');
   fill(els.output, d.outputs, 'CapraLink Input', win ? 'apps on this computer record from it — pick "CABLE Output" as the microphone in Discord' : 'apps on this computer record from it');
-  $('cableNote').hidden = !win || d.outputs.includes('CapraLink Input');
+  $('cableNote').hidden = !win || d.outputs.some((o) => o.id === 'CapraLink Input');
 }
 
 // Size the window to the content, so it never needs a scroll bar; re-fit whenever the
