@@ -16,4 +16,5 @@ anyhow = "1"
 capralink_engine = { path = "../engine" }
 serde = { version = "1", features = ["derive"] }
 tauri = { version = "2", features = ["tray-icon", "image-png"] }
+tauri-plugin-dialog = "2"
 tauri-plugin-single-instance = "2"

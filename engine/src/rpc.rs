@@ -10,7 +10,7 @@
 //! Nonces are 64 hex chars; the HMACs are HMAC-SHA256 over the strings, hex-encoded.
 
 use crate::node::{config_dir_or_default, hex, random, write_private};
-use crate::{Node, NodeState, RemoteConfig, Settings};
+use crate::{Check, MicCheck, Node, NodeState, RemoteConfig, Settings};
 use anyhow::{anyhow, bail, ensure, Context, Result};
 use hmac::{Hmac, KeyInit, Mac};
 use serde::de::DeserializeOwned;
@@ -39,6 +39,7 @@ pub struct Devices {
 /// Headless engine: the node on `port` plus the RPC server on `port + 1`. Runs until the
 /// `shutdown` command or a termination signal.
 pub fn daemon(config_dir: Option<PathBuf>, port: u16) -> Result<()> {
+    crate::log::init(config_dir.clone(), "daemon");
     let node = Node::start(config_dir, port, true)?;
     let rpc = node.port().checked_add(1).ok_or_else(|| anyhow!("port 65535 leaves no room for the engine port above it"));
     if let Err(e) = rpc.and_then(|p| serve_rpc(node.clone(), p)) {
@@ -108,8 +109,18 @@ fn handle(node: &Node, token: &str, mut s: TcpStream) {
     let _ = s.set_read_timeout(Some(IO_TIMEOUT));
     let _ = s.set_write_timeout(Some(IO_TIMEOUT));
     let (reply, quit) = match authenticate(token, &s) {
-        Err(e) => (Err(e), false),
-        Ok(r) => (dispatch(node, &r.cmd, r.args), r.cmd == "shutdown"),
+        Err(e) => {
+            crate::log::log(&format!("refused a local connection: {e:#}"));
+            (Err(e), false)
+        }
+        Ok(r) => {
+            let reply = dispatch(node, &r.cmd, r.args);
+            // pairing logs its own outcome (and an argument error could quote the PIN)
+            if let Some(e) = reply.as_ref().err().filter(|_| !r.cmd.starts_with("pair")) {
+                crate::log::log(&format!("{}: {e:#}", r.cmd));
+            }
+            (reply, r.cmd == "shutdown")
+        }
     };
     let body = match reply {
         Ok(v) => json!({ "ok": v }),
@@ -165,6 +176,8 @@ fn dispatch(node: &Node, cmd: &str, args: Value) -> Result<Value> {
         addr: String,
         settings: Option<Settings>,
         name: Option<String>,
+        redact: bool,
+        peer: Option<String>,
     }
     let a: Args = if args.is_null() { Args::default() } else { serde_json::from_value(args)? };
     let done = |r: Result<()>| r.map(|()| Value::Null);
@@ -186,6 +199,20 @@ fn dispatch(node: &Node, cmd: &str, args: Value) -> Result<Value> {
         "set_name" => done(node.set_name(&a.name.ok_or_else(|| anyhow!("missing name"))?)),
         "remote_get" => Ok(serde_json::to_value(node.remote_get(&a.id)?)?),
         "remote_set" => done(node.remote_set(&a.id, a.settings.ok_or_else(|| anyhow!("missing settings"))?, a.name)),
+        "checks" => Ok(serde_json::to_value(node.checks())?),
+        "test_tone" => done(crate::test_tone(&node.settings().output)),
+        "mic_check" => Ok(serde_json::to_value(crate::mic_check(&node.settings().input)?)?),
+        "diagnostics" => {
+            let mut text = node.diagnostics(a.redact);
+            if let Some(peer) = a.peer {
+                text += "\n\n==== The other computer ====\n";
+                match node.remote_diagnostics(&peer, a.redact) {
+                    Ok(t) => text += &t,
+                    Err(e) => text += &format!("Couldn't get its diagnostics: {e:#}\n"),
+                }
+            }
+            Ok(Value::from(text))
+        }
         "shutdown" => Ok(Value::Null), // `handle` exits after replying
         _ => bail!("unknown command {cmd}"),
     }
@@ -292,6 +319,25 @@ impl Client {
     /// `name` renames the target too, when given.
     pub fn remote_set(&self, id: &str, s: &Settings, name: Option<&str>) -> Result<()> {
         self.call("remote_set", json!({ "id": id, "settings": s, "name": name }))
+    }
+
+    pub fn checks(&self) -> Result<Vec<Check>> {
+        self.call("checks", Value::Null)
+    }
+
+    /// Plays a test tone on the Play to device.
+    pub fn test_tone(&self) -> Result<()> {
+        self.call("test_tone", Value::Null)
+    }
+
+    /// Records 3 s from the Send from device (well inside `CALL_TIMEOUT`).
+    pub fn mic_check(&self) -> Result<MicCheck> {
+        self.call("mic_check", Value::Null)
+    }
+
+    /// This computer's diagnostics, plus paired device `peer`'s when given.
+    pub fn diagnostics(&self, redact: bool, peer: Option<&str>) -> Result<String> {
+        self.call("diagnostics", json!({ "redact": redact, "peer": peer }))
     }
 
     pub fn shutdown(&self) -> Result<()> {
@@ -462,6 +508,9 @@ mod tests {
         assert!(c.connect("nobody").is_err());
         assert!(c.set_peer_addr("nobody", "127.0.0.1").unwrap_err().to_string().contains("not paired"));
         c.disconnect().unwrap();
+        assert!(c.checks().unwrap()[0].ok);
+        let d = c.diagnostics(true, Some("nobody")).unwrap();
+        assert!(d.contains("This computer: This computer") && d.contains("Couldn't get its diagnostics"), "{d}");
         let _ = std::fs::remove_dir_all(dir);
     }
 

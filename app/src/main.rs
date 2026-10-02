@@ -2,7 +2,8 @@
 // a client of that engine (MASTER.md §3.6).
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
-use capralink_engine::{Client, Devices, NodeState, RemoteConfig, Settings};
+use capralink_engine::log::log;
+use capralink_engine::{Check, Client, Devices, MicCheck, NodeState, RemoteConfig, Settings};
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::sync::Mutex;
@@ -10,6 +11,7 @@ use std::time::{Duration, Instant};
 use tauri::menu::{CheckMenuItem, Menu, MenuItem};
 use tauri::tray::{TrayIconBuilder, TrayIconEvent};
 use tauri::{AppHandle, Manager, RunEvent, State, WebviewUrl, WebviewWindowBuilder};
+use tauri_plugin_dialog::DialogExt;
 
 /// Connection to the engine daemon, (re)made on demand.
 struct App {
@@ -22,7 +24,10 @@ impl App {
     fn client(&self) -> Result<Client, String> {
         let mut c = self.client.lock().unwrap_or_else(|e| e.into_inner());
         if c.is_none() {
-            *c = Some(self.connect().map_err(|e| format!("Can't reach the CapraLink engine: {e:#}"))?);
+            *c = Some(self.connect().map_err(|e| {
+                log(&format!("can't reach the engine: {e:#}"));
+                format!("Can't reach the CapraLink engine: {e:#}")
+            })?);
         }
         Ok(c.clone().expect("set above"))
     }
@@ -52,6 +57,7 @@ impl App {
                 return format!("{e:#}");
             }
             *self.client.lock().unwrap_or_else(|e| e.into_inner()) = None; // reconnect next time
+            log(&format!("lost the engine: {e:#}"));
             format!("Can't reach the CapraLink engine: {e:#}")
         })
     }
@@ -163,6 +169,33 @@ fn remote_set(app: State<App>, id: String, settings: Settings, name: Option<Stri
     app.run(|c| c.remote_set(&id, &settings, name.as_deref()))
 }
 
+#[tauri::command(async)]
+fn checks(app: State<App>) -> Result<Vec<Check>, String> {
+    app.run(Client::checks)
+}
+
+#[tauri::command(async)]
+fn test_tone(app: State<App>) -> Result<(), String> {
+    app.run(Client::test_tone)
+}
+
+#[tauri::command(async)]
+fn mic_check(app: State<App>) -> Result<MicCheck, String> {
+    app.run(Client::mic_check)
+}
+
+/// Saves the diagnostics (this computer's, plus paired device `peer`'s) where the user picks
+/// in a Save dialog; returns the path, or None if cancelled. The page never names the path.
+#[tauri::command(async)]
+fn export_diagnostics(window: tauri::WebviewWindow, app: State<App>, redact: bool, peer: Option<String>) -> Result<Option<String>, String> {
+    let text = app.run(|c| c.diagnostics(redact, peer.as_deref()))?;
+    let name = format!("CapraLink-diagnostics-{}.txt", &capralink_engine::log::now()[..10]);
+    let Some(path) = window.dialog().file().set_parent(&window).set_file_name(name).add_filter("Text", &["txt"]).blocking_save_file() else { return Ok(None) };
+    let path = path.into_path().map_err(|e| e.to_string())?;
+    std::fs::write(&path, text).map_err(|e| format!("Can't save {}: {e}", path.display()))?;
+    Ok(Some(path.display().to_string()))
+}
+
 /// Tray Quit: the engine goes too unless it is meant to run in the background.
 fn quit(app: &AppHandle) {
     let client = app.state::<App>().client.lock().unwrap_or_else(|e| e.into_inner()).clone();
@@ -236,18 +269,20 @@ fn main() {
     // Before any Tauri/GTK/webview init, so the engine runs without a display.
     if std::env::args().any(|a| a == "--daemon") {
         if let Err(e) = capralink_engine::daemon(dir, port) {
-            eprintln!("capralink --daemon: {e:#}");
+            log(&format!("engine stopped: {e:#}"));
             std::process::exit(1);
         }
         return;
     }
 
+    capralink_engine::log::init(dir.clone(), "ui");
     let app = App { dir, port, client: Mutex::new(None) };
     tauri::Builder::default()
         // a second launch (no tray on stock GNOME, Start menu on Windows) brings this window back
         .plugin(tauri_plugin_single_instance::init(|app, _, _| show_window(app)))
+        .plugin(tauri_plugin_dialog::init())
         .manage(app)
-        .invoke_handler(tauri::generate_handler![devices, state, version, open_releases, levels, fit, pair, pair_ip, open_pairing, connect, disconnect, forget, set_settings, set_peer_addr, set_name, remote_get, remote_set])
+        .invoke_handler(tauri::generate_handler![devices, state, version, open_releases, levels, fit, pair, pair_ip, open_pairing, connect, disconnect, forget, set_settings, set_peer_addr, set_name, remote_get, remote_set, checks, test_tone, mic_check, export_diagnostics])
         .setup(|app| {
             #[cfg(target_os = "macos")]
             app.set_activation_policy(tauri::ActivationPolicy::Accessory);

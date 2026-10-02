@@ -1,11 +1,12 @@
 //! CapraLink audio engine: capture -> Opus -> UDP -> Opus -> playback.
 
 mod dsp;
+pub mod log;
 mod node;
 mod rpc;
 mod vdev;
 
-pub use node::{Device, Node, NodeState, RemoteConfig};
+pub use node::{Check, Device, Node, NodeState, Quality, RemoteConfig};
 pub use rpc::{daemon, daemon_exe, serve_rpc, Client, Devices};
 
 /// A command for a system tool (pactl, systemctl, reg, hostname). Inside an AppImage,
@@ -209,14 +210,7 @@ impl Link {
     /// Streams to/from `peer` over UDP `port`; only packets from exactly `peer` are accepted.
     pub fn start(cfg: &Settings, port: u16, peer: SocketAddr, keys: &Keys) -> anyhow::Result<Link> {
         anyhow::ensure!(matches!(cfg.channels, 1 | 2), "channels must be 1 or 2");
-        let host = cpal::default_host();
-        let find = |input: bool, want: &Option<String>, default: Option<cpal::Device>| match want {
-            Some(n) => devices(&host, input).into_iter().find(|(s, _)| s == n).map(|(_, d)| d).ok_or_else(|| anyhow!("device not found: {n}")),
-            None => default.ok_or_else(|| anyhow!("no default device")),
-        };
-        let off = |want: &Option<String>| want.as_deref() == Some(NO_DEVICE);
-        let in_dev = if off(&cfg.input) { None } else { Some(find(true, &cfg.input, host.default_input_device())?) };
-        let out_dev = if off(&cfg.output) { None } else { Some(find(false, &cfg.output, host.default_output_device())?) };
+        let (in_dev, out_dev) = (find(true, &cfg.input)?, find(false, &cfg.output)?);
 
         let sock = UdpSocket::bind(("0.0.0.0", port)).with_context(|| format!("bind UDP port {port}"))?;
         sock.set_read_timeout(Some(Duration::from_millis(200)))?;
@@ -280,7 +274,17 @@ impl Link {
     }
 
     pub fn stats(&self) -> Stats {
+        self.read(true)
+    }
+
+    /// Like `stats`, but leaves the gap meters to the window (for the log and diagnostics).
+    pub fn peek(&self) -> Stats {
+        self.read(false)
+    }
+
+    fn read(&self, reset_gaps: bool) -> Stats {
         let c = &self.shared.c;
+        let gap = |g: &AtomicU32| if reset_gaps { g.swap(0, Relaxed) } else { g.load(Relaxed) } as f32 / 1000.0;
         Stats {
             sent: c.sent.load(Relaxed),
             received: c.received.load(Relaxed),
@@ -291,8 +295,8 @@ impl Link {
             target_ms: f32::from_bits(self.shared.target_ms.load(Relaxed)),
             in_peak: f32::from_bits(self.shared.in_peak.load(Relaxed)),
             out_peak: f32::from_bits(self.shared.out_peak.load(Relaxed)),
-            tx_gap_ms: self.shared.tx_gap_us.swap(0, Relaxed) as f32 / 1000.0,
-            rx_gap_ms: self.shared.rx_gap_us.swap(0, Relaxed) as f32 / 1000.0,
+            tx_gap_ms: gap(&self.shared.tx_gap_us),
+            rx_gap_ms: gap(&self.shared.rx_gap_us),
             bitrate: self.shared.bitrate.load(Relaxed),
             complexity: self.shared.complexity.load(Relaxed),
             music: self.shared.music.load(Relaxed),
@@ -332,6 +336,99 @@ impl Drop for Link {
     }
 }
 
+/// The device a Send from (`input`) / Play to setting names: `None` = system default,
+/// `Ok(None)` = that direction is off.
+fn find(input: bool, want: &Option<String>) -> anyhow::Result<Option<cpal::Device>> {
+    let host = cpal::default_host();
+    Ok(Some(match want.as_deref() {
+        Some(NO_DEVICE) => return Ok(None),
+        Some(n) => devices(&host, input).into_iter().find(|(s, _)| s == n).map(|(_, d)| d).ok_or_else(|| anyhow!("device not found: {n}"))?,
+        None => if input { host.default_input_device() } else { host.default_output_device() }.ok_or_else(|| anyhow!("no default device"))?,
+    }))
+}
+
+/// The system's default playback device's name (Windows setup check).
+#[cfg(windows)]
+pub(crate) fn default_output_name() -> Option<String> {
+    cpal::default_host().default_output_device().map(|d| name(&d))
+}
+
+/// Plays about a second of a soft 440 Hz tone on the Play to device; returns when it's done.
+pub fn test_tone(output: &Option<String>) -> anyhow::Result<()> {
+    let dev = find(false, output)?.ok_or_else(|| anyhow!("Play to is set to None"))?;
+    let sc = pick_config(dev.default_output_config()?, dev.supported_output_configs()?);
+    let (ch, rate, c) = (sc.channels() as usize, sc.sample_rate(), sc.config());
+    let err = |e: cpal::Error| crate::log::log(&format!("test tone: {e}"));
+    let mut n = 0u32;
+    let s = match sc.sample_format() {
+        SampleFormat::F32 => dev.build_output_stream(c, move |d: &mut [f32], _: &_| tone(d, &mut n, ch, rate), err, None)?,
+        SampleFormat::I16 => dev.build_output_stream(c, move |d: &mut [i16], _: &_| tone(d, &mut n, ch, rate), err, None)?,
+        SampleFormat::I32 => dev.build_output_stream(c, move |d: &mut [i32], _: &_| tone(d, &mut n, ch, rate), err, None)?,
+        SampleFormat::U16 => dev.build_output_stream(c, move |d: &mut [u16], _: &_| tone(d, &mut n, ch, rate), err, None)?,
+        f => anyhow::bail!("unsupported output sample format {f}"),
+    };
+    s.play()?;
+    std::thread::sleep(Duration::from_millis(1200)); // the tone plus the device's buffer
+    Ok(())
+}
+
+/// Next frames of the test tone (`n` = frames played so far): 1 s, 50 ms fades, then silence.
+fn tone<T: SizedSample + FromSample<f32>>(out: &mut [T], n: &mut u32, ch: usize, rate: u32) {
+    for f in out.chunks_exact_mut(ch) {
+        let t = *n as f32 / rate as f32;
+        let fade = (t.min(1.0 - t) / 0.05).clamp(0.0, 1.0);
+        f.fill(T::from_sample(0.2 * fade * (std::f32::consts::TAU * 440.0 * t).sin()));
+        *n = n.saturating_add(1);
+    }
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+pub struct MicCheck {
+    pub peak_db: f32,
+    /// "silent", "clipping" or "ok"
+    pub verdict: String,
+    pub message: String,
+}
+
+/// Records 3 s from the Send from device and judges its level.
+pub fn mic_check(input: &Option<String>) -> anyhow::Result<MicCheck> {
+    let dev = find(true, input)?.ok_or_else(|| anyhow!("Send from is set to None"))?;
+    let label = input.clone().unwrap_or_else(|| name(&dev));
+    // "Everything this PC plays" is a playback device: its mix format is the one loopback takes.
+    let sc = if input.as_deref() == Some(EVERYTHING) { dev.default_output_config()? } else { dev.default_input_config()? };
+    let (peak, c) = (Arc::new(AtomicU32::new(0)), sc.config());
+    let err = |e: cpal::Error| crate::log::log(&format!("mic check: {e}"));
+    let p = peak.clone();
+    let s = match sc.sample_format() {
+        SampleFormat::F32 => dev.build_input_stream(c, move |d: &[f32], _: &_| meter_max(&p, d), err, None)?,
+        SampleFormat::I16 => dev.build_input_stream(c, move |d: &[i16], _: &_| meter_max(&p, d), err, None)?,
+        SampleFormat::I32 => dev.build_input_stream(c, move |d: &[i32], _: &_| meter_max(&p, d), err, None)?,
+        SampleFormat::U16 => dev.build_input_stream(c, move |d: &[u16], _: &_| meter_max(&p, d), err, None)?,
+        f => anyhow::bail!("unsupported input sample format {f}"),
+    };
+    s.play()?;
+    std::thread::sleep(Duration::from_secs(3));
+    drop(s);
+    let peak_db = (20.0 * f32::from_bits(peak.load(Relaxed)).log10()).max(-120.0);
+    let (verdict, message) = if peak_db < -60.0 {
+        ("silent", format!("No sound from {label} — check it isn't muted. On macOS, allow microphone access in System Settings → Privacy & Security."))
+    } else if peak_db >= -0.5 {
+        ("clipping", format!("{label} is too loud — lower its input volume"))
+    } else {
+        ("ok", format!("Microphone OK — peak {} dB", format!("{peak_db:.0}").replace('-', "\u{2212}")))
+    };
+    Ok(MicCheck { peak_db, verdict: verdict.into(), message })
+}
+
+/// Raises a max-peak meter (positive f32 bit patterns order like the floats).
+fn meter_max<T: Sample>(peak: &AtomicU32, d: &[T])
+where
+    f32: FromSample<T>,
+{
+    let p = d.iter().fold(0f32, |m, s| m.max(f32::from_sample(*s).abs()));
+    peak.fetch_max(p.to_bits(), Relaxed);
+}
+
 /// Default config, switched to 48 kHz when the device supports it (avoids resampling).
 fn pick_config(def: cpal::SupportedStreamConfig, mut all: impl Iterator<Item = cpal::SupportedStreamConfigRange>) -> cpal::SupportedStreamConfig {
     if def.sample_rate() == RATE {
@@ -363,7 +460,7 @@ fn meter(level: &AtomicU32, samples: &[f32]) {
 /// Logs stream errors; a device that went away is also recorded as the link's `failure()`.
 fn err_cb(shared: Arc<Shared>, what: &'static str) -> impl FnMut(cpal::Error) + Send + 'static {
     move |e| {
-        eprintln!("audio stream error: {e}");
+        crate::log::log(&format!("audio stream error ({what}): {e}"));
         if e.kind() == cpal::ErrorKind::DeviceNotAvailable {
             if let Ok(mut f) = shared.failure.lock() {
                 *f = Some(format!("{what}: {e}"));

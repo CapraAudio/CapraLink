@@ -1,9 +1,10 @@
 //! One node per process: config, mDNS discovery, PIN pairing (SPAKE2), the Noise control
 //! channel and the single active `Link` (MASTER.md §3.3).
 
-use crate::dsp::{ceiling, RateControl};
+use crate::dsp::{ceiling, RateControl, MUSIC_TARGET, RATE, TARGET};
+use crate::log::log;
 use crate::vdev::Virtual;
-use crate::{Keys, Link, Settings, Stats};
+use crate::{Keys, Link, Settings, Stats, EVERYTHING, NO_DEVICE, VIRTUAL_INPUT, VIRTUAL_OUTPUT};
 use anyhow::{anyhow, bail, ensure, Context, Result};
 use hkdf::Hkdf;
 use hmac::{Hmac, KeyInit, Mac};
@@ -11,7 +12,8 @@ use mdns_sd::{IfKind, ServiceDaemon, ServiceEvent, ServiceInfo};
 use serde::{Deserialize, Serialize};
 use sha2::Sha256;
 use spake2::{Ed25519Group, Identity, Password, Spake2};
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
+use std::fmt::Write as _;
 use std::io::{self, Read, Write};
 use std::net::{IpAddr, Ipv4Addr, Shutdown, SocketAddr, TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
@@ -38,6 +40,10 @@ const NO_IPV6: &str = "IPv6 addresses aren't supported yet — use the computer'
 // auto-reconnect backoff (MASTER.md §3.9); short under test
 const RETRY_FIRST: Duration = Duration::from_millis(if cfg!(test) { 100 } else { 2000 });
 const RETRY_MAX: Duration = Duration::from_millis(if cfg!(test) { 400 } else { 30_000 });
+const QUALITY_WINDOW: usize = 30; // seconds of receive reports that `Quality` covers
+const QUALITY_LOG: Duration = Duration::from_secs(30);
+// a long `Text` reply goes in pieces: even fully JSON-escaped (6x) one fits a 64 KB frame
+const TEXT_CHUNK: usize = 8000;
 
 #[derive(Serialize, Deserialize)]
 pub struct NodeState {
@@ -55,6 +61,27 @@ pub struct NodeState {
     pub error: Option<String>,
     /// Why the virtual devices couldn't be created (Linux), if they couldn't.
     pub virtual_error: Option<String>,
+    /// How well audio is arriving over the last ~30 s (None when not streaming).
+    pub quality: Option<Quality>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct Quality {
+    /// "good", "fair" or "poor"
+    pub grade: String,
+    /// What's wrong, in plain words ("" when good).
+    pub hint: String,
+    pub loss_pct: f32,
+    pub underruns: u64,
+}
+
+/// One setup check (see `Node::checks`).
+#[derive(Serialize, Deserialize)]
+pub struct Check {
+    pub ok: bool,
+    pub title: String,
+    /// What to do about it, when not ok.
+    pub fix: Option<String>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -157,6 +184,10 @@ enum Msg {
     /// This side's own Music Mode setting, sent after the session starts and on every change
     /// (MASTER.md §3.7). Old peers never send it (= off) and ignore it.
     Mode { music: bool },
+    /// Manage request: the diagnostics text (`Node::diagnostics`), answered with `Text`.
+    Diagnostics { redact: bool },
+    /// A long text, in pieces: `more` on all but the last (see `send_text`).
+    Text { text: String, #[serde(default)] more: bool },
 }
 
 struct Found {
@@ -172,6 +203,7 @@ struct Session {
     ctl: Arc<Ctl>,
     peer_music: bool, // the peer's last `Mode`
     mine: bool,       // this node dialed it (only the initiator auto-reconnects)
+    recent: VecDeque<[u64; 3]>, // per-second (received, lost, underruns) of our Link, newest last
 }
 
 /// How a session's control loop ended.
@@ -217,6 +249,7 @@ impl Node {
     pub fn start(config_dir: Option<PathBuf>, port: u16, mdns: bool) -> Result<Node> {
         crate::pin_audio_host();
         let dir = config_dir_or_default(config_dir)?;
+        crate::log::init(Some(dir.clone()), "capralinkd");
         let cfg = load(&dir)?;
         let listener = TcpListener::bind(("0.0.0.0", port)).with_context(|| format!("port {port} is in use (is CapraLink already running?)"))?;
         let port = listener.local_addr()?.port();
@@ -241,6 +274,7 @@ impl Node {
                 }
             })?;
         }
+        log(&format!("CapraLink {} started on {} {}, port {port}", env!("CARGO_PKG_VERSION"), std::env::consts::OS, std::env::consts::ARCH));
         let n = node.clone();
         std::thread::Builder::new().name("capralink-ctl".into()).spawn(move || n.accept(listener))?;
         {
@@ -316,17 +350,102 @@ impl Node {
             }
         }
         devices.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()).then(a.id.cmp(&b.id)));
+        let stats = st.session.as_ref().and_then(|s| s.link.as_ref()).map(Link::stats);
         NodeState {
             name: st.cfg.name.clone(),
             pin: st.pin.clone(),
             pairing_secs: secs_left(st.pairing_until),
             pairing_locked_secs: secs_left(st.locked_until),
             devices,
-            stats: st.session.as_ref().and_then(|s| s.link.as_ref()).map(Link::stats),
+            quality: st.session.as_ref().zip(stats.as_ref()).map(|(s, x)| quality(s, x)),
+            stats,
             settings: st.cfg.settings.clone(),
             current: st.cfg.current.clone(),
             error: st.error.clone(),
             virtual_error: st.vdev.error.clone(),
+        }
+    }
+
+    pub fn settings(&self) -> Settings {
+        self.st().cfg.settings.clone()
+    }
+
+    /// Setup checks, run on demand: engine, virtual devices, Windows network/speaker, peers seen.
+    pub fn checks(&self) -> Vec<Check> {
+        let check = |ok: bool, title: String, fix: Option<String>| Check { ok, title, fix: fix.filter(|_| !ok) };
+        let has = |list: Vec<String>, n: &str| list.iter().any(|d| d == n);
+        let mut v = vec![check(true, format!("CapraLink is running (port {})", self.0.port), None)];
+        if cfg!(windows) {
+            let ok = has(crate::output_devices(), VIRTUAL_INPUT);
+            let title = if ok { "CapraLink Input is ready (VB-Cable)" } else { "CapraLink Input is missing: VB-Cable isn't installed" };
+            v.push(check(ok, title.into(), Some("Install VB-Cable (free) from vb-audio.com/Cable for a CapraLink microphone".into())));
+        } else {
+            let ok = has(crate::input_devices(), VIRTUAL_OUTPUT) && has(crate::output_devices(), VIRTUAL_INPUT);
+            let title = if ok { "CapraLink Input and Output are ready" } else { "CapraLink Input and Output are missing" };
+            let fix = if cfg!(target_os = "macos") { "Reinstall CapraLink to add its audio devices".into() } else { self.st().vdev.error.clone().unwrap_or_else(|| "Restart CapraLink to add its audio devices".into()) };
+            v.push(check(ok, title.into(), Some(fix)));
+        }
+        #[cfg(windows)]
+        {
+            let mut c = crate::system_command("powershell");
+            c.args(["-NoProfile", "-Command", "(Get-NetConnectionProfile).NetworkCategory"]).stdin(std::process::Stdio::null());
+            std::os::windows::process::CommandExt::creation_flags(&mut c, 0x0800_0000); // CREATE_NO_WINDOW
+            let public = c.output().is_ok_and(|o| String::from_utf8_lossy(&o.stdout).contains("Public"));
+            let title = if public { "This network is set to Public" } else { "This network is Private" };
+            v.push(check(!public, title.into(), Some("Set this network to Private in Settings → Network & internet, or Windows Firewall blocks other computers".into())));
+            let cable = crate::default_output_name().is_some_and(|n| n.contains("CABLE Input"));
+            let title = if cable { "VB-Cable is the default speaker" } else { "The default speaker isn't VB-Cable" };
+            v.push(check(!cable, title.into(), Some("Windows sends all sound into VB-Cable: set your speakers or headset as the default output again in Sound settings".into())));
+        }
+        let st = self.st();
+        for p in &st.cfg.peers {
+            let ok = st.found.contains_key(&p.id) || st.session.as_ref().is_some_and(|s| s.peer_id == p.id);
+            let title = if ok { format!("{} is on the network", p.name) } else { format!("{} hasn't been seen on the network", p.name) };
+            v.push(check(ok, title, Some("If it's on, check it's on the same network, or use Edit address with its IP. On Windows, set the network to Private.".into())));
+        }
+        v
+    }
+
+    /// A support report: version, system, settings, devices, connection, setup checks and the
+    /// recent log. `redact` swaps names and IPv4 addresses for placeholders (see `redactions`).
+    pub fn diagnostics(&self, redact: bool) -> String {
+        let (ins, outs, checks) = (crate::input_devices(), crate::output_devices(), self.checks());
+        let mut t = String::new();
+        let st = self.st();
+        let _ = writeln!(t, "CapraLink {} diagnostics, {}", env!("CARGO_PKG_VERSION"), crate::log::now());
+        let _ = writeln!(t, "System: {} {}\nThis computer: {}", std::env::consts::OS, std::env::consts::ARCH, st.cfg.name);
+        let _ = writeln!(t, "\n== Settings ==\n{:#?}", st.cfg.settings);
+        let _ = writeln!(t, "\n== Audio devices ==\nSend from: {}\nPlay to: {}", ins.join(" | "), outs.join(" | "));
+        let _ = writeln!(t, "\n== Paired devices ==");
+        let conn = st.session.as_ref().map(|s| s.peer_id.as_str());
+        for p in &st.cfg.peers {
+            let online = if st.found.contains_key(&p.id) || conn == Some(&p.id) { "online" } else { "offline" };
+            let _ = writeln!(t, "{} [{}] last address {}, {online}{}", p.name, short(&p.id), p.addr.as_deref().unwrap_or("none"), if conn == Some(&p.id) { ", connected" } else { "" });
+        }
+        let _ = writeln!(t, "\n== Connection ==");
+        match st.session.as_ref().and_then(|s| Some((s, s.link.as_ref()?.peek()))) {
+            Some((s, x)) => drop(writeln!(t, "{x:?}\n{:?}", quality(s, &x))),
+            None => t.push_str("Not streaming\n"),
+        }
+        let _ = writeln!(t, "\n== Setup checks ==");
+        for c in &checks {
+            let _ = writeln!(t, "[{}] {}{}", if c.ok { "ok" } else { "!!" }, c.title, c.fix.as_ref().map_or(String::new(), |f| format!(" — {f}")));
+        }
+        let _ = writeln!(t, "\n== Log ==\n{}", log_tail(&self.0.dir, 2000));
+        if !redact {
+            return t;
+        }
+        let devices: Vec<String> = st.cfg.peers.iter().map(|p| p.name.clone()).chain(st.found.values().map(|f| f.name.clone())).collect();
+        let saved = st.cfg.peers.iter().filter_map(|p| p.audio.as_ref()).flat_map(|a| [a.input.clone(), a.output.clone()]);
+        let audio: Vec<String> = ins.into_iter().chain(outs).chain([st.cfg.settings.input.clone(), st.cfg.settings.output.clone()].into_iter().chain(saved).flatten()).collect();
+        redact_text(&t, &redactions(&st.cfg.name, &devices, &audio))
+    }
+
+    /// Paired device `id`'s diagnostics (it must allow remote configuration).
+    pub fn remote_diagnostics(&self, id: &str, redact: bool) -> Result<String> {
+        match self.manage(id, &Msg::Diagnostics { redact })? {
+            Msg::Text { text, .. } => Ok(text),
+            _ => bail!("unexpected reply"),
         }
     }
 
@@ -371,6 +490,14 @@ impl Node {
 
     /// Pairs with the node at the first of `addrs` that answers, using its PIN; returns the peer's device id.
     pub fn pair_addr(&self, addrs: &[SocketAddr], pin: &str) -> Result<String> {
+        let r = self.pair_at(addrs, pin);
+        if let Err(e) = &r {
+            log(&format!("pairing failed: {e:#}"));
+        }
+        r
+    }
+
+    fn pair_at(&self, addrs: &[SocketAddr], pin: &str) -> Result<String> {
         let pin = pin.trim();
         ensure!(pin.len() == 6 && pin.bytes().all(|b| b.is_ascii_digit()), "the PIN is 6 digits");
         let (my_id, my_name) = {
@@ -391,6 +518,7 @@ impl Node {
         add_peer(&mut st.cfg, &id, &name, &secret, Some(addr));
         save(&self.0.dir, &st.cfg)?;
         st.error = None;
+        log(&format!("paired with {name} [{}]", short(&id)));
         Ok(id)
     }
 
@@ -409,6 +537,7 @@ impl Node {
         let locked = secs_left(st.locked_until);
         ensure!(locked == 0, "pairing is locked for {locked} more seconds after a wrong PIN");
         st.pairing_until = Some(Instant::now() + PAIR_WINDOW);
+        log("pairing window opened");
         Ok(())
     }
 
@@ -635,7 +764,14 @@ impl Node {
         ctl.send(&Msg::Manage)?;
         ctl.send(req)?;
         s.set_read_timeout(Some(LINK_TIMEOUT + IO_TIMEOUT))?; // new audio settings may restart its link
-        let reply = ctl.recv();
+        let mut text = String::new();
+        let reply = loop {
+            match ctl.recv() {
+                Ok(Some(Msg::Text { text: t, more: true })) => text.push_str(&t),
+                Ok(Some(Msg::Text { text: t, .. })) => break Ok(Some(Msg::Text { text: text + &t, more: false })),
+                r => break r,
+            }
+        };
         ctl.close();
         match reply? {
             Some(Msg::Error { message }) => bail!("{message}"),
@@ -664,13 +800,15 @@ impl Node {
         let link = match start_link(&st.cfg.settings, self.0.port, addr, keys) {
             Ok(l) => l,
             Err(e) => {
+                log(&format!("can't start audio with {}: {e:#}", peer_name(&st.cfg, id)));
                 drop(st);
                 ctl.close();
                 return Err(e);
             }
         };
         self.cancel_retry(&mut st);
-        st.session = Some(Session { peer_id: id.to_string(), addr, link, ctl: ctl.clone(), peer_music: false, mine: own.is_some() });
+        st.session = Some(Session { peer_id: id.to_string(), addr, link, ctl: ctl.clone(), peer_music: false, mine: own.is_some(), recent: VecDeque::new() });
+        log(&format!("session started with {} at {addr}, {}", peer_name(&st.cfg, id), if own.is_some() { "dialed from here" } else { "dialed by the other computer" }));
         st.error = None;
         set_addr(&mut st.cfg, id, addr.to_string());
         st.cfg.last_peer = own.map(|_| id.to_string());
@@ -679,19 +817,19 @@ impl Node {
         }
         apply_mode(&st);
         drop(st);
-        let n = self.clone();
-        std::thread::Builder::new().name("capralink-session".into()).spawn(move || n.serve(ctl))?;
+        let (n, id) = (self.clone(), id.to_string());
+        std::thread::Builder::new().name("capralink-session".into()).spawn(move || n.serve(ctl, &id))?;
         Ok(())
     }
 
     /// Session control loop: exchanges 1 s reports (which double as keepalive), steers this
     /// node's own sender from the peer's reports, and tears the session down on stop / close /
     /// silence.
-    fn serve(&self, ctl: Arc<Ctl>) {
+    fn serve(&self, ctl: Arc<Ctl>, peer: &str) {
         let _ = ctl.stream.set_read_timeout(Some(Duration::from_secs(1)));
         let mut rate = RateControl::new(ceiling(self.st().cfg.settings.bitrate, false));
         let mut last_counts = (0u64, 0u64, 0u64);
-        let (mut last_rx, mut last_report) = (Instant::now(), Instant::now());
+        let (mut last_rx, mut last_report, mut last_log) = (Instant::now(), Instant::now(), Instant::now());
         let end = loop {
             match ctl.recv() {
                 Ok(Some(Msg::Stop)) => break End::Stop,
@@ -734,12 +872,25 @@ impl Node {
                 if ctl.send(&m).is_err() {
                     break End::Lost;
                 }
+                if last_log.elapsed() >= QUALITY_LOG {
+                    last_log = Instant::now();
+                    self.log_quality(&ctl);
+                }
             }
         };
         // no `stop`: after a loss the peer should treat it as a loss too (and may reconnect)
         let _ = ctl.stream.shutdown(Shutdown::Both);
         let mut st = self.st();
-        if !st.session.as_ref().is_some_and(|s| Arc::ptr_eq(&s.ctl, &ctl)) {
+        let current = st.session.as_ref().is_some_and(|s| Arc::ptr_eq(&s.ctl, &ctl));
+        let why = match &end {
+            _ if !current => "ended on this computer",
+            End::Stop => "stopped by the other computer",
+            End::Dead => "no reply from the other computer for 15 s",
+            End::Lost => "connection lost",
+            End::Device(f) => f,
+        };
+        log(&format!("session with {} ended: {why}", peer_name(&st.cfg, peer)));
+        if !current {
             return; // ended here (disconnect, replaced, shutdown): nothing to do
         }
         let Some(s) = st.session.take() else { return };
@@ -753,10 +904,7 @@ impl Node {
                 }
             }
             _ if s.mine && st.cfg.settings.auto_reconnect && st.cfg.last_peer.as_deref() == Some(&s.peer_id) => self.start_retry(&mut st, s.peer_id),
-            End::Dead => {
-                let name = st.cfg.peers.iter().find(|p| p.id == s.peer_id).map(|p| p.name.clone());
-                st.error = Some(format!("lost connection to {}", name.unwrap_or_default()));
-            }
+            End::Dead => st.error = Some(format!("lost connection to {}", peer_name(&st.cfg, &s.peer_id))),
             End::Lost => {}
         }
     }
@@ -768,13 +916,30 @@ impl Node {
 
     /// This session's own receive-side counters, as deltas since `last` (updated in place).
     /// `None` if the session moved on (or has no Link, e.g. under test).
+    /// Also keeps the last `QUALITY_WINDOW` deltas for `Quality`.
     fn link_delta(&self, ctl: &Arc<Ctl>, last: &mut (u64, u64, u64)) -> Option<(u64, u64, u64, f32)> {
-        let st = self.st();
-        let link = st.session.as_ref().filter(|s| Arc::ptr_eq(&s.ctl, ctl))?.link.as_ref()?;
-        let (r, l, u, jitter_ms) = link.report_counters();
+        let mut st = self.st();
+        let s = st.session.as_mut().filter(|s| Arc::ptr_eq(&s.ctl, ctl))?;
+        let (r, l, u, jitter_ms) = s.link.as_ref()?.report_counters();
         let delta = (r.saturating_sub(last.0), l.saturating_sub(last.1), u.saturating_sub(last.2));
         *last = (r, l, u);
+        s.recent.push_back([delta.0, delta.1, delta.2]);
+        if s.recent.len() > QUALITY_WINDOW {
+            s.recent.pop_front();
+        }
         Some((delta.0, delta.1, delta.2, jitter_ms))
+    }
+
+    /// One log line on how this session's audio is doing.
+    fn log_quality(&self, ctl: &Arc<Ctl>) {
+        let st = self.st();
+        let Some((s, link)) = st.session.as_ref().filter(|s| Arc::ptr_eq(&s.ctl, ctl)).and_then(|s| Some((s, s.link.as_ref()?))) else { return };
+        let (x, jitter_ms) = (link.peek(), link.report_counters().3);
+        let q = quality(s, &x);
+        log(&format!(
+            "quality {}: loss {:.1}%, underruns {}, buffer {:.0}/{:.0} ms, jitter {jitter_ms:.0} ms, {} kbps, complexity {}",
+            q.grade, q.loss_pct, q.underruns, x.buffer_ms, x.target_ms, x.bitrate / 1000, x.complexity
+        ));
     }
 
     /// Applies a new bitrate/loss% to this session's own sender, if it's still the current one.
@@ -842,6 +1007,7 @@ impl Node {
     /// A wrong PIN rotates the PIN and locks pairing (`LOCK_FIRST`, doubling, up to `LOCK_MAX`).
     fn on_pair(&self, mut s: TcpStream, id: &str, name: &str, port: Option<u16>) -> Result<()> {
         check_id(id)?;
+        let name = &clean_name(name); // also keeps the log one line per entry
         let addr = match port {
             Some(p) => Some(SocketAddr::new(s.peer_addr()?.ip(), p).to_string()),
             None => None,
@@ -863,6 +1029,7 @@ impl Node {
             (st.cfg.device_id.clone(), name.clone(), st.pin.clone(), refused)
         };
         if let Some(message) = refused {
+            log(&format!("pairing attempt from {name} refused: {message}"));
             send_msg(&mut s, &Msg::Error { message: message.clone() })?;
             bail!("{message}");
         }
@@ -871,6 +1038,7 @@ impl Node {
         let mut st = self.st();
         match r {
             Ok(secret) => {
+                log(&format!("paired with {name} [{}] (it entered this computer's PIN)", short(id)));
                 add_peer(&mut st.cfg, id, name, &secret, addr);
                 (st.pin, st.failures, st.error, st.pairing_until, st.locked_until) = (new_pin(), 0, None, None, None);
                 save(&self.0.dir, &st.cfg)
@@ -879,6 +1047,7 @@ impl Node {
                 st.failures += 1;
                 let lock = LOCK_FIRST.saturating_mul(1 << (st.failures - 1).min(16)).min(LOCK_MAX);
                 (st.pin, st.locked_until) = (new_pin(), Some(Instant::now() + lock));
+                log(&format!("wrong PIN from {name}: pairing locked for {} s", lock.as_secs_f32().ceil()));
                 Err(e.context("pairing failed (wrong PIN?)"))
             }
         }
@@ -913,11 +1082,17 @@ impl Node {
             let theirs = st.cfg.peers.iter().find(|p| p.id == id).and_then(|p| p.audio.clone()).filter(|_| st.cfg.current.as_deref() != Some(id));
             (st.cfg.name.clone(), st.cfg.settings.clone(), theirs)
         };
+        let peer = peer_name(&self.st().cfg, id);
         let reply = match req {
             _ if !local.remote_config => Msg::Error { message: format!("remote configuration is off on {name}") },
+            Some(Msg::Diagnostics { redact }) => {
+                log(&format!("sending diagnostics to {peer}"));
+                Msg::Text { text: self.diagnostics(redact), more: false }
+            }
             Some(Msg::GetConfig) => Msg::Config(RemoteConfig { name, settings: match theirs { Some(a) => a.apply(local), None => local }, inputs: crate::input_devices(), outputs: crate::output_devices() }),
             // `service` and `remote_config` only change locally
             Some(Msg::SetSettings { settings, name: new_name }) => {
+                log(&format!("{peer} changed this computer's settings{}", if new_name.is_some() { " and name" } else { "" }));
                 let r = match new_name {
                     Some(n) => self.set_name(&n),
                     None => Ok(()),
@@ -943,7 +1118,10 @@ impl Node {
             }
             _ => Msg::Error { message: "unsupported request".into() },
         };
-        let r = ctl.send(&reply);
+        let r = match reply {
+            Msg::Text { text, .. } => send_text(ctl, &text),
+            m => ctl.send(&m),
+        };
         ctl.close();
         r
     }
@@ -968,10 +1146,22 @@ impl Node {
                         let _ = save(&self.0.dir, &st.cfg);
                     }
                 }
-                let found = Found { name: clean, addrs, fullname: info.get_fullname().to_string() };
-                st.found.insert(id.to_string(), found);
+                let paired = st.cfg.peers.iter().any(|p| p.id == id);
+                let found = Found { name: clean.clone(), addrs, fullname: info.get_fullname().to_string() };
+                if st.found.insert(id.to_string(), found).is_none() && paired {
+                    log(&format!("{clean} [{}] appeared on the network", short(id)));
+                }
             }
-            ServiceEvent::ServiceRemoved(_, fullname) => st.found.retain(|_, f| f.fullname != fullname),
+            ServiceEvent::ServiceRemoved(_, fullname) => {
+                let st = &mut *st;
+                st.found.retain(|id, f| {
+                    let gone = f.fullname == fullname;
+                    if gone && st.cfg.peers.iter().any(|p| p.id == *id) {
+                        log(&format!("{} [{}] left the network", f.name, short(id)));
+                    }
+                    !gone
+                });
+            }
             _ => {}
         }
     }
@@ -987,6 +1177,120 @@ fn apply_mode(st: &St) {
     if let Some(link) = st.session.as_ref().and_then(|s| s.link.as_ref()) {
         link.set_music(music(st));
     }
+}
+
+/// A session's audio quality over its last `QUALITY_WINDOW` reports, from its live stats.
+fn quality(s: &Session, x: &Stats) -> Quality {
+    let [r, l, u] = s.recent.iter().fold([0; 3], |a, d| [a[0] + d[0], a[1] + d[1], a[2] + d[2]]);
+    let normal_ms = if x.music { MUSIC_TARGET } else { TARGET } as f32 * 1000.0 / RATE as f32;
+    grade(r, l, u, x.target_ms - normal_ms)
+}
+
+/// Grades received/lost packets and underruns; `added_ms` = playout buffer above normal.
+fn grade(received: u64, lost: u64, underruns: u64, added_ms: f32) -> Quality {
+    let loss_pct = if received + lost == 0 { 0.0 } else { lost as f32 * 100.0 / (received + lost) as f32 };
+    let grade = if loss_pct < 1.0 && underruns == 0 {
+        "good"
+    } else if loss_pct < 5.0 && underruns <= 2 {
+        "fair"
+    } else {
+        "poor"
+    };
+    let hint = match grade {
+        "good" => String::new(),
+        _ if loss_pct >= 1.0 => format!("Wi-Fi is dropping packets ({loss_pct:.0}% in the last 30 s) — Ethernet or 5 GHz Wi-Fi helps"),
+        _ => format!("Network delay spikes — CapraLink added {:.0} ms of buffer to cover them", added_ms.max(0.0)),
+    };
+    Quality { grade: grade.into(), hint, loss_pct, underruns }
+}
+
+/// A peer's name for messages and the log, else its id prefix.
+fn peer_name(cfg: &Config, id: &str) -> String {
+    cfg.peers.iter().find(|p| p.id == id).map_or_else(|| format!("[{}]", short(id)), |p| p.name.clone())
+}
+
+/// The id prefix the log and diagnostics show.
+fn short(id: &str) -> &str {
+    id.get(..8).unwrap_or(id)
+}
+
+/// Sends a long text in pieces that fit a frame (`more` on all but the last).
+fn send_text(ctl: &Ctl, text: &str) -> Result<()> {
+    let mut rest = text;
+    loop {
+        let mut i = rest.len().min(TEXT_CHUNK);
+        while !rest.is_char_boundary(i) {
+            i -= 1;
+        }
+        ctl.send(&Msg::Text { text: rest[..i].into(), more: i < rest.len() })?;
+        rest = &rest[i..];
+        if rest.is_empty() {
+            return Ok(());
+        }
+    }
+}
+
+/// The last `n` lines of the log (the rotated file, then the current one).
+fn log_tail(dir: &Path, n: usize) -> String {
+    let all: String = [crate::log::OLD, crate::log::FILE].iter().filter_map(|f| std::fs::read(dir.join(f)).ok()).map(|b| String::from_utf8_lossy(&b).into_owned()).collect();
+    let lines: Vec<&str> = all.lines().collect();
+    lines[lines.len().saturating_sub(n)..].join("\n")
+}
+
+/// Placeholders for diagnostics: this computer, other computers ("Device A"...) and audio devices
+/// ("Audio device 1"...), keeping CapraLink's own fixed names. Longest first, so a name inside
+/// another ("Mic" in "USB Mic") can't split it.
+// ponytail: plain substring match, so a very short name (say "A") also hides that text in log
+// lines; match on word boundaries if that ever makes reports unreadable.
+fn redactions(me: &str, devices: &[String], audio: &[String]) -> Vec<(String, String)> {
+    let fixed = [VIRTUAL_INPUT, VIRTUAL_OUTPUT, EVERYTHING, NO_DEVICE, "System default"];
+    let mut map = vec![(me.to_string(), "This computer".to_string())];
+    let mut add = |names: &[String], label: &dyn Fn(usize) -> String| {
+        let mut i = 0;
+        for n in names {
+            if !n.is_empty() && !fixed.contains(&n.as_str()) && !map.iter().any(|(k, _)| k == n) {
+                map.push((n.clone(), label(i)));
+                i += 1;
+            }
+        }
+    };
+    add(devices, &|i| if i < 26 { format!("Device {}", (b'A' + i as u8) as char) } else { format!("Device {}", i + 1) });
+    add(audio, &|i| format!("Audio device {}", i + 1));
+    map.retain(|(k, _)| !k.is_empty());
+    map.sort_by_key(|(k, _)| std::cmp::Reverse(k.len()));
+    map
+}
+
+/// Applies `redactions` in one pass, and replaces each IPv4 address with `<ip-N>` (the same
+/// address always gets the same N).
+fn redact_text(text: &str, map: &[(String, String)]) -> String {
+    let (mut out, mut ips, mut rest, mut prev) = (String::new(), Vec::<&str>::new(), text, ' ');
+    'next: while let Some(c) = rest.chars().next() {
+        for (from, to) in map {
+            if rest.starts_with(from.as_str()) {
+                out.push_str(to);
+                rest = &rest[from.len()..];
+                prev = ' ';
+                continue 'next;
+            }
+        }
+        if c.is_ascii_digit() && !(prev.is_ascii_digit() || prev == '.') {
+            let run = rest.find(|c: char| !(c.is_ascii_digit() || c == '.')).unwrap_or(rest.len());
+            let ip = rest[..run].trim_end_matches('.');
+            if ip.parse::<Ipv4Addr>().is_ok() {
+                let n = ips.iter().position(|a| *a == ip).unwrap_or_else(|| {
+                    ips.push(ip);
+                    ips.len() - 1
+                });
+                let _ = write!(out, "<ip-{}>", n + 1);
+                (rest, prev) = (&rest[ip.len()..], '>');
+                continue;
+            }
+        }
+        out.push(c);
+        (rest, prev) = (&rest[c.len_utf8()..], c);
+    }
+    out
 }
 
 /// In tests there are no audio devices: the session runs without a Link.
@@ -1588,6 +1892,65 @@ mod tests {
         wait(|| is(&a2, |d| d.connected) && is(&b, |d| d.connected));
         let _ = std::fs::remove_dir_all(adir);
         let _ = std::fs::remove_dir_all(bdir);
+    }
+
+    #[test]
+    fn remote_diagnostics() {
+        let ((a, adir), (b, bdir)) = (node(), node());
+        b.open_pairing().unwrap();
+        a.pair_ip(&format!("127.0.0.1:{}", b.port()), &b.state().pin).unwrap();
+        wait(|| peers(&bdir).len() == 1);
+        let bid = peers(&adir)[0].id.clone();
+        let checks = a.checks();
+        assert!(checks[0].ok && checks[0].fix.is_none());
+        let seen = checks.iter().find(|c| c.title.contains(&b.state().name)).unwrap();
+        assert!(!seen.ok && seen.title.contains("hasn't been seen") && seen.fix.is_some(), "no mDNS here: b was never seen");
+
+        let err = a.remote_diagnostics(&bid, true).unwrap_err().to_string();
+        assert!(err.contains("remote configuration is off"), "{err}");
+        b.set_settings(Settings { remote_config: true, ..b.state().settings }).unwrap();
+        // a long log (multi-byte text) comes over in several pieces
+        let log: String = (0..400).map(|i| format!("{i} {}\n", "é".repeat(60))).collect();
+        std::fs::write(bdir.join(crate::log::OLD), format!("{log}last line from 10.1.2.3\n")).unwrap();
+        let t = a.remote_diagnostics(&bid, true).unwrap();
+        assert!(t.len() > 3 * TEXT_CHUNK && t.contains(&log) && t.contains("last line from <ip-"), "{}", &t[..500]);
+        assert!(t.contains("This computer: This computer") && !t.contains(&b.state().name), "redacted on b's side");
+        assert!(a.remote_diagnostics(&bid, false).unwrap().contains(&format!("This computer: {}", b.state().name)));
+        let mine = a.diagnostics(false);
+        assert!(mine.contains("== Setup checks ==") && mine.contains(&format!("[{}]", &bid[..8])) && !mine.contains(&bid), "ids only as prefixes");
+        let _ = std::fs::remove_dir_all(adir);
+        let _ = std::fs::remove_dir_all(bdir);
+    }
+
+    #[test]
+    fn quality_grades() {
+        let q = |r, l, u, added| {
+            let q = grade(r, l, u, added);
+            (q.grade, q.hint)
+        };
+        assert_eq!(q(0, 0, 0, 0.0), ("good".into(), String::new()));
+        assert_eq!(q(3000, 20, 0, 5.0).0, "good");
+        assert_eq!(q(3000, 60, 0, 0.0), ("fair".into(), "Wi-Fi is dropping packets (2% in the last 30 s) — Ethernet or 5 GHz Wi-Fi helps".into()));
+        assert_eq!(q(3000, 0, 2, 30.4), ("fair".into(), "Network delay spikes — CapraLink added 30 ms of buffer to cover them".into()));
+        assert_eq!(q(3000, 0, 3, 40.0).0, "poor");
+        assert_eq!(q(1000, 100, 0, 0.0).0, "poor");
+        assert_eq!(grade(900, 100, 1, 0.0).loss_pct, 10.0);
+    }
+
+    #[test]
+    fn redaction() {
+        let map = redactions(
+            "Brian's Mac",
+            &["Studio PC".into(), "Deck".into(), "Studio PC".into()],
+            &["Mic".into(), "MacBook Pro Microphone".into(), VIRTUAL_INPUT.into(), VIRTUAL_OUTPUT.into(), EVERYTHING.into(), NO_DEVICE.into(), "Mic".into()],
+        );
+        let t = "Brian's Mac paired with Studio PC at 192.168.1.5:47800; Deck at 10.0.0.2, Studio PC again at 192.168.1.5.\n\
+                 Send from MacBook Pro Microphone, Mic, CapraLink Input, CapraLink Output, Everything this PC plays, none. v0.1.0 1.2.3.4.5";
+        assert_eq!(
+            redact_text(t, &map),
+            "This computer paired with Device A at <ip-1>:47800; Device B at <ip-2>, Device A again at <ip-1>.\n\
+             Send from Audio device 2, Audio device 1, CapraLink Input, CapraLink Output, Everything this PC plays, none. v0.1.0 1.2.3.4.5"
+        );
     }
 
     #[test]
