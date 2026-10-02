@@ -903,6 +903,7 @@ impl Node {
         let mut rate = RateControl::new(ceiling(self.st().cfg.settings.bitrate, false));
         let mut last_counts = (0u64, 0u64, 0u64);
         let (mut last_rx, mut last_report, mut last_log) = (Instant::now(), Instant::now(), Instant::now());
+        let mut rebuilding = false; // a reconnect for `Failure::Rebuild` is under way
         let end = loop {
             match ctl.recv() {
                 Ok(Some(Msg::Stop)) => break End::Stop,
@@ -938,7 +939,26 @@ impl Node {
             }
             if last_report.elapsed() >= REPORT {
                 last_report = Instant::now();
-                let failure = self.st().session.as_ref().filter(|s| Arc::ptr_eq(&s.ctl, &ctl)).and_then(|s| s.link.as_ref()?.failure()).map(|(Failure::Rebuild(f) | Failure::End(f))| f);
+                let failure = self.st().session.as_ref().filter(|s| Arc::ptr_eq(&s.ctl, &ctl)).and_then(|s| Some((s.peer_id.clone(), s.link.as_ref()?.failure()?)));
+                let failure = match failure {
+                    // the stream must be rebuilt: reconnect (fresh keys, so packet numbers can restart);
+                    // the new session replaces this one, and this loop then ends quietly
+                    Some((id, Failure::Rebuild(f))) => {
+                        if !rebuilding {
+                            rebuilding = true;
+                            log(&format!("{f}: reconnecting to rebuild the audio"));
+                            let n = self.clone();
+                            std::thread::spawn(move || {
+                                if let Err(e) = n.connect(&id) {
+                                    n.st().error = Some(format!("{f}, and reconnecting failed: {e:#}"));
+                                }
+                            });
+                        }
+                        None
+                    }
+                    Some((_, Failure::End(f))) => Some(f),
+                    None => None,
+                };
                 if let Some(f) = failure {
                     // the peer shouldn't keep redialing a link that can't play: `stop` with a FIN, then
                     // wait (≤ 2 s) for its close, so the full shutdown below can't reset `stop` away
@@ -1023,8 +1043,8 @@ impl Node {
         let (x, jitter_ms) = (link.peek(), link.report_counters().3);
         let q = quality(s, &x);
         log(&format!(
-            "quality {}: loss {:.1}%, underruns {}, buffer {:.0}/{:.0} ms, jitter {jitter_ms:.0} ms, {} kbps, complexity {}",
-            q.grade, q.loss_pct, q.underruns, x.buffer_ms, x.target_ms, x.bitrate / 1000, x.complexity
+            "quality {}: loss {:.1}%, underruns {}, buffer {:.0}/{:.0} ms, jitter {jitter_ms:.0} ms, {} kbps, complexity {}, slowest capture callback {} µs, sends dropped {}",
+            q.grade, q.loss_pct, q.underruns, x.buffer_ms, x.target_ms, x.bitrate / 1000, x.complexity, x.callback_max_us, x.send_dropped
         ));
     }
 
@@ -1191,6 +1211,8 @@ impl Node {
                 // validated before anything is renamed or stored for a peer that isn't connected
                 let r = match new_name {
                     _ if !matches!(settings.channels, 1 | 2) => Err(anyhow!("channels must be 1 or 2")),
+                    // checked again right before renaming: it may have been turned off since the request arrived
+                    Some(_) if !self.st().cfg.settings.remote_config => Err(anyhow!("remote configuration is off")),
                     Some(n) => self.set_name(&n),
                     None => Ok(()),
                 }
