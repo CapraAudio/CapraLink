@@ -239,8 +239,10 @@ pub const MUSIC_TARGET: usize = 15 * TARGET; // ... 150 ms in Music Mode (covers
 const MARGIN: usize = RATE as usize / 200; // 5 ms on top of measured jitter
 const HEADROOM: usize = RATE as usize / 10; // fill beyond need + target + 100 ms is discarded
 // Music Mode never drops audio to shrink the buffer (an audible skip): the ≤ 0.5% speed-up drains it
-// instead (300 ms in about a minute). Only fill that wouldn't fit the 1.5 s playback ring is dropped.
-const MUSIC_HEADROOM: usize = RATE as usize * 2 / 5; // 400 ms over a target of up to 1 s
+// instead (300 ms in about a minute). Only fill that wouldn't fit the 1.5 s playback ring is dropped:
+// beyond 400 ms over the 1 s ceiling, not over the current target (a forgotten stall can shrink that
+// by ~0.85 s at once).
+const MUSIC_HEADROOM: usize = RATE as usize * 2 / 5;
 const GROW: usize = RATE as usize / 100; // +10 ms boost per underrun (spike jitter missed) ...
 const SHRINK: usize = RATE as usize / 1000; // ... fading 1 ms ...
 const RELAX: usize = RATE as usize; // ... per second of clean playback
@@ -279,6 +281,7 @@ pub struct Playout {
     grow: usize,
     max_adj: f32,
     headroom: usize,
+    drain: bool, // Music Mode: `headroom` counts from `max`, not from the target
     playing: bool,
     jitter: usize,
     boost: usize,
@@ -290,7 +293,7 @@ pub struct Playout {
 
 impl Default for Playout {
     fn default() -> Self {
-        Playout { min: TARGET, max: MAX_TARGET, grow: GROW, max_adj: MAX_ADJ, headroom: HEADROOM, playing: false, jitter: 0, boost: 0, clean: 0, low: usize::MAX, span: 0, adj: 0.0 }
+        Playout { min: TARGET, max: MAX_TARGET, grow: GROW, max_adj: MAX_ADJ, headroom: HEADROOM, drain: false, playing: false, jitter: 0, boost: 0, clean: 0, low: usize::MAX, span: 0, adj: 0.0 }
     }
 }
 
@@ -309,6 +312,7 @@ impl Playout {
         } else {
             (TARGET, MAX_TARGET, GROW, MAX_ADJ, HEADROOM)
         };
+        self.drain = music;
     }
 
     pub fn target(&self) -> usize {
@@ -319,7 +323,8 @@ impl Playout {
     pub fn plan(&mut self, fill: usize, need: usize) -> Plan {
         let target = self.target();
         let excess = fill.saturating_sub(need + target);
-        let discard = excess * (excess > self.headroom) as usize;
+        let keep = if self.drain { self.max } else { target } + self.headroom;
+        let discard = excess * (fill > need + keep) as usize;
         let fill = fill - discard;
         if !self.playing && fill < need + target {
             return Plan::Silence;
@@ -363,8 +368,9 @@ impl Jitter {
     /// `period_us`: the stream's packet period (10 ms, 20 ms in Music Mode).
     /// `window_us`: how long a stall is remembered (between 1× and 2× this).
     pub fn push(&mut self, gap_us: u32, period_us: u32, window_us: u32) -> u32 {
-        // a pause this long is a peer restart or a stopped stream, not jitter
-        if gap_us < 500_000 {
+        // a pause this long is a peer restart or a stopped stream, not jitter; shorter ones are
+        // stalls (Wi-Fi dropouts of ~0.7 s seen in the field), capped later by the target ceiling
+        if gap_us < 2_000_000 {
             self.cur = self.cur.max(gap_us.saturating_sub(period_us));
             self.elapsed += gap_us;
             if self.elapsed >= window_us {
@@ -461,11 +467,10 @@ impl Complexity {
     }
 }
 
-/// Streaming linear resampler for interleaved audio, state carried across calls. Sources above
-/// 48 kHz first go through a Blackman-windowed sinc low-pass (~74 dB stopband), so nothing
-/// above 28 kHz folds back into the audible band.
-// ponytail: the FIR runs at the source rate (6 taps per 8 kHz of it: 73 at 96 kHz, 145 at
-// 192 kHz); compute it only at the output positions (polyphase) if that CPU ever matters.
+/// Streaming linear resampler for interleaved audio, state carried across calls. When lowering
+/// the rate would fold audio into the audible band (e.g. 96 kHz → 48 kHz, or 48 kHz playback on
+/// a 16 kHz headset), the input first goes through a Blackman-windowed sinc low-pass (~74 dB
+/// stopband), computed only at the input frames the interpolation reads.
 pub struct Resampler {
     pub step: f64, // input frames per output frame
     pos: f64,      // read position; 0 = `prev`, 1.. = current chunk
@@ -477,10 +482,12 @@ pub struct Resampler {
 
 impl Resampler {
     pub fn new(from: u32, to: u32, channels: usize) -> Self {
-        // Opus keeps 0–20 kHz; an alias of f lands at 48k - f, so only f > 28 kHz must go:
-        // centre the transition (passband to 20 kHz, stopband from 28 kHz) on 24 kHz.
-        let taps = if from > RATE { (6 * from / 8_000) as usize | 1 } else { 0 };
-        let fc = 24_000.0 / from as f64;
+        // An alias of f lands at `to` - f. Needed only if the source's top (`from`/2) folds below
+        // 20 kHz (so not for 48 → 44.1 kHz). The transition is centred on `to`/2 and `to`/6 wide
+        // (into 48 kHz: passband to 20 kHz, stopband from 28 kHz); 6 taps per transition width
+        // of source rate: 73 at 96 → 48 kHz, 109 at 48 → 16 kHz.
+        let taps = if to < from && (to as i64) - (from as i64) / 2 < 20_000 { (36 * from / to) as usize | 1 } else { 0 };
+        let fc = to as f64 / 2.0 / from as f64;
         let m = taps.saturating_sub(1) as f64;
         let mut fir: Vec<f32> = (0..taps)
             .map(|i| {
@@ -512,10 +519,28 @@ impl Resampler {
         hist.resize((self.fir.len() - 1) * ch, 0.0); // zeros before the first chunk
         hist.extend_from_slice(&input[..n * ch]);
         y.clear();
-        for j in 0..n {
-            for c in 0..ch {
-                y.push(hist[j * ch + c..].iter().step_by(ch).zip(&self.fir).map(|(x, h)| x * h).sum());
+        y.resize(n * ch, 0.0);
+        // filter only the frames `linear` reads: each output's two neighbours, and the last frame
+        let mut done = None;
+        let mut fir_at = |j: usize, y: &mut Vec<f32>| {
+            if done < Some(j) {
+                for c in 0..ch {
+                    y[j * ch + c] = hist[j * ch + c..].iter().step_by(ch).zip(&self.fir).map(|(x, h)| x * h).sum();
+                }
+                done = Some(j);
             }
+        };
+        let mut pos = self.pos;
+        while pos < n as f64 {
+            let i = pos as usize;
+            if i > 0 {
+                fir_at(i - 1, &mut y);
+            }
+            fir_at(i, &mut y);
+            pos += self.step;
+        }
+        if n > 0 {
+            fir_at(n - 1, &mut y);
         }
         hist.drain(..n * ch);
         self.linear(&y, out);
@@ -651,9 +676,10 @@ mod tests {
     #[test]
     fn music_mode_drains_instead_of_skipping() {
         // the stall memory expires: the target falls to its minimum with the old target's worth
-        // buffered (Music Mode: ~450 → 150 ms; normal: ~120 → 10 ms, its ceiling is 125 ms)
+        // buffered (Music Mode: ~0.7 s → 150 ms after a Wi-Fi dropout; normal: ~120 → 10 ms, its
+        // ceiling is 125 ms)
         let need = 480;
-        for (music, high, skips) in [(true, RATE as usize * 450 / 1000, false), (false, RATE as usize * 120 / 1000, true)] {
+        for (music, high, skips) in [(true, RATE as usize * 700 / 1000, false), (false, RATE as usize * 120 / 1000, true)] {
             let mut p = Playout::default();
             p.set_music(music);
             p.set_jitter(high);
@@ -700,6 +726,8 @@ mod tests {
             j.push(20_000, 20_000, MUSIC_JITTER_WINDOW_US); // 120 s
         }
         assert_eq!(j.push(20_000, 20_000, MUSIC_JITTER_WINDOW_US), 130_000);
+        // a ~0.7 s Wi-Fi dropout is learned too (it sizes the target, up to the 1 s ceiling)
+        assert_eq!(Jitter::default().push(700_000, 20_000, MUSIC_JITTER_WINDOW_US), 680_000);
         // cushion far below target: Music Mode slows by at most 0.5% (pitch-safe)
         let mut m = Playout::default();
         m.set_music(true);
@@ -863,26 +891,30 @@ mod tests {
 
     #[test]
     fn resample_anti_alias() {
-        // level (dB re the input) of a 250 ms tone at `hz`, resampled from `from` to 48 kHz in 10 ms chunks
-        let level = |from: u32, hz: f64| {
-            let mut r = Resampler::new(from, RATE, 2);
+        // level (dB re the input) of a 250 ms tone at `hz`, resampled from `from` to `to` in 10 ms chunks
+        let level_to = |from: u32, to: u32, hz: f64| {
+            let mut r = Resampler::new(from, to, 2);
             let tone = |i: usize| 0.5 * (std::f64::consts::TAU * hz * i as f64 / from as f64).sin() as f32;
             let input: Vec<f32> = (0..from as usize / 4).flat_map(|i| [tone(i), tone(i)]).collect();
             let mut out = Vec::new();
             for chunk in input.chunks(2 * from as usize / 100) {
                 r.process(chunk, &mut out);
             }
-            assert!((out.len() as f64 / 2.0 - RATE as f64 / 4.0).abs() <= 1.0, "{from}: {} frames", out.len() / 2);
+            assert!((out.len() as f64 / 2.0 - to as f64 / 4.0).abs() <= 1.0, "{from}: {} frames", out.len() / 2);
             let left: Vec<f32> = out.iter().step_by(2).skip(480).copied().collect(); // past the filter's warm-up
             let rms = (left.iter().map(|s| s * s).sum::<f32>() / left.len() as f32).sqrt();
             20.0 * (rms / (0.5 / 2f32.sqrt())).log10()
         };
+        let level = |from, hz| level_to(from, RATE, hz);
         for from in [88_200, 96_000, 176_400, 192_000] {
             let (alias, pass) = (level(from, 30_000.0), level(from, 1_000.0));
             assert!(alias <= -60.0, "{from}: 30 kHz folds to {alias} dB");
             assert!(pass.abs() <= 0.5, "{from}: 1 kHz at {pass} dB");
         }
         assert!(level(48_000, 1_000.0).abs() < 1e-3, "48 kHz passes untouched");
+        // playback on a 16 kHz headset: 10 kHz would fold to 6 kHz
+        let (alias, pass) = (level_to(RATE, 16_000, 10_000.0), level_to(RATE, 16_000, 1_000.0));
+        assert!(alias <= -60.0 && pass.abs() <= 0.5, "48 → 16 kHz: alias {alias} dB, 1 kHz {pass} dB");
         assert!(Resampler::new(48_000, RATE, 2).fir.is_empty() && Resampler::new(RATE, 44_100, 2).fir.is_empty(), "no filter, no delay at ≤ 48 kHz");
     }
 }

@@ -145,8 +145,8 @@ fn forget(app: State<App>, id: String) -> Result<(), String> {
 }
 
 #[tauri::command(async)]
-fn set_settings(app: State<App>, settings: Settings) -> Result<(), String> {
-    app.run(|c| c.set_settings(&settings))
+fn patch_settings(app: State<App>, patch: serde_json::Value) -> Result<(), String> {
+    app.run(|c| c.patch_settings(patch))
 }
 
 #[tauri::command(async)]
@@ -199,7 +199,8 @@ fn export_diagnostics(window: tauri::WebviewWindow, app: State<App>, redact: boo
 /// Tray Quit: the engine goes too unless it is meant to run in the background. Never waits more
 /// than 2 s on the engine, so Quit works even if the engine is stuck.
 fn quit(app: &AppHandle) {
-    let client = app.state::<App>().client.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    // never waits on the lock either: it is held while the engine is (re)started
+    let client = app.state::<App>().client.try_lock().ok().and_then(|c| c.clone());
     if let Some(c) = client {
         let (done, finished) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
@@ -220,8 +221,8 @@ fn toggle_music(app: &AppHandle, item: CheckMenuItem<tauri::Wry>) {
     std::thread::spawn(move || {
         let a = app.state::<App>();
         let _ = a.run(|c| {
-            let s = c.state()?.settings;
-            c.set_settings(&Settings { music_mode: !s.music_mode, ..s })
+            let on = c.state()?.settings.music_mode;
+            c.patch_settings(serde_json::json!({ "music_mode": !on }))
         });
         if let Ok(st) = a.run(Client::state) {
             let _ = item.set_checked(st.settings.music_mode);
@@ -238,7 +239,8 @@ fn sync_music(app: AppHandle, item: CheckMenuItem<tauri::Wry>) {
         if app.get_webview_window(WINDOW_LABEL).is_some() {
             continue;
         }
-        let client = app.state::<App>().client.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        // never waits on the lock either: it is held while the engine is (re)started
+    let client = app.state::<App>().client.try_lock().ok().and_then(|c| c.clone());
         if let Some(st) = client.and_then(|c| c.state().ok()) {
             if item.is_checked().is_ok_and(|on| on != st.settings.music_mode) {
                 let _ = item.set_checked(st.settings.music_mode);
@@ -288,7 +290,7 @@ fn main() {
         .plugin(tauri_plugin_single_instance::init(|app, _, _| show_window(app)))
         .plugin(tauri_plugin_dialog::init())
         .manage(app)
-        .invoke_handler(tauri::generate_handler![devices, state, version, open_releases, levels, fit, pair, pair_ip, open_pairing, connect, disconnect, forget, set_settings, set_peer_addr, set_name, remote_get, remote_set, checks, test_tone, mic_check, export_diagnostics])
+        .invoke_handler(tauri::generate_handler![devices, state, version, open_releases, levels, fit, pair, pair_ip, open_pairing, connect, disconnect, forget, patch_settings, set_peer_addr, set_name, remote_get, remote_set, checks, test_tone, mic_check, export_diagnostics])
         .setup(|app| {
             #[cfg(target_os = "macos")]
             app.set_activation_policy(tauri::ActivationPolicy::Accessory);

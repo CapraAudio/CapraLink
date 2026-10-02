@@ -60,10 +60,10 @@ async function act(cmd, args) {
   return ok;
 }
 
-// Save only the field(s) the user changed, on top of the engine's current settings, so a remote
-// change to another field (e.g. the microphone) made while a control was being edited isn't undone.
+// Save only the field(s) the user changed: the engine merges them onto its current settings, so a
+// remote change to another field (e.g. the microphone) made meanwhile isn't undone.
 function saveSetting(patch) {
-  act('set_settings', async () => ({ settings: { ...(await invoke('state')).settings, ...patch() } }));
+  act('patch_settings', () => ({ patch: patch() }));
 }
 
 els.channels.addEventListener('click', (e) => {

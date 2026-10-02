@@ -721,21 +721,41 @@ impl Node {
     /// A change to `service` installs/removes the login agent first. Music Mode switches live:
     /// the peer is told, no reconnect.
     pub fn set_settings(&self, s: Settings) -> Result<()> {
-        self.save_settings(s, None)
+        self.save_settings(|_| Ok(s.clone()), None)
+    }
+
+    /// `set_settings` for only the fields in `patch` (`Settings` fields as JSON), merged onto the
+    /// current settings under the lock that writes, so a change made meanwhile to another field
+    /// (e.g. by the other computer) isn't undone.
+    pub fn patch_settings(&self, patch: &serde_json::Map<String, serde_json::Value>) -> Result<()> {
+        self.save_settings(
+            |cur| {
+                let mut v = serde_json::to_value(cur)?;
+                v.as_object_mut().expect("Settings is a struct").extend(patch.clone());
+                Ok(serde_json::from_value(v)?)
+            },
+            None,
+        )
     }
 
     /// `set_settings`, or with `from`, paired device `from`'s remote save: refused if remote
     /// configuration is off, `service` and `remote_config` stay as they are, and if `from` isn't
     /// the current connection only its saved audio changes. Decided under the lock that writes,
     /// so a local change made meanwhile isn't undone.
-    fn save_settings(&self, mut s: Settings, from: Option<&str>) -> Result<()> {
-        ensure!(matches!(s.channels, 1 | 2), "channels must be 1 or 2");
-        if from.is_none() && self.st().cfg.settings.service != s.service {
-            crate::rpc::login_agent(s.service).context("background service")?;
+    /// `new` makes the settings to save from the current ones.
+    fn save_settings(&self, new: impl Fn(&Settings) -> Result<Settings>, from: Option<&str>) -> Result<()> {
+        let service = {
+            let cur = &self.st().cfg.settings;
+            (cur.service, new(cur)?.service)
+        };
+        if from.is_none() && service.0 != service.1 {
+            crate::rpc::login_agent(service.1).context("background service")?;
         }
         let (running, notify) = {
             let mut st = self.st();
             let old = st.cfg.settings.clone();
+            let mut s = new(&old)?;
+            ensure!(matches!(s.channels, 1 | 2), "channels must be 1 or 2");
             if let Some(id) = from {
                 ensure!(old.remote_config, "remote configuration is off");
                 (s.service, s.remote_config) = (old.service, old.remote_config);
@@ -862,22 +882,25 @@ impl Node {
     /// Installs a new session: stops the old one, starts the Link, watches the control channel,
     /// remembers the peer's address. `own` = this node dialed it, as part of retry generation
     /// `own` (refused if that was cancelled meanwhile); it becomes `last_peer`. An incoming
-    /// session clears `last_peer`: the side that dialed owns reconnecting.
+    /// session clears `last_peer`: the side that dialed owns reconnecting. Either kind is refused
+    /// if cancelled (e.g. Disconnect) while its audio starts.
     fn activate(&self, id: &str, secret: &[u8; 32], addr: SocketAddr, keys: &Keys, ctl: Arc<Ctl>, own: Option<u64>) -> Result<()> {
         let _one = self.0.starting.lock().unwrap_or_else(|e| e.into_inner());
         // the checks run again after the audio has started: either may change while it does
-        let refused = |st: &St| -> Option<&'static str> {
-            // cancelled after its `Link` went out: the peer's copy gets `stop` (own dials are
-            // serialized, so no newer one of ours reached the peer before it)
-            if own.is_some_and(|g| g != st.retry) {
+        let refused = |st: &St, gen: u64| -> Option<&'static str> {
+            // cancelled (Disconnect, another connect) since this start began; for an own dial,
+            // since its `Link` went out: the peer's copy gets `stop` (own dials are serialized,
+            // so no newer one of ours reached the peer before it)
+            if st.retry != gen {
                 return Some("cancelled");
             }
             // forgotten (or paired again with a new key) since this session's handshake
             (!still_paired(&st.cfg, id, secret)).then_some("pairing was removed or changed")
         };
-        let settings = {
+        let (gen, mut settings) = {
             let mut st = self.st();
-            match refused(&st) {
+            let gen = own.unwrap_or(st.retry);
+            match refused(&st, gen) {
                 Some("cancelled") => {
                     drop(st);
                     ctl.close();
@@ -890,26 +913,36 @@ impl Node {
                 old.ctl.close(); // its Link drops here, freeing the UDP port before the new bind
             }
             use_peer(&mut st.cfg, id);
-            st.cfg.settings.clone()
+            (gen, st.cfg.settings.clone())
         };
         // Opening devices can wait on the OS (e.g. macOS asking for microphone permission), so never
         // under the state lock: the window, Quit and everything else keep working meanwhile.
-        #[cfg(test)]
-        self.pause("start audio");
-        let link = start_link(&settings, self.0.port, addr, keys);
-        let mut st = self.st();
-        let link = match (link, refused(&st)) {
-            (Ok(l), None) => l,
-            (Ok(_), Some(why)) => {
-                drop(st);
-                ctl.close();
-                bail!("{why}");
-            }
-            (Err(e), _) => {
-                log(&format!("can't start audio with {}: {e:#}", peer_name(&st.cfg, id)));
-                drop(st);
-                ctl.close();
-                return Err(e);
+        let (mut st, link) = loop {
+            #[cfg(test)]
+            self.pause("start audio");
+            let link = start_link(&settings, self.0.port, addr, keys);
+            let st = self.st();
+            match (link, refused(&st, gen)) {
+                (Ok(l), None) => {
+                    if Audio::of(&st.cfg.settings) == Audio::of(&settings) {
+                        break (st, l);
+                    }
+                    // the audio settings changed while it started: start again with the new ones
+                    settings = st.cfg.settings.clone();
+                    drop(st);
+                    drop(l); // frees the UDP port before the new bind
+                }
+                (Ok(_), Some(why)) => {
+                    drop(st);
+                    ctl.close();
+                    bail!("{why}");
+                }
+                (Err(e), _) => {
+                    log(&format!("can't start audio with {}: {e:#}", peer_name(&st.cfg, id)));
+                    drop(st);
+                    ctl.close();
+                    return Err(e);
+                }
             }
         };
         self.cancel_retry(&mut st);
@@ -982,8 +1015,16 @@ impl Node {
                             log(&format!("{f}: reconnecting to rebuild the audio"));
                             let n = self.clone();
                             std::thread::spawn(move || {
+                                let gen = n.st().retry;
                                 if let Err(e) = n.connect(&id) {
-                                    n.st().error = Some(format!("{f}, and reconnecting failed: {e:#}"));
+                                    let mut st = n.st();
+                                    st.error = Some(format!("{f}, and reconnecting failed: {e:#}"));
+                                    // a passing failure (e.g. the other computer busy): keep trying as usual,
+                                    // unless something else happened meanwhile (Disconnect, another connect;
+                                    // `connect` itself moved the generation on by one)
+                                    if st.cfg.settings.auto_reconnect && st.session.is_none() && st.retry == gen + 1 {
+                                        n.start_retry(&mut st, id);
+                                    }
                                 }
                             });
                         }
@@ -1256,7 +1297,7 @@ impl Node {
                 .and_then(|()| {
                     #[cfg(test)]
                     self.pause("remote save");
-                    self.save_settings(settings, Some(id))
+                    self.save_settings(|_| Ok(settings.clone()), Some(id))
                 });
                 match r {
                     Ok(()) => Msg::Ok,
@@ -2541,4 +2582,57 @@ mod tests {
         let _ = std::fs::remove_dir_all(bdir);
     }
 
+    #[test]
+    fn disconnect_cancels_an_incoming_session_while_its_audio_starts() {
+        let ((a, adir), (b, bdir), _aid, bid) = paired_nodes();
+        let (reached, at) = mpsc::channel();
+        let (go, wait_go) = mpsc::channel::<()>();
+        *b.0.hook.lock().unwrap() = Some(("start audio", Box::new(move || {
+            reached.send(()).unwrap();
+            let _ = wait_go.recv_timeout(Duration::from_secs(5));
+        })));
+        let a2 = a.clone();
+        let dial = std::thread::spawn(move || a2.connect(&bid));
+        at.recv().unwrap();
+        b.disconnect(); // b's user disconnects while b is still opening its devices
+        go.send(()).unwrap();
+        assert!(dial.join().unwrap().is_err());
+        std::thread::sleep(Duration::from_millis(300));
+        assert!(b.st().session.is_none() && a.st().session.is_none());
+        let _ = std::fs::remove_dir_all(adir);
+        let _ = std::fs::remove_dir_all(bdir);
+    }
+
+    #[test]
+    fn settings_changed_while_audio_starts_restart_it_with_the_new_ones() {
+        let ((a, adir), (b, bdir), _aid, bid) = paired_nodes();
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let restarted = Arc::new(AtomicBool::new(false));
+        let (b2, r) = (b.clone(), restarted.clone());
+        *b.0.hook.lock().unwrap() = Some(("start audio", Box::new(move || {
+            // the first start: the user picks another bitrate meanwhile (no session yet to restart)
+            b2.set_settings(Settings { bitrate: 16_000, ..b2.state().settings }).unwrap();
+            *b2.0.hook.lock().unwrap() = Some(("start audio", Box::new(move || r.store(true, Ordering::SeqCst))));
+        })));
+        a.connect(&bid).unwrap();
+        assert!(restarted.load(Ordering::SeqCst), "the audio started once more, with the new settings");
+        assert!(b.st().session.is_some());
+        let _ = std::fs::remove_dir_all(adir);
+        let _ = std::fs::remove_dir_all(bdir);
+    }
+    #[test]
+    fn a_settings_patch_changes_only_its_own_fields() {
+        let ((a, adir), (b, bdir), _aid, _bid) = paired_nodes();
+        // another change lands first (e.g. the other computer picks a microphone)...
+        b.set_settings(Settings { input: Some("Mic".into()), ..b.state().settings }).unwrap();
+        // ...then this window's bitrate change: the microphone stays
+        b.patch_settings(serde_json::json!({ "bitrate": 16_000 }).as_object().unwrap()).unwrap();
+        let s = b.state().settings;
+        assert_eq!((s.input.as_deref(), s.bitrate), (Some("Mic"), 16_000));
+        assert!(b.patch_settings(serde_json::json!({ "channels": 3 }).as_object().unwrap()).is_err());
+        assert_eq!(b.state().settings.channels, s.channels);
+        drop(a);
+        let _ = std::fs::remove_dir_all(adir);
+        let _ = std::fs::remove_dir_all(bdir);
+    }
 }

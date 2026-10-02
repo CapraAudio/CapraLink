@@ -191,6 +191,7 @@ fn dispatch(node: &Node, cmd: &str, args: Value) -> Result<Value> {
         pin: String,
         addr: String,
         settings: Option<Settings>,
+        patch: Option<serde_json::Map<String, Value>>,
         name: Option<String>,
         redact: bool,
         peer: Option<String>,
@@ -211,6 +212,7 @@ fn dispatch(node: &Node, cmd: &str, args: Value) -> Result<Value> {
         }
         "forget" => done(node.forget(&a.id)),
         "set_settings" => done(node.set_settings(a.settings.ok_or_else(|| anyhow!("missing settings"))?)),
+        "patch_settings" => done(node.patch_settings(&a.patch.ok_or_else(|| anyhow!("missing patch"))?)),
         "set_peer_addr" => done(node.set_peer_addr(&a.id, &a.addr)),
         "set_name" => done(node.set_name(&a.name.ok_or_else(|| anyhow!("missing name"))?)),
         "remote_get" => Ok(serde_json::to_value(node.remote_get(&a.id)?)?),
@@ -318,6 +320,12 @@ impl Client {
 
     pub fn set_settings(&self, s: &Settings) -> Result<()> {
         self.call("set_settings", json!({ "settings": s }))
+    }
+
+    /// Changes only the given `Settings` fields (a JSON object), keeping every other one as the
+    /// engine has it.
+    pub fn patch_settings(&self, patch: Value) -> Result<()> {
+        self.call("patch_settings", json!({ "patch": patch }))
     }
 
     pub fn set_peer_addr(&self, id: &str, addr: &str) -> Result<()> {
