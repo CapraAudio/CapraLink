@@ -71,6 +71,12 @@ jobs:
           mkdir release
           cp artifacts/*/dist/* release/
           cd release && sha256sum * > SHA256SUMS.txt && cat SHA256SUMS.txt
+      # the release notes are the annotated tag's message: a tag without a written description fails here
       - env:
           GH_TOKEN: ${{ github.token }}
-        run: gh release create "$GITHUB_REF_NAME" release/* --repo "$GITHUB_REPOSITORY" --draft --generate-notes --title "CapraLink ${GITHUB_REF_NAME#v}"
+        run: |
+          ref=$(gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$GITHUB_REF_NAME")
+          [ "$(jq -r .object.type <<<"$ref")" = tag ] || { echo "::error::$GITHUB_REF_NAME is not an annotated tag with release notes"; exit 1; }
+          gh api "repos/$GITHUB_REPOSITORY/git/tags/$(jq -r .object.sha <<<"$ref")" -q .message > notes.md
+          [ "$(wc -l < notes.md)" -ge 3 ] || { echo "::error::the $GITHUB_REF_NAME tag message needs a description of the changes"; exit 1; }
+          gh release create "$GITHUB_REF_NAME" release/* --repo "$GITHUB_REPOSITORY" --draft --notes-file notes.md --title "CapraLink ${GITHUB_REF_NAME#v}"
