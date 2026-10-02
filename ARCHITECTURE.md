@@ -63,6 +63,11 @@ playback device
 - **Stored on disk:** settings, paired devices, and their pairing secrets, in
   `<config dir>/CapraLink/config.json`. That's `~/Library/Application Support` on macOS,
   `~/.config` on Linux and `%APPDATA%` on Windows. The file is readable only by you on macOS and Linux.
+- **Log file:** `capralink.log` (plus one older `capralink.1.log`) in the same folder, capped at
+  1 MB. It records events (start/stop, pairing results, sessions, device errors, a quality line every
+  30 s while streaming), never audio, PINs, keys or tokens. It stays on your computer unless you
+  export diagnostics (Troubleshooting → Export), which hides names and addresses by default. A paired
+  computer can fetch these diagnostics only when remote configuration is on.
 - **No telemetry,** no accounts. The only internet request is the update check: when the window
   opens, it asks GitHub's public API for the latest CapraLink release (a plain web request, nothing
   about you or your devices), and offers a Download link if a newer one exists. Audio and control
