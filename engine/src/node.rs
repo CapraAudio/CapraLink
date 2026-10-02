@@ -238,7 +238,13 @@ struct Inner {
     wake: Condvar, // wakes a sleeping retry loop when `retry` changes
     pending: Mutex<Vec<IpAddr>>, // sources of unauthenticated incoming connections
     pairing: Mutex<()>,          // held by the one PIN attempt allowed at a time
+    #[cfg(test)]
+    hook: Mutex<Option<Hook>>,
 }
+
+/// A test's pause point name and what to run there (see `Node::pause`).
+#[cfg(test)]
+type Hook = (&'static str, Box<dyn FnOnce() + Send>);
 
 #[derive(Clone)]
 pub struct Node(Arc<Inner>);
@@ -265,7 +271,7 @@ impl Node {
             (None, None)
         };
         let st = St { cfg, pin: new_pin(), failures: 0, pairing_until: None, locked_until: None, found: HashMap::new(), session: None, error: None, vdev: Virtual::setup(), retry: 0, retrying: None };
-        let node = Node(Arc::new(Inner { dir, port, mdns: daemon, st: Mutex::new(st), wake: Condvar::new(), pending: Mutex::default(), pairing: Mutex::default() }));
+        let node = Node(Arc::new(Inner { dir, port, mdns: daemon, st: Mutex::new(st), wake: Condvar::new(), pending: Mutex::default(), pairing: Mutex::default(), #[cfg(test)] hook: Mutex::default() }));
         if let Some(rx) = browse {
             let n = node.clone();
             std::thread::Builder::new().name("capralink-mdns".into()).spawn(move || {
@@ -316,6 +322,15 @@ impl Node {
 
     fn st(&self) -> MutexGuard<'_, St> {
         self.0.st.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Test hook: runs the closure set for pause point `at`, once.
+    #[cfg(test)]
+    fn pause(&self, at: &str) {
+        let f = self.0.hook.lock().unwrap().take_if(|(p, _)| *p == at);
+        if let Some((_, f)) = f {
+            f();
+        }
     }
 
     /// (sending, receiving) VU levels of the active link, for smooth meters.
@@ -688,14 +703,32 @@ impl Node {
     /// A change to `service` installs/removes the login agent first. Music Mode switches live:
     /// the peer is told, no reconnect.
     pub fn set_settings(&self, s: Settings) -> Result<()> {
+        self.save_settings(s, None)
+    }
+
+    /// `set_settings`, or with `from`, paired device `from`'s remote save: refused if remote
+    /// configuration is off, `service` and `remote_config` stay as they are, and if `from` isn't
+    /// the current connection only its saved audio changes. Decided under the lock that writes,
+    /// so a local change made meanwhile isn't undone.
+    fn save_settings(&self, mut s: Settings, from: Option<&str>) -> Result<()> {
         ensure!(matches!(s.channels, 1 | 2), "channels must be 1 or 2");
-        let old = self.st().cfg.settings.clone();
-        if old.service != s.service {
+        if from.is_none() && self.st().cfg.settings.service != s.service {
             crate::rpc::login_agent(s.service).context("background service")?;
         }
-        let music = s.music_mode;
         let (running, notify) = {
             let mut st = self.st();
+            let old = st.cfg.settings.clone();
+            if let Some(id) = from {
+                ensure!(old.remote_config, "remote configuration is off");
+                (s.service, s.remote_config) = (old.service, old.remote_config);
+                if st.cfg.current.as_deref() != Some(id) {
+                    if let Some(p) = st.cfg.peers.iter_mut().find(|p| p.id == id) {
+                        p.audio = Some(Audio::of(&s));
+                    }
+                    s = Audio::of(&old).apply(s);
+                }
+            }
+            let music = s.music_mode;
             let audio_changed = Settings { service: s.service, remote_config: s.remote_config, music_mode: music, auto_reconnect: s.auto_reconnect, ..old } != s;
             if !s.auto_reconnect && st.retrying.is_some() {
                 self.cancel_retry(&mut st);
@@ -709,9 +742,9 @@ impl Node {
             save(&self.0.dir, &st.cfg)?;
             apply_mode(&st);
             let sess = st.session.as_ref();
-            (sess.filter(|_| audio_changed).map(|s| (s.peer_id.clone(), s.addr)), sess.filter(|_| !audio_changed && old.music_mode != music).map(|s| s.ctl.clone()))
+            (sess.filter(|_| audio_changed).map(|s| (s.peer_id.clone(), s.addr)), sess.filter(|_| !audio_changed && old.music_mode != music).map(|s| (s.ctl.clone(), music)))
         };
-        if let Some(ctl) = notify {
+        if let Some((ctl, music)) = notify {
             let _ = ctl.send(&Msg::Mode { music });
         }
         match running {
@@ -1142,18 +1175,9 @@ impl Node {
                     None => Ok(()),
                 }
                 .and_then(|()| {
-                    let settings = Settings { service: local.service, remote_config: local.remote_config, ..settings };
-                    let mut st = self.st();
-                    if st.cfg.current.as_deref() == Some(id) {
-                        drop(st);
-                        return self.set_settings(settings);
-                    }
-                    // not the current connection: store its audio, apply only the rest
-                    if let Some(p) = st.cfg.peers.iter_mut().find(|p| p.id == id) {
-                        p.audio = Some(Audio::of(&settings));
-                    }
-                    drop(st);
-                    self.set_settings(Audio::of(&local).apply(settings))
+                    #[cfg(test)]
+                    self.pause("remote save");
+                    self.save_settings(settings, Some(id))
                 });
                 match r {
                     Ok(()) => Msg::Ok,
@@ -2215,6 +2239,21 @@ mod tests {
         link(&old);
         assert!(refused(&old));
         assert!(!is(&b, |d| d.connected));
+        let _ = std::fs::remove_dir_all(adir);
+        let _ = std::fs::remove_dir_all(bdir);
+    }
+
+    #[test]
+    fn remote_save_cannot_undo_turning_remote_configuration_off() {
+        let ((a, adir), (b, bdir), _aid, bid) = paired_nodes();
+        b.set_settings(Settings { remote_config: true, ..b.state().settings }).unwrap();
+        let before = b.state().settings;
+        // b's user turns remote configuration off while a's save is on its way in
+        let b2 = b.clone();
+        *b.0.hook.lock().unwrap() = Some(("remote save", Box::new(move || b2.set_settings(Settings { remote_config: false, ..b2.state().settings }).unwrap())));
+        assert!(a.remote_set(&bid, Settings { bitrate: 16_000, ..before.clone() }, None).is_err());
+        assert_eq!(b.state().settings, Settings { remote_config: false, ..before.clone() });
+        assert_eq!(load(&bdir).unwrap().settings, Settings { remote_config: false, ..before });
         let _ = std::fs::remove_dir_all(adir);
         let _ = std::fs::remove_dir_all(bdir);
     }
