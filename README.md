@@ -113,6 +113,22 @@ drivers/macos/build.sh && sudo drivers/macos/install.sh
 How it works, the security model, and what CapraLink stores and shares: [ARCHITECTURE.md](ARCHITECTURE.md).
 Reporting a security problem: [SECURITY.md](SECURITY.md).
 
+## Versioning
+
+CapraLink follows [Semantic Versioning](https://semver.org/): versions are MAJOR.MINOR.PATCH.
+
+- **PATCH** (0.2.0 → 0.2.1): bug fixes only.
+- **MINOR** (0.2.1 → 0.3.0): new features that keep working with what came before.
+- **MAJOR** (0.x → 1.0.0, then 1.x → 2.0.0): a change that breaks the public API below.
+
+The public API, meaning what a version number promises to keep compatible, is:
+
+1. **Computers on different versions can pair and connect** (network protocol and remote configuration).
+2. **Your settings and pairings survive an update** (`config.json`).
+3. **The `capralinkd` command-line options.**
+
+Before 1.0.0, a breaking change bumps MINOR instead of MAJOR, and the release notes call it out.
+
 ## License
 
 GPL-3.0 — see [LICENSE](LICENSE). The macOS driver is derived from

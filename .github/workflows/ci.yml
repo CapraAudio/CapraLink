@@ -75,6 +75,9 @@ jobs:
       - env:
           GH_TOKEN: ${{ github.token }}
         run: |
+          # SemVer tag (vMAJOR.MINOR.PATCH) that matches the version the app was built with
+          [[ "$GITHUB_REF_NAME" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]] || { echo "::error::$GITHUB_REF_NAME is not a vMAJOR.MINOR.PATCH tag"; exit 1; }
+          ls release | grep -q "_${GITHUB_REF_NAME#v}_" || { echo "::error::the installers aren't version ${GITHUB_REF_NAME#v}: bump [workspace.package] version first"; exit 1; }
           ref=$(gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$GITHUB_REF_NAME")
           [ "$(jq -r .object.type <<<"$ref")" = tag ] || { echo "::error::$GITHUB_REF_NAME is not an annotated tag with release notes"; exit 1; }
           gh api "repos/$GITHUB_REPOSITORY/git/tags/$(jq -r .object.sha <<<"$ref")" -q .message > notes.md
