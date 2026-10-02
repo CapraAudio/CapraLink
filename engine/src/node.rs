@@ -4,7 +4,7 @@
 use crate::dsp::{ceiling, RateControl, MUSIC_TARGET, RATE, TARGET};
 use crate::log::log;
 use crate::vdev::Virtual;
-use crate::{Keys, Link, Settings, Stats, EVERYTHING, NO_DEVICE, VIRTUAL_INPUT, VIRTUAL_OUTPUT};
+use crate::{Failure, Keys, Link, Settings, Stats, EVERYTHING, NO_DEVICE, VIRTUAL_INPUT, VIRTUAL_OUTPUT};
 use anyhow::{anyhow, bail, ensure, Context, Result};
 use hkdf::Hkdf;
 use hmac::{Hmac, KeyInit, Mac};
@@ -890,7 +890,7 @@ impl Node {
             }
             if last_report.elapsed() >= REPORT {
                 last_report = Instant::now();
-                let failure = self.st().session.as_ref().filter(|s| Arc::ptr_eq(&s.ctl, &ctl)).and_then(|s| s.link.as_ref()?.failure());
+                let failure = self.st().session.as_ref().filter(|s| Arc::ptr_eq(&s.ctl, &ctl)).and_then(|s| s.link.as_ref()?.failure()).map(|(Failure::Rebuild(f) | Failure::End(f))| f);
                 if let Some(f) = failure {
                     // the peer shouldn't keep redialing a link that can't play: `stop` with a FIN, then
                     // wait (≤ 2 s) for its close, so the full shutdown below can't reset `stop` away

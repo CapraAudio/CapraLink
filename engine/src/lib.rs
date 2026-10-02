@@ -194,7 +194,16 @@ struct Shared {
     bitrate: AtomicI32, // currently applied, for Stats
     complexity: AtomicU8,
     music: AtomicBool, // effective Music Mode, set by the node
-    failure: Mutex<Option<String>>, // an audio device went away (see `err_cb`)
+    failure: Mutex<Option<Failure>>, // see `err_cb`
+}
+
+/// Why a link can't go on (`Link::failure`).
+#[derive(Clone, Debug, PartialEq)]
+pub enum Failure {
+    /// An audio stream must be rebuilt (e.g. its device's format changed): restart the link.
+    Rebuild(String),
+    /// An audio device is gone or refused: end the session.
+    End(String),
 }
 
 /// A running TX + RX link. Dropping it stops everything.
@@ -314,8 +323,8 @@ impl Link {
         self.shared.target_loss_perc.store(loss_perc, Relaxed);
     }
 
-    /// Why the link can't go on (e.g. "Play to device stopped: …"), once an audio device is gone.
-    pub fn failure(&self) -> Option<String> {
+    /// Why the link can't go on (e.g. "Play to device stopped: …"), once an audio stream died.
+    pub fn failure(&self) -> Option<Failure> {
         self.shared.failure.lock().ok()?.clone()
     }
 
@@ -476,16 +485,34 @@ fn meter(level: &AtomicU32, samples: &[f32]) {
     level.store(p.max(old * 0.97).to_bits(), Relaxed);
 }
 
-/// Logs stream errors; a device that went away is also recorded as the link's `failure()`.
-fn err_cb(shared: Arc<Shared>, what: &'static str) -> impl FnMut(cpal::Error) + Send + 'static {
+/// Logs stream errors; one the stream can't survive is also recorded as the link's `failure()`
+/// (an `End` is never downgraded to a `Rebuild`).
+fn err_cb(shared: Arc<Shared>, input: bool) -> impl FnMut(cpal::Error) + Send + 'static {
     move |e| {
-        crate::log::log(&format!("audio stream error ({what}): {e}"));
-        if e.kind() == cpal::ErrorKind::DeviceNotAvailable {
-            if let Ok(mut f) = shared.failure.lock() {
-                *f = Some(format!("{what}: {e}"));
+        crate::log::log(&format!("audio stream error ({}): {e}", side(input)));
+        if let (Some(new), Ok(mut f)) = (failure(&e, input), shared.failure.lock()) {
+            if !matches!(*f, Some(Failure::End(_))) {
+                *f = Some(new);
             }
         }
     }
+}
+
+fn side(input: bool) -> &'static str {
+    if input { "Send from device" } else { "Play to device" }
+}
+
+/// What a stream error means for the link; `None` = log only (busy, rerouted, xruns …).
+fn failure(e: &cpal::Error, input: bool) -> Option<Failure> {
+    use cpal::ErrorKind::*;
+    let what = side(input);
+    Some(match e.kind() {
+        StreamInvalidated => Failure::Rebuild(format!("{what} must be restarted: {e}")),
+        DeviceNotAvailable | HostUnavailable => Failure::End(format!("{what} stopped: {e}")),
+        PermissionDenied if input => Failure::End(format!("{what}: permission denied — on macOS allow microphone access in System Settings → Privacy & Security")),
+        PermissionDenied => Failure::End(format!("{what}: permission denied: {e}")),
+        _ => return None,
+    })
 }
 
 struct Tx {
@@ -630,7 +657,7 @@ fn build_input(dev: &cpal::Device, cfg: &Settings, pk: Packetizer, sock: UdpSock
     // "Everything this PC plays" is a playback device: its mix format is the one loopback takes.
     let sc = if cfg.input.as_deref() == Some(EVERYTHING) { dev.default_output_config()? } else { pick_config(dev.default_input_config()?, dev.supported_input_configs()?) };
     let (dev_ch, rate, fmt) = (sc.channels() as usize, sc.sample_rate(), sc.sample_format());
-    let err_cb = err_cb(shared.clone(), "Send from device stopped");
+    let err_cb = err_cb(shared.clone(), true);
     let mut tx = Tx::new(cfg, pk, sock, peer, shared, dev_ch, rate);
     let mut c = sc.config();
     // Ask for 10 ms capture buffers so packets leave evenly instead of in bursts
@@ -714,7 +741,7 @@ impl Playback {
 fn build_output(dev: &cpal::Device, cons: HeapCons<f32>, shared: Arc<Shared>) -> anyhow::Result<cpal::Stream> {
     let sc = pick_config(dev.default_output_config()?, dev.supported_output_configs()?);
     let (rate, fmt) = (sc.sample_rate(), sc.sample_format());
-    let err_cb = err_cb(shared.clone(), "Play to device stopped");
+    let err_cb = err_cb(shared.clone(), false);
     let mut pb = Playback {
         cons,
         plan: Playout::default(),
@@ -768,6 +795,21 @@ fn windows_labels() {
     let ins = ["Microphone (USB Mic)", "CABLE Output (VB-Audio Virtual Cable)"];
     assert_eq!(shown(true, &ins), ["Microphone (USB Mic)"]);
     assert_eq!(shown(true, &outs), ["Speakers (Realtek(R) Audio)"], "no VB-Cable endpoint is ever offered as Send from");
+}
+
+#[cfg(test)]
+#[test]
+fn stream_error_failures() {
+    use cpal::{Error, ErrorKind::*};
+    let f = |k, input| failure(&Error::new(k), input);
+    assert!(matches!(f(StreamInvalidated, true), Some(Failure::Rebuild(m)) if m.starts_with("Send from device")));
+    assert!(matches!(f(DeviceNotAvailable, false), Some(Failure::End(m)) if m.starts_with("Play to device stopped")));
+    assert!(matches!(f(HostUnavailable, true), Some(Failure::End(_))));
+    assert!(matches!(f(PermissionDenied, true), Some(Failure::End(m)) if m.contains("microphone access")));
+    assert!(matches!(f(PermissionDenied, false), Some(Failure::End(m)) if !m.contains("microphone")));
+    for k in [DeviceBusy, DeviceChanged, Xrun, RealtimeDenied, BackendError, Other] {
+        assert_eq!(f(k, true), None, "{k:?} is log-only");
+    }
 }
 
 #[cfg(test)]
