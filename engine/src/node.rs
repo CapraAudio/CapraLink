@@ -182,8 +182,9 @@ enum Msg {
     #[serde(rename = "set_settings")]
     SetSettings { settings: Settings, #[serde(default)] name: Option<String> },
     /// This side's own Music Mode setting, sent after the session starts and on every change
-    /// (MASTER.md §3.7). Old peers never send it (= off) and ignore it.
-    Mode { music: bool },
+    /// (MASTER.md §3.7). Old peers never send it (= off) and ignore it. `name` = the sender's own
+    /// device name (at session start and on a rename; absent from old peers).
+    Mode { music: bool, #[serde(default)] name: Option<String> },
     /// Manage request: the diagnostics text (`Node::diagnostics`), answered with `Text`.
     Diagnostics { redact: bool },
     /// A long text, in pieces: `more` on all but the last (see `send_text`).
@@ -350,7 +351,7 @@ impl Node {
                 let online = st.found.contains_key(&p.id) || conn == Some(&p.id);
                 Device {
                     id: p.id.clone(),
-                    name: st.found.get(&p.id).map_or(&p.name, |f| &f.name).clone(),
+                    name: p.name.clone(), // not the mDNS one (see `on_mdns`)
                     paired: true,
                     online,
                     connected: conn == Some(&p.id),
@@ -606,10 +607,8 @@ impl Node {
             let st = self.st();
             (st.cfg.device_id.clone(), secret(&st.cfg, id).ok_or_else(|| anyhow!("not paired with that device"))?, st.cfg.settings.channels)
         };
-        let mut s = dial(addrs)?;
-        let addr = s.peer_addr()?;
-        send_msg(&mut s, &Msg::Session { id: my_id })?;
-        let (ctl, keys) = handshake(&mut s, &secret, true).context("secure connection failed (try pairing again)")?;
+        let (ctl, keys) = open(addrs, &my_id, &secret)?;
+        let (s, addr) = (&ctl.stream, ctl.stream.peer_addr()?);
         #[cfg(test)]
         self.pause("before link");
         // cancelled meanwhile: don't ask the peer to start (it would replace its current session)
@@ -755,7 +754,7 @@ impl Node {
             (sess.filter(|_| audio_changed).map(|s| (s.peer_id.clone(), s.addr)), sess.filter(|_| !audio_changed && old.music_mode != music).map(|s| (s.ctl.clone(), music)))
         };
         if let Some((ctl, music)) = notify {
-            let _ = ctl.send(&Msg::Mode { music });
+            let _ = ctl.send(&Msg::Mode { music, name: None });
         }
         match running {
             Some((id, addr)) => self.connect_to(&id, &[addr]),
@@ -789,16 +788,19 @@ impl Node {
         }
     }
 
-    /// Renames this computer; re-advertises immediately so paired peers see it without a
-    /// restart (MASTER.md §3.6 device rename).
+    /// Renames this computer; re-advertises immediately, and tells the connected peer (paired
+    /// peers take the name from the session or `remote_get`; MASTER.md §3.6 device rename).
     pub fn set_name(&self, name: &str) -> Result<()> {
         let name = clean_name(name.trim());
         ensure!(!name.is_empty(), "the name can't be empty");
         let mut st = self.st();
         st.cfg.name = name.clone();
         save(&self.0.dir, &st.cfg)?;
-        let id = st.cfg.device_id.clone();
+        let (id, ctl) = (st.cfg.device_id.clone(), st.session.as_ref().map(|s| s.ctl.clone()));
         drop(st);
+        if let Some(ctl) = ctl {
+            self.send_mode(&ctl); // the connected peer takes the new name from here, not from mDNS
+        }
         if let Some(d) = &self.0.mdns {
             advertise(d, &id, &name, self.0.port)?;
         }
@@ -828,12 +830,10 @@ impl Node {
             let st = self.st();
             (st.cfg.device_id.clone(), secret(&st.cfg, id).ok_or_else(|| anyhow!("not paired with that device"))?)
         };
-        let mut s = dial(addrs)?;
-        send_msg(&mut s, &Msg::Session { id: my_id })?;
-        let (ctl, _) = handshake(&mut s, &secret, true).context("secure connection failed (try pairing again)")?;
+        let (ctl, _) = open(addrs, &my_id, &secret)?;
         ctl.send(&Msg::Manage)?;
         ctl.send(req)?;
-        s.set_read_timeout(Some(LINK_TIMEOUT + IO_TIMEOUT))?; // new audio settings may restart its link
+        ctl.stream.set_read_timeout(Some(LINK_TIMEOUT + IO_TIMEOUT))?; // new audio settings may restart its link
         let mut text = String::new();
         let reply = loop {
             match ctl.recv() {
@@ -915,13 +915,18 @@ impl Node {
                     let (bitrate, loss_perc) = rate.on_report(received, lost, underruns);
                     self.apply_rate(&ctl, bitrate, loss_perc);
                 }
-                Ok(Some(Msg::Mode { music })) => {
+                Ok(Some(Msg::Mode { music, name })) => {
                     last_rx = Instant::now();
                     let mut st = self.st();
                     if let Some(s) = st.session.as_mut().filter(|s| Arc::ptr_eq(&s.ctl, &ctl)) {
                         s.peer_music = music;
                     }
                     apply_mode(&st);
+                    let name = name.map(|n| clean_name(n.trim())).filter(|n| !n.is_empty());
+                    if let Some((p, n)) = st.cfg.peers.iter_mut().find(|p| p.id == peer).zip(name).filter(|(p, n)| p.name != *n) {
+                        p.name = n;
+                        let _ = save(&self.0.dir, &st.cfg);
+                    }
                 }
                 Ok(_) => last_rx = Instant::now(),
                 Err(e) if matches!(e.kind(), io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut) => {
@@ -986,9 +991,13 @@ impl Node {
         }
     }
 
+    /// Tells the peer this side's Music Mode and name.
     fn send_mode(&self, ctl: &Ctl) {
-        let music = self.st().cfg.settings.music_mode;
-        let _ = ctl.send(&Msg::Mode { music });
+        let m = {
+            let st = self.st();
+            Msg::Mode { music: st.cfg.settings.music_mode, name: Some(st.cfg.name.clone()) }
+        };
+        let _ = ctl.send(&m);
     }
 
     /// This session's own receive-side counters, as deltas since `last` (updated in place).
@@ -1217,18 +1226,12 @@ impl Node {
                 if info.get_property_val_str("v") != Some("2") || id == st.cfg.device_id || check_id(id).is_err() {
                     return;
                 }
-                let clean = clean_name(name);
-                // a paired peer's rename shows up here (and in a fresh remote_get) without restart
-                if let Some(p) = st.cfg.peers.iter_mut().find(|p| p.id == id) {
-                    if p.name != clean {
-                        p.name = clean.clone();
-                        let _ = save(&self.0.dir, &st.cfg);
-                    }
-                }
+                // anyone can announce any id and name: a paired device's name only changes through
+                // its encrypted channel (`Mode`, `remote_get`), never from here
                 let paired = st.cfg.peers.iter().any(|p| p.id == id);
-                let found = Found { name: clean.clone(), addrs, fullname: info.get_fullname().to_string() };
+                let found = Found { name: clean_name(name), addrs, fullname: info.get_fullname().to_string() };
                 if st.found.insert(id.to_string(), found).is_none() && paired {
-                    log(&format!("{clean} [{}] appeared on the network", short(id)));
+                    log(&format!("{} [{}] appeared on the network", peer_name(&st.cfg, id), short(id)));
                 }
             }
             ServiceEvent::ServiceRemoved(_, fullname) => {
@@ -1236,7 +1239,7 @@ impl Node {
                 st.found.retain(|id, f| {
                     let gone = f.fullname == fullname;
                     if gone && st.cfg.peers.iter().any(|p| p.id == *id) {
-                        log(&format!("{} [{}] left the network", f.name, short(id)));
+                        log(&format!("{} [{}] left the network", peer_name(&st.cfg, id), short(id)));
                     }
                     !gone
                 });
@@ -1694,6 +1697,24 @@ fn dial(addrs: &[SocketAddr]) -> Result<TcpStream> {
     Err(err)
 }
 
+/// Opens a session's control channel with a paired device at the first of `addrs` that completes
+/// the handshake: an address that answers but isn't that device (a stale or forged mDNS entry)
+/// can't block the next one.
+fn open(addrs: &[SocketAddr], my_id: &str, secret: &[u8; 32]) -> Result<(Arc<Ctl>, Keys)> {
+    let mut err = anyhow!("no address for that device");
+    for a in addrs {
+        let r = dial(&[*a]).and_then(|mut s| {
+            send_msg(&mut s, &Msg::Session { id: my_id.into() })?;
+            handshake(&mut s, secret, true).context("secure connection failed (try pairing again)")
+        });
+        match r {
+            Ok(c) => return Ok(c),
+            Err(e) => err = e,
+        }
+    }
+    Err(err)
+}
+
 fn setup(s: &TcpStream) -> io::Result<()> {
     s.set_nodelay(true)?;
     s.set_read_timeout(Some(IO_TIMEOUT))?;
@@ -1825,13 +1846,14 @@ mod tests {
         wait(both); // b restarts its link for the new audio settings
 
         // remote rename (service/remote_config in `want` are ignored, so b's remote_config is
-        // still on): the target renames and the initiator's stored peer name catches up.
+        // still on): the target renames and tells the connected initiator over the session.
         a.remote_set(&bid, want.clone(), Some("Renamed B".into())).unwrap();
         assert_eq!(load(&bdir).unwrap().name, "Renamed B");
-        assert_ne!(peers(&adir).iter().find(|p| p.id == bid).unwrap().name, "Renamed B", "not updated until the next remote_get");
+        wait(|| peers(&adir).iter().any(|p| p.id == bid && p.name == "Renamed B"));
+        a.st().cfg.peers.iter_mut().find(|p| p.id == bid).unwrap().name = "Stale".into();
         let rc2 = a.remote_get(&bid).unwrap();
         assert_eq!(rc2.name, "Renamed B");
-        assert_eq!(peers(&adir).iter().find(|p| p.id == bid).unwrap().name, "Renamed B", "initiator's stored peer name updates after remote_get");
+        assert_eq!(stored_name(&a, &bid).0, "Renamed B", "initiator's stored peer name updates after remote_get");
 
         let err = a.remote_set(&bid, want.clone(), Some("   ".into())).unwrap_err().to_string();
         assert!(err.contains("can't be empty"), "{err}");
@@ -2095,7 +2117,14 @@ mod tests {
         assert!(matches!(m, Msg::SetSettings { name: None, .. }), "old SetSettings JSON without `name` parses");
 
         let m: Msg = serde_json::from_str(r#"{"type":"mode","music":true}"#).unwrap();
-        assert!(matches!(m, Msg::Mode { music: true }));
+        assert!(matches!(m, Msg::Mode { music: true, name: None }), "old Mode JSON without `name` parses");
+        #[derive(Deserialize)]
+        #[serde(tag = "type", rename_all = "lowercase")]
+        enum Old {
+            Mode { music: bool },
+        }
+        let new = serde_json::to_vec(&Msg::Mode { music: true, name: Some("B".into()) }).unwrap();
+        assert!(matches!(serde_json::from_slice(&new), Ok(Old::Mode { music: true })), "an old peer reads the new Mode");
         let st: Stats = serde_json::from_str(r#"{"sent":0,"received":0,"lost":0,"fec_recovered":0,"underruns":0,"buffer_ms":0,"target_ms":0,
             "in_peak":0,"out_peak":0,"tx_gap_ms":0,"rx_gap_ms":0,"bitrate":0,"complexity":0}"#).unwrap();
         assert!(!st.music, "old Stats JSON without `music` parses");
@@ -2227,6 +2256,50 @@ mod tests {
         x.close();
         assert!(matches!(y.recv().unwrap(), Some(Msg::Stop)), "the peer must see a chosen end, not a lost connection");
     }
+    fn stored_name(n: &Node, id: &str) -> (String, String) {
+        let st = n.state();
+        (n.st().cfg.peers.iter().find(|p| p.id == id).unwrap().name.clone(), st.devices.iter().find(|d| d.id == id).unwrap().name.clone())
+    }
+
+    #[test]
+    fn only_the_paired_device_itself_can_rename_it() {
+        let ((a, adir), (b, bdir), _aid, bid) = paired_nodes();
+        a.st().cfg.peers[0].name = "Stale".into();
+        // anyone on the network can announce b's id with another name
+        let info = ServiceInfo::new(SERVICE, &bid, &format!("{bid}.local."), "127.0.0.1", 1, &[("id", bid.as_str()), ("name", "Evil"), ("v", "2")][..]).unwrap();
+        a.on_mdns(ServiceEvent::ServiceResolved(Box::new(info.as_resolved_service())));
+        assert!(a.st().found.contains_key(&bid));
+        assert_eq!(stored_name(&a, &bid), ("Stale".into(), "Stale".into()));
+        // the session tells a b's real name, and a rename while connected
+        a.connect_to(&bid, &[addr(&b)]).unwrap();
+        let real = b.state().name;
+        wait(|| stored_name(&a, &bid) == (real.clone(), real.clone()));
+        b.set_name("Renamed B").unwrap();
+        wait(|| stored_name(&a, &bid) == ("Renamed B".into(), "Renamed B".into()));
+        assert_eq!(peers(&adir)[0].name, "Renamed B");
+        let _ = std::fs::remove_dir_all(adir);
+        let _ = std::fs::remove_dir_all(bdir);
+    }
+
+    #[test]
+    fn a_bad_first_address_does_not_block_the_next() {
+        let ((a, adir), (b, bdir), _aid, bid) = paired_nodes();
+        b.set_settings(Settings { remote_config: true, ..b.state().settings }).unwrap();
+        // answers TCP, but isn't CapraLink
+        let l = TcpListener::bind("127.0.0.1:0").unwrap();
+        let bad = l.local_addr().unwrap();
+        std::thread::spawn(move || {
+            for mut s in l.incoming().flatten() {
+                let _ = s.write_all(b"HTTP/1.1 400 Bad Request\r\n\r\n");
+            }
+        });
+        assert!(matches!(a.manage_at(&bid, &[bad, addr(&b)], &Msg::GetConfig).unwrap(), Msg::Config(_)));
+        a.connect_to(&bid, &[bad, addr(&b)]).unwrap();
+        wait(|| is(&b, |d| d.connected));
+        let _ = std::fs::remove_dir_all(adir);
+        let _ = std::fs::remove_dir_all(bdir);
+    }
+
     #[test]
     fn a_frame_split_by_read_timeouts_arrives_intact() {
         let (x, y) = control_pair();
