@@ -889,7 +889,11 @@ impl Node {
                 last_report = Instant::now();
                 let failure = self.st().session.as_ref().filter(|s| Arc::ptr_eq(&s.ctl, &ctl)).and_then(|s| s.link.as_ref()?.failure());
                 if let Some(f) = failure {
-                    let _ = ctl.send(&Msg::Stop); // the peer shouldn't keep redialing a link that can't play
+                    // the peer shouldn't keep redialing a link that can't play: `stop` with a FIN, then
+                    // wait (≤ 2 s) for its close, so the full shutdown below can't reset `stop` away
+                    ctl.close();
+                    let t = Instant::now();
+                    while t.elapsed() < Duration::from_secs(2) && matches!(ctl.recv(), Ok(Some(_))) {}
                     break End::Device(f);
                 }
                 let m = match self.link_delta(&ctl, &mut last_counts) {
