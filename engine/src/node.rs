@@ -238,6 +238,7 @@ struct Inner {
     wake: Condvar, // wakes a sleeping retry loop when `retry` changes
     pending: Mutex<Vec<IpAddr>>, // sources of unauthenticated incoming connections
     pairing: Mutex<()>,          // held by the one PIN attempt allowed at a time
+    dialing: Mutex<()>,          // held by this node's one session dial at a time
     #[cfg(test)]
     hook: Mutex<Option<Hook>>,
 }
@@ -271,7 +272,7 @@ impl Node {
             (None, None)
         };
         let st = St { cfg, pin: new_pin(), failures: 0, pairing_until: None, locked_until: None, found: HashMap::new(), session: None, error: None, vdev: Virtual::setup(), retry: 0, retrying: None };
-        let node = Node(Arc::new(Inner { dir, port, mdns: daemon, st: Mutex::new(st), wake: Condvar::new(), pending: Mutex::default(), pairing: Mutex::default(), #[cfg(test)] hook: Mutex::default() }));
+        let node = Node(Arc::new(Inner { dir, port, mdns: daemon, st: Mutex::new(st), wake: Condvar::new(), pending: Mutex::default(), pairing: Mutex::default(), dialing: Mutex::default(), #[cfg(test)] hook: Mutex::default() }));
         if let Some(rx) = browse {
             let n = node.clone();
             std::thread::Builder::new().name("capralink-mdns".into()).spawn(move || {
@@ -598,7 +599,9 @@ impl Node {
     }
 
     /// Dials a session; `gen` = the `St::retry` value it belongs to (a later cancel voids it).
+    /// One at a time, so a cancelled dial finishes (or gives up) before a newer one starts.
     fn dial_link(&self, id: &str, addrs: &[SocketAddr], gen: u64) -> Result<()> {
+        let _one = self.0.dialing.lock().unwrap_or_else(|e| e.into_inner());
         let (my_id, secret, channels) = {
             let st = self.st();
             (st.cfg.device_id.clone(), secret(&st.cfg, id).ok_or_else(|| anyhow!("not paired with that device"))?, st.cfg.settings.channels)
@@ -607,6 +610,13 @@ impl Node {
         let addr = s.peer_addr()?;
         send_msg(&mut s, &Msg::Session { id: my_id })?;
         let (ctl, keys) = handshake(&mut s, &secret, true).context("secure connection failed (try pairing again)")?;
+        #[cfg(test)]
+        self.pause("before link");
+        // cancelled meanwhile: don't ask the peer to start (it would replace its current session)
+        if self.st().retry != gen {
+            ctl.close();
+            bail!("cancelled");
+        }
         ctl.send(&Msg::Link { channels, port: self.0.port })?;
         s.set_read_timeout(Some(LINK_TIMEOUT))?;
         match ctl.recv()? {
@@ -846,8 +856,8 @@ impl Node {
     /// session clears `last_peer`: the side that dialed owns reconnecting.
     fn activate(&self, id: &str, secret: &[u8; 32], addr: SocketAddr, keys: &Keys, ctl: Arc<Ctl>, own: Option<u64>) -> Result<()> {
         let mut st = self.st();
-        // ponytail: a cancelled dial is refused only here, after the peer has accepted it; if the
-        // peer took it after a newer session from us, that newer one drops too. Serialize own dials if seen.
+        // cancelled after its `Link` went out: the peer's copy gets `stop` (own dials are serialized,
+        // so no newer one of ours reached the peer before it)
         if own.is_some_and(|g| g != st.retry) {
             drop(st);
             ctl.close();
@@ -1128,6 +1138,7 @@ impl Node {
         let port = match ctl.recv()? {
             Some(Msg::Link { port, .. }) => port,
             Some(Msg::Manage) => return self.on_manage(&ctl, id, &secret, authed),
+            Some(Msg::Stop) => return Ok(()), // its dial was cancelled after the handshake
             _ => bail!("expected link request"),
         };
         drop(authed); // the usual per-read timeouts from here on
@@ -2254,6 +2265,34 @@ mod tests {
         assert!(a.remote_set(&bid, Settings { bitrate: 16_000, ..before.clone() }, None).is_err());
         assert_eq!(b.state().settings, Settings { remote_config: false, ..before.clone() });
         assert_eq!(load(&bdir).unwrap().settings, Settings { remote_config: false, ..before });
+        let _ = std::fs::remove_dir_all(adir);
+        let _ = std::fs::remove_dir_all(bdir);
+    }
+
+    #[test]
+    fn a_cancelled_dial_cannot_end_a_newer_session() {
+        let ((a, adir), (b, bdir), _aid, bid) = paired_nodes();
+        // an older dial (say a reconnect attempt) stalls after its handshake...
+        let (reached, at) = mpsc::channel();
+        let (go, wait_go) = mpsc::channel::<()>();
+        *a.0.hook.lock().unwrap() = Some(("before link", Box::new(move || {
+            reached.send(()).unwrap();
+            let _ = wait_go.recv_timeout(Duration::from_secs(2));
+        })));
+        let (a2, bid2, gen, at_b) = (a.clone(), bid.clone(), a.st().retry, addr(&b));
+        let old = std::thread::spawn(move || a2.dial_link(&bid2, &[at_b], gen));
+        at.recv().unwrap();
+        // ...while the user connects (it may wait for the older dial to give up)
+        let (a2, bid2) = (a.clone(), bid.clone());
+        let newer = std::thread::spawn(move || a2.connect(&bid2));
+        std::thread::sleep(Duration::from_millis(500));
+        let _ = go.send(());
+        assert!(old.join().unwrap().is_err(), "the older dial was cancelled");
+        newer.join().unwrap().unwrap();
+        let (ca, cb) = (a.st().session.as_ref().unwrap().ctl.clone(), b.st().session.as_ref().map(|s| s.ctl.clone()));
+        std::thread::sleep(Duration::from_millis(500));
+        assert!(a.st().session.as_ref().is_some_and(|s| Arc::ptr_eq(&s.ctl, &ca)), "the newer session survives here");
+        assert!(cb.is_some_and(|cb| b.st().session.as_ref().is_some_and(|s| Arc::ptr_eq(&s.ctl, &cb))), "and on the other computer");
         let _ = std::fs::remove_dir_all(adir);
         let _ = std::fs::remove_dir_all(bdir);
     }
