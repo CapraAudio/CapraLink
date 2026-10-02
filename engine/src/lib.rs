@@ -23,7 +23,7 @@ pub fn system_command(program: &str) -> std::process::Command {
 use anyhow::{anyhow, Context};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::{FromSample, Sample, SampleFormat, SizedSample};
-use dsp::{Complexity, Counters, Jitter, Packetizer, Plan, Playout, Resampler, Rx, FRAME, JITTER_WINDOW_US, MUSIC_JITTER_WINDOW_US, RATE, TARGET};
+use dsp::{Complexity, Counters, Jitter, Mode, Packetizer, Plan, Playout, Resampler, Rx, FRAME, JITTER_WINDOW_US, MUSIC_JITTER_WINDOW_US, RATE, TARGET};
 use ringbuf::traits::{Consumer, Observer, Producer, Split};
 use ringbuf::{HeapCons, HeapRb};
 use std::net::{SocketAddr, UdpSocket};
@@ -176,6 +176,12 @@ pub struct Stats {
     /// The link is in Music Mode (either side has it on).
     #[serde(default)]
     pub music: bool,
+    /// Audio packets the network stack refused (send queue full); dropped, never retried.
+    #[serde(default)]
+    pub send_dropped: u64,
+    /// Slowest capture callback (µs) since the previous `stats()` call.
+    #[serde(default)]
+    pub callback_max_us: u32,
 }
 
 #[derive(Default)]
@@ -194,7 +200,30 @@ struct Shared {
     bitrate: AtomicI32, // currently applied, for Stats
     complexity: AtomicU8,
     music: AtomicBool, // effective Music Mode, set by the node
+    mode: Mutex<Option<TxMode>>, // the encoder/resampler for `music`, prepared for `Tx::apply_mode`
+    callback_us: AtomicU32, // slowest capture callback, reset on read
     failure: Mutex<Option<Failure>>, // see `err_cb`
+}
+
+impl Shared {
+    /// `tx`: (Channels setting, capture rate) when sending. The capture callback allocates
+    /// nothing for a switch: its new encoder and resampler are built here and swapped in there.
+    fn set_music(&self, on: bool, tx: Option<(u16, u32)>) {
+        if self.music.swap(on, Relaxed) == on {
+            return;
+        }
+        if let Some((ch, rate)) = tx {
+            let ch = if on { 2 } else { ch };
+            let m = Mode::new(ch, on).ok().map(|pk| TxMode { pk, rs: (rate != RATE).then(|| Resampler::new(rate, RATE, ch as usize)) });
+            // whatever was in the slot (e.g. the encoder the callback swapped out) is freed here
+            let _old = self.mode.lock().map(|mut slot| std::mem::replace(&mut *slot, m));
+        }
+    }
+}
+
+struct TxMode {
+    pk: Mode,
+    rs: Option<Resampler>,
 }
 
 /// Why a link can't go on (`Link::failure`).
@@ -211,6 +240,7 @@ pub struct Link {
     shared: Arc<Shared>,
     stop: Arc<AtomicBool>,
     rx: Option<JoinHandle<()>>,
+    tx: Option<(u16, u32)>,       // (Channels setting, capture rate) when sending
     _input: Option<cpal::Stream>, // None when Send from is off
     _output: Option<cpal::Stream>, // None when Play to is off
 }
@@ -223,6 +253,11 @@ impl Link {
 
         let sock = UdpSocket::bind(("0.0.0.0", port)).with_context(|| format!("bind UDP port {port}"))?;
         sock.set_read_timeout(Some(Duration::from_millis(200)))?;
+        // A full send queue drops a packet (`send_dropped`) instead of stalling the capture
+        // callback. Not `set_nonblocking`: that flag is shared with the RX thread's clone.
+        // ponytail: still waits up to one timer tick (1–4 ms on Linux, 1 ms on Windows; macOS
+        // UDP sends don't wait); move sending to its own thread if `callback_max_us` shows it.
+        sock.set_write_timeout(Some(Duration::from_millis(1)))?;
         let shared = Arc::new(Shared::default());
         let initial_bitrate = cfg.bitrate.clamp(8_000, 96_000);
         shared.target_bitrate.store(initial_bitrate, Relaxed);
@@ -245,12 +280,13 @@ impl Link {
         let pk = Packetizer::new(cfg.channels, cfg.bitrate, &keys.send)?;
         // None when Send from is off: nothing captured or sent
         let input = in_dev
-            .map(|d| -> anyhow::Result<cpal::Stream> {
-                let s = build_input(&d, cfg, pk, sock.try_clone()?, peer, shared.clone())?;
+            .map(|d| -> anyhow::Result<(cpal::Stream, u32)> {
+                let (s, rate) = build_input(&d, cfg, pk, sock.try_clone()?, peer, shared.clone())?;
                 s.play()?;
-                Ok(s)
+                Ok((s, rate))
             })
             .transpose()?;
+        let tx = input.as_ref().map(|(_, rate)| (cfg.channels, *rate));
 
         let rx = {
             let (shared, stop, mut rx) = (shared.clone(), stop.clone(), Rx::new(&keys.recv));
@@ -274,7 +310,7 @@ impl Link {
                 }
             })?
         };
-        Ok(Link { shared, stop, rx: Some(rx), _input: input, _output: output })
+        Ok(Link { shared, stop, rx: Some(rx), tx, _input: input.map(|(s, _)| s), _output: output })
     }
 
     /// Current (sending, receiving) VU levels, 0..1; cheap enough to poll many times a second.
@@ -286,14 +322,15 @@ impl Link {
         self.read(true)
     }
 
-    /// Like `stats`, but leaves the gap meters to the window (for the log and diagnostics).
+    /// Like `stats`, but leaves the gap and callback meters to the window (for the log and diagnostics).
     pub fn peek(&self) -> Stats {
         self.read(false)
     }
 
     fn read(&self, reset_gaps: bool) -> Stats {
         let c = &self.shared.c;
-        let gap = |g: &AtomicU32| if reset_gaps { g.swap(0, Relaxed) } else { g.load(Relaxed) } as f32 / 1000.0;
+        let max = |g: &AtomicU32| if reset_gaps { g.swap(0, Relaxed) } else { g.load(Relaxed) };
+        let gap = |g| max(g) as f32 / 1000.0;
         Stats {
             sent: c.sent.load(Relaxed),
             received: c.received.load(Relaxed),
@@ -309,12 +346,14 @@ impl Link {
             bitrate: self.shared.bitrate.load(Relaxed),
             complexity: self.shared.complexity.load(Relaxed),
             music: self.shared.music.load(Relaxed),
+            send_dropped: c.send_dropped.load(Relaxed),
+            callback_max_us: max(&self.shared.callback_us),
         }
     }
 
     /// Switches this link's sender and receiver into or out of Music Mode, live.
     pub fn set_music(&self, on: bool) {
-        self.shared.music.store(on, Relaxed);
+        self.shared.set_music(on, self.tx);
     }
 
     /// Sets the sender's target bitrate/loss%, applied by the capture callback (MASTER.md §3.5).
@@ -520,8 +559,6 @@ struct Tx {
     sock: UdpSocket,
     peer: SocketAddr,
     dev_ch: usize,
-    rate: u32,
-    user_ch: u16,
     music: bool,
     rs: Option<Resampler>,
     mixed: Vec<f32>,
@@ -536,11 +573,12 @@ struct Tx {
 
 impl Tx {
     // ponytail: encode + send run inside the capture callback; move them to a dedicated
-    // encode thread fed by a ring if callbacks ever overrun.
+    // encode thread fed by a ring if callbacks ever overrun (`callback_max_us`).
     fn process<T: SizedSample>(&mut self, data: &[T])
     where
         f32: FromSample<T>,
     {
+        let start = Instant::now();
         self.apply_mode();
         self.apply_rate();
         let (dev_ch, out_ch) = (self.dev_ch, self.pk.channels());
@@ -572,6 +610,8 @@ impl Tx {
                     if self.sock.send_to(p, self.peer).is_ok() {
                         self.shared.c.sent.fetch_add(1, Relaxed);
                         gap(&mut self.last_send, &self.shared.tx_gap_us);
+                    } else {
+                        self.shared.c.send_dropped.fetch_add(1, Relaxed);
                     }
                 }
                 // The controller thinks in 10 ms frames: a 20 ms frame counts as two, each with
@@ -589,29 +629,30 @@ impl Tx {
                 self.frame.extend_from_slice(&chunk[take..]);
             }
         }
+        self.shared.callback_us.fetch_max(start.elapsed().as_micros() as u32, Relaxed);
     }
 
     /// Follows the node's Music Mode flag: forced stereo, 20 ms frames, complexity up to 10.
-    /// The encoder is rebuilt in place (seq continues); a partial frame is dropped.
+    /// Swaps in the encoder and resampler `Shared::set_music` prepared (seq continues; the old
+    /// ones go back into the slot, freed there); a partial frame is dropped.
     fn apply_mode(&mut self) {
         let music = self.shared.music.load(Relaxed);
         if music == self.music {
             return;
         }
+        let Ok(mut slot) = self.shared.mode.try_lock() else { return }; // retried next callback
+        let Some(m) = slot.as_mut().filter(|m| m.pk.music == music) else { return };
+        if self.pk.set_mode(&mut m.pk).is_err() {
+            return;
+        }
+        std::mem::swap(&mut self.rs, &mut m.rs);
+        drop(slot);
         self.music = music;
-        let ch = if music { 2 } else { self.user_ch };
-        // ponytail: allocates (new Opus encoder, resampler, buffers) in the audio callback; fine for a rare user toggle
-        let _ = self.pk.set_mode(ch, music);
         let level = self.cx.set_max(if music { 10 } else { 5 });
         if self.pk.set_complexity(level).is_ok() {
             self.shared.complexity.store(level, Relaxed);
         }
-        let ch = self.pk.channels();
-        if self.rs.is_some() {
-            self.rs = Some(Resampler::new(self.rate, RATE, ch));
-        }
-        self.frame.clear();
-        self.frame.reserve(self.pk.frame() * ch);
+        self.frame.clear(); // has room for a 20 ms stereo frame
     }
 
     /// Applies the session thread's latest bitrate/loss% target, only when it actually changed.
@@ -637,12 +678,10 @@ impl Tx {
             sock,
             peer,
             dev_ch,
-            rate,
-            user_ch: cfg.channels,
             music: false,
             rs: (rate != RATE).then(|| Resampler::new(rate, RATE, ch)),
-            mixed: Vec::with_capacity(16_384 * ch),
-            resampled: Vec::with_capacity(32_768 * ch),
+            mixed: Vec::with_capacity(16_384 * 2), // stereo: Music Mode can switch to it
+            resampled: Vec::with_capacity(32_768 * 2),
             frame: Vec::with_capacity(4 * FRAME), // room for a 20 ms stereo frame
             last_send: None,
             shared,
@@ -653,7 +692,8 @@ impl Tx {
     }
 }
 
-fn build_input(dev: &cpal::Device, cfg: &Settings, pk: Packetizer, sock: UdpSocket, peer: SocketAddr, shared: Arc<Shared>) -> anyhow::Result<cpal::Stream> {
+/// The capture stream and its sample rate.
+fn build_input(dev: &cpal::Device, cfg: &Settings, pk: Packetizer, sock: UdpSocket, peer: SocketAddr, shared: Arc<Shared>) -> anyhow::Result<(cpal::Stream, u32)> {
     // "Everything this PC plays" is a playback device: its mix format is the one loopback takes.
     let sc = if cfg.input.as_deref() == Some(EVERYTHING) { dev.default_output_config()? } else { pick_config(dev.default_input_config()?, dev.supported_input_configs()?) };
     let (dev_ch, rate, fmt) = (sc.channels() as usize, sc.sample_rate(), sc.sample_format());
@@ -665,13 +705,14 @@ fn build_input(dev: &cpal::Device, cfg: &Settings, pk: Packetizer, sock: UdpSock
     if let cpal::SupportedBufferSize::Range { min, max } = *sc.buffer_size() {
         c.buffer_size = cpal::BufferSize::Fixed((rate / 100).clamp(min, max));
     }
-    Ok(match fmt {
+    let s = match fmt {
         SampleFormat::F32 => dev.build_input_stream(c, move |d: &[f32], _: &_| tx.process(d), err_cb, None)?,
         SampleFormat::I16 => dev.build_input_stream(c, move |d: &[i16], _: &_| tx.process(d), err_cb, None)?,
         SampleFormat::I32 => dev.build_input_stream(c, move |d: &[i32], _: &_| tx.process(d), err_cb, None)?,
         SampleFormat::U16 => dev.build_input_stream(c, move |d: &[u16], _: &_| tx.process(d), err_cb, None)?,
         f => anyhow::bail!("unsupported input sample format {f}"),
-    })
+    };
+    Ok((s, rate))
 }
 
 struct Playback {
@@ -810,6 +851,49 @@ fn stream_error_failures() {
     for k in [DeviceBusy, DeviceChanged, Xrun, RealtimeDenied, BackendError, Other] {
         assert_eq!(f(k, true), None, "{k:?} is log-only");
     }
+}
+
+/// Test builds count heap allocations per thread, to prove the capture callback makes none.
+#[cfg(test)]
+mod alloc_count {
+    use std::alloc::{GlobalAlloc, Layout, System};
+    use std::cell::Cell;
+    thread_local!(static N: Cell<usize> = const { Cell::new(0) });
+    struct Counting;
+    unsafe impl GlobalAlloc for Counting {
+        unsafe fn alloc(&self, l: Layout) -> *mut u8 {
+            let _ = N.try_with(|n| n.set(n.get() + 1));
+            unsafe { System.alloc(l) }
+        }
+        unsafe fn dealloc(&self, p: *mut u8, l: Layout) {
+            unsafe { System.dealloc(p, l) }
+        }
+    }
+    #[global_allocator]
+    static A: Counting = Counting;
+    pub fn allocations() -> usize {
+        N.with(Cell::get)
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn capture_callback_doesnt_allocate() {
+    let peer = UdpSocket::bind("127.0.0.1:0").unwrap();
+    let (shared, rate) = (Arc::new(Shared::default()), 96_000); // resampled, through the anti-alias filter
+    let pk = Packetizer::new(1, 64_000, &[7; 32]).unwrap();
+    let mut tx = Tx::new(&Settings::default(), pk, UdpSocket::bind("127.0.0.1:0").unwrap(), peer.local_addr().unwrap(), shared.clone(), 2, rate);
+    let chunk = [0.1f32; 2 * 960]; // 10 ms of device stereo
+    tx.process(&chunk);
+    shared.set_music(true, Some((1, rate))); // what `Link::set_music` does
+    let before = alloc_count::allocations();
+    for _ in 0..10 {
+        tx.process(&chunk);
+    }
+    assert_eq!(alloc_count::allocations() - before, 0, "the capture callback allocated");
+    assert!(tx.music && tx.pk.channels() == 2 && tx.pk.frame() == 2 * FRAME, "switched to Music Mode");
+    assert_eq!(shared.c.sent.load(Relaxed), 1 + 5, "one 10 ms mono packet, then five 20 ms stereo ones");
+    assert!(shared.callback_us.load(Relaxed) > 0);
 }
 
 #[cfg(test)]

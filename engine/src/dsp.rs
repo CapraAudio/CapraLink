@@ -22,6 +22,7 @@ pub struct Counters {
     pub lost: AtomicU64,
     pub fec_recovered: AtomicU64,
     pub underruns: AtomicU64,
+    pub send_dropped: AtomicU64,
 }
 
 fn inc(c: &AtomicU64, n: u64) {
@@ -82,15 +83,15 @@ impl Packetizer {
         Ok(Packetizer { enc, aead: cipher(key), channels: channels as u8, music: false, seq: 0, buf })
     }
 
-    /// Switches channels / Music Mode live by replacing the Opus encoder (bitrate, complexity
-    /// and loss% carry over). The AEAD key and `seq` stay, so nonces keep counting up.
-    pub fn set_mode(&mut self, channels: u16, music: bool) -> anyhow::Result<()> {
-        let bitrate = match self.enc.get_bitrate()? {
-            opus::Bitrate::Bits(b) => b,
-            _ => 64_000,
-        };
-        self.enc = encoder(channels, music, bitrate, self.enc.get_complexity()?, self.enc.get_packet_loss_perc()?)?;
-        (self.channels, self.music) = (channels as u8, music);
+    /// Switches channels / Music Mode live by swapping in `m`'s encoder (bitrate, complexity
+    /// and loss% carry over); `m` gets the old one back. Doesn't allocate, so it can run in the
+    /// capture callback. The AEAD key and `seq` stay, so nonces keep counting up.
+    pub fn set_mode(&mut self, m: &mut Mode) -> anyhow::Result<()> {
+        m.enc.set_bitrate(self.enc.get_bitrate()?)?;
+        m.enc.set_complexity(self.enc.get_complexity()?)?;
+        m.enc.set_packet_loss_perc(self.enc.get_packet_loss_perc()?)?;
+        std::mem::swap(&mut self.enc, &mut m.enc);
+        ((self.channels, m.channels), (self.music, m.music)) = ((m.channels, self.channels), (m.music, self.music));
         Ok(())
     }
 
@@ -129,6 +130,19 @@ impl Packetizer {
         let tag = self.aead.encrypt_inout_detached(&nonce(seq), hdr, (&mut body[..1 + n]).into()).map_err(|_| anyhow::anyhow!("encrypt failed"))?;
         self.buf[end..end + TAG].copy_from_slice(&tag);
         Ok(&self.buf[..end + TAG])
+    }
+}
+
+/// An encoder for `Packetizer::set_mode`, built off the audio thread (creating one allocates).
+pub struct Mode {
+    enc: opus::Encoder,
+    channels: u8,
+    pub music: bool,
+}
+
+impl Mode {
+    pub fn new(channels: u16, music: bool) -> anyhow::Result<Self> {
+        Ok(Mode { enc: encoder(channels, music, 64_000, 5, 5)?, channels: channels as u8, music })
     }
 }
 
@@ -566,7 +580,7 @@ mod tests {
         let mut tx = Packetizer::new(1, 64_000, &key).unwrap();
         let tone = |n: usize, ch: usize| -> Vec<f32> { (0..n * ch).map(|i| 0.5 * (i as f32 * 0.13 / ch as f32).sin()).collect() };
         let mut packets: Vec<Vec<u8>> = (0..10).map(|_| tx.packet(&tone(FRAME, 1)).unwrap().to_vec()).collect();
-        tx.set_mode(2, true).unwrap();
+        tx.set_mode(&mut Mode::new(2, true).unwrap()).unwrap();
         assert_eq!((tx.channels(), tx.frame()), (2, 2 * FRAME));
         packets.extend((0..10).map(|_| tx.packet(&tone(2 * FRAME, 2)).unwrap().to_vec()));
         // seq (the AEAD nonce) keeps counting across the encoder swap: no reuse
@@ -591,7 +605,7 @@ mod tests {
         assert_eq!(c.lost.load(Relaxed), 2);
 
         // and back to normal
-        tx.set_mode(1, false).unwrap();
+        tx.set_mode(&mut Mode::new(1, false).unwrap()).unwrap();
         assert_eq!(tx.frame(), FRAME);
         let p = tx.packet(&tone(FRAME, 1)).unwrap();
         assert_eq!(u32::from_be_bytes([p[3], p[4], p[5], p[6]]), 20);
