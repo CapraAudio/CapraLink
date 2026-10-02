@@ -235,7 +235,7 @@ impl Rx {
 }
 
 pub const TARGET: usize = RATE as usize / 100; // 10 ms: minimum cushion ...
-pub const MUSIC_TARGET: usize = 4 * TARGET; // ... 40 ms in Music Mode
+pub const MUSIC_TARGET: usize = 15 * TARGET; // ... 150 ms in Music Mode (covers a typical Wi-Fi stall from the start)
 const MARGIN: usize = RATE as usize / 200; // 5 ms on top of measured jitter
 const HEADROOM: usize = RATE as usize / 10; // fill beyond need + target + 100 ms is discarded
 const GROW: usize = RATE as usize / 100; // +10 ms boost per underrun (spike jitter missed) ...
@@ -297,7 +297,7 @@ impl Playout {
     }
 
     /// Normal: 10 ms minimum, 125 ms ceiling, +10 ms per underrun.
-    /// Music Mode: 40 ms minimum, 300 ms ceiling, +30 ms per underrun, speed change ≤ 0.5%.
+    /// Music Mode: 150 ms minimum, 300 ms ceiling, +30 ms per underrun, speed change ≤ 0.5%.
     pub fn set_music(&mut self, music: bool) {
         (self.min, self.max, self.grow, self.max_adj) =
             if music { (MUSIC_TARGET, MUSIC_MAX_TARGET, MUSIC_GROW, MUSIC_MAX_ADJ) } else { (TARGET, MAX_TARGET, GROW, MAX_ADJ) };
@@ -645,8 +645,8 @@ mod tests {
         let mut p = Playout::default();
         assert_eq!(p.target(), TARGET);
         p.set_music(true);
-        assert_eq!(p.target(), RATE as usize * 40 / 1000);
-        assert_eq!(p.plan(480 + MUSIC_TARGET - 1, 480), Plan::Silence, "prebuffers 40 ms");
+        assert_eq!(p.target(), RATE as usize * 150 / 1000);
+        assert_eq!(p.plan(480 + MUSIC_TARGET - 1, 480), Plan::Silence, "prebuffers 150 ms");
         // a 150 ms stall is covered in Music Mode (ceiling 300 ms), capped at 125 ms normally
         p.set_jitter(RATE as usize * 150 / 1000);
         assert_eq!(p.target(), RATE as usize * 155 / 1000);
@@ -667,7 +667,7 @@ mod tests {
         // cushion far below target: Music Mode slows by at most 0.5% (pitch-safe)
         let mut m = Playout::default();
         m.set_music(true);
-        assert!(matches!(m.plan(480 + MUSIC_TARGET, 480), Plan::Play { .. }), "starts once 40 ms is buffered");
+        assert!(matches!(m.plan(480 + MUSIC_TARGET, 480), Plan::Play { .. }), "starts once 150 ms is buffered");
         let r = (0..200).map(|_| m.plan(480 + MUSIC_TARGET / 2, 480)).last().unwrap();
         assert!(matches!(r, Plan::Play { ratio, .. } if (0.995..1.0).contains(&ratio)), "{r:?}");
         p.set_music(false);

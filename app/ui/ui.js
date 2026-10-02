@@ -44,7 +44,8 @@ function showMusic() {
   // the track fills up to the bitrate actually being sent (adaptive), outside Music Mode
   const live = on ? null : liveRate;
   els.bitrate.style.setProperty('--live', live ? Math.min(1, Math.max(0, (live - 8) / (96 - 8))) : 0);
-  els.bitrateVal.textContent = on ? MUSIC_RATE : els.bitrate.value + ' kbps' + (live ? ` · now ${live}` : '');
+  // current/target, e.g. "48kbps/64kbps" (0 when nothing is being sent)
+  els.bitrateVal.textContent = on ? MUSIC_RATE : `${live || 0}kbps/${els.bitrate.value}kbps`;
 }
 
 // ---- actions ----
@@ -283,7 +284,7 @@ function remotePanel() {
     seg.appendChild(b);
   }
   box.appendChild(seg);
-  box.appendChild(el('label', null, 'Bitrate'));
+  box.appendChild(el('label', null, 'Bitrate Target'));
   rate.type = 'range'; rate.min = 8; rate.max = 96; rate.step = 8; rate.value = Math.round(s.bitrate / 1000);
   rate.addEventListener('input', () => { s.bitrate = Number(rate.value) * 1000; sync(); });
   box.appendChild(rate);
