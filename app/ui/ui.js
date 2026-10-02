@@ -7,7 +7,8 @@ const els = {
 };
 
 let channels = 1;
-let effectiveMusic = false; // the link is in Music Mode (either side has it on)
+let effectiveMusic = false;
+let liveRate = null; // kbps actually being sent, while streaming // the link is in Music Mode (either side has it on)
 let settingsLoaded = false;
 let currentId;
 let actionError = '';
@@ -40,7 +41,10 @@ function showMusic() {
     b.classList.toggle('active', Number(b.dataset.v) === (on ? 2 : channels));
   }
   els.bitrate.disabled = on;
-  els.bitrateVal.textContent = on ? MUSIC_RATE : els.bitrate.value + ' kbps';
+  // the track fills up to the bitrate actually being sent (adaptive), outside Music Mode
+  const live = on ? null : liveRate;
+  els.bitrate.style.setProperty('--live', live ? Math.min(1, Math.max(0, (live - 8) / (96 - 8))) : 0);
+  els.bitrateVal.textContent = on ? MUSIC_RATE : els.bitrate.value + ' kbps' + (live ? ` · now ${live}` : '');
 }
 
 // ---- actions ----
@@ -396,6 +400,8 @@ async function poll() {
   els.status.textContent = peer ? 'Streaming' : 'Idle';
   els.status.classList.toggle('on', !!peer);
   const s = st.stats;
+  liveRate = s ? Math.round(s.bitrate / 1000) : null;
+  showMusic();
   if (s) {
     els.stats.textContent =
       `sent ${s.sent} · recv ${s.received} · lost ${s.lost} · fec ${s.fec_recovered} · underruns ${s.underruns} · buf ${s.buffer_ms.toFixed(0)}/${s.target_ms.toFixed(0)}ms · gap tx ${s.tx_gap_ms.toFixed(0)} rx ${s.rx_gap_ms.toFixed(0)}ms · ${Math.round(s.bitrate / 1000)} kbps · cx ${s.complexity}`;

@@ -42,6 +42,15 @@
   .seg button.active { background: var(--accent); color: white; }
   .seg button:disabled { opacity: .6; cursor: default; }
   input[type=range] { padding: 0; margin-bottom: 4px; }
+  /* Bitrate: the knob is the target you set; the filled part of the track is what is being sent
+     right now (adaptive, below the target on a busy network). --live animates where supported. */
+  @property --live { syntax: '<number>'; inherits: false; initial-value: 0; }
+  input.rate { -webkit-appearance: none; appearance: none; height: 6px; margin: 8px 0 6px; border-radius: 3px;
+    --live: 0; transition: --live .9s ease;
+    background: linear-gradient(to right, var(--accent) calc(8px + var(--live) * (100% - 16px)), var(--border) 0); }
+  input.rate::-webkit-slider-thumb { -webkit-appearance: none; width: 16px; height: 16px; border-radius: 50%;
+    background: #fff; border: 1px solid var(--border); box-shadow: 0 1px 2px rgba(0,0,0,.3); cursor: pointer; }
+  input.rate:disabled::-webkit-slider-thumb { opacity: .5; }
   .check { display: flex; align-items: center; gap: 6px; font-size: 13px; color: var(--fg); margin: 2px 0 4px; }
   .check input { width: auto; margin: 0; }
   .bitrate-val { font-size: 11px; color: var(--sub); text-align: right; margin-bottom: 8px; }
@@ -181,7 +190,7 @@
       <button data-v="2">Stereo</button>
     </div>
     <label>Bitrate</label>
-    <input id="bitrate" type="range" min="8" max="96" step="8" value="64" />
+    <input id="bitrate" class="rate" type="range" min="8" max="96" step="8" value="64" />
     <div class="bitrate-val" id="bitrateVal">64 kbps</div>
   </section>
 
