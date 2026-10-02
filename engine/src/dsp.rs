@@ -439,20 +439,68 @@ impl Complexity {
     }
 }
 
-/// Streaming linear resampler for interleaved audio, state carried across calls.
-// ponytail: linear resampler, swap for a windowed-sinc (rubato) if aliasing is audible
+/// Streaming linear resampler for interleaved audio, state carried across calls. Sources above
+/// 48 kHz first go through a Blackman-windowed sinc low-pass (~74 dB stopband), so nothing
+/// above 28 kHz folds back into the audible band.
+// ponytail: the FIR runs at the source rate (6 taps per 8 kHz of it: 73 at 96 kHz, 145 at
+// 192 kHz); compute it only at the output positions (polyphase) if that CPU ever matters.
 pub struct Resampler {
     pub step: f64, // input frames per output frame
     pos: f64,      // read position; 0 = `prev`, 1.. = current chunk
     prev: Vec<f32>,
+    fir: Vec<f32>,      // anti-alias taps; empty at ≤ 48 kHz (no filtering, no delay)
+    hist: Vec<f32>,     // the last fir.len() - 1 input frames, then the current chunk
+    filtered: Vec<f32>, // the current chunk after the FIR
 }
 
 impl Resampler {
     pub fn new(from: u32, to: u32, channels: usize) -> Self {
-        Resampler { step: from as f64 / to as f64, pos: 0.0, prev: vec![0.0; channels] }
+        // Opus keeps 0–20 kHz; an alias of f lands at 48k - f, so only f > 28 kHz must go:
+        // centre the transition (passband to 20 kHz, stopband from 28 kHz) on 24 kHz.
+        let taps = if from > RATE { (6 * from / 8_000) as usize | 1 } else { 0 };
+        let fc = 24_000.0 / from as f64;
+        let m = taps.saturating_sub(1) as f64;
+        let mut fir: Vec<f32> = (0..taps)
+            .map(|i| {
+                let (x, w) = (i as f64 - m / 2.0, std::f64::consts::TAU * i as f64 / m);
+                let sinc = if x == 0.0 { 2.0 * fc } else { (std::f64::consts::TAU * fc * x).sin() / (std::f64::consts::PI * x) };
+                (sinc * (0.42 - 0.5 * w.cos() + 0.08 * (2.0 * w).cos())) as f32
+            })
+            .collect();
+        let sum: f32 = fir.iter().sum();
+        fir.iter_mut().for_each(|h| *h /= sum); // unity gain at DC
+        let room = 16_384 * channels; // the capture callback's largest expected chunk
+        Resampler {
+            step: from as f64 / to as f64,
+            pos: 0.0,
+            prev: vec![0.0; channels],
+            hist: Vec::with_capacity(if taps > 0 { room + taps * channels } else { 0 }),
+            filtered: Vec::with_capacity(if taps > 0 { room } else { 0 }),
+            fir,
+        }
     }
 
     pub fn process(&mut self, input: &[f32], out: &mut Vec<f32>) {
+        if self.fir.is_empty() {
+            return self.linear(input, out);
+        }
+        let ch = self.prev.len();
+        let n = input.len() / ch;
+        let (mut hist, mut y) = (std::mem::take(&mut self.hist), std::mem::take(&mut self.filtered));
+        hist.resize((self.fir.len() - 1) * ch, 0.0); // zeros before the first chunk
+        hist.extend_from_slice(&input[..n * ch]);
+        y.clear();
+        for j in 0..n {
+            for c in 0..ch {
+                y.push(hist[j * ch + c..].iter().step_by(ch).zip(&self.fir).map(|(x, h)| x * h).sum());
+            }
+        }
+        hist.drain(..n * ch);
+        self.linear(&y, out);
+        (self.hist, self.filtered) = (hist, y);
+    }
+
+    fn linear(&mut self, input: &[f32], out: &mut Vec<f32>) {
         let ch = self.prev.len();
         let n = input.len() / ch;
         while self.pos < n as f64 {
@@ -760,5 +808,30 @@ mod tests {
             let expect = total_in as f64 * 48_000.0 / 44_100.0;
             assert!((out.len() as f64 / 2.0 - expect).abs() <= 1.0, "{} vs {expect}", out.len() / 2);
         }
+    }
+
+    #[test]
+    fn resample_anti_alias() {
+        // level (dB re the input) of a 250 ms tone at `hz`, resampled from `from` to 48 kHz in 10 ms chunks
+        let level = |from: u32, hz: f64| {
+            let mut r = Resampler::new(from, RATE, 2);
+            let tone = |i: usize| 0.5 * (std::f64::consts::TAU * hz * i as f64 / from as f64).sin() as f32;
+            let input: Vec<f32> = (0..from as usize / 4).flat_map(|i| [tone(i), tone(i)]).collect();
+            let mut out = Vec::new();
+            for chunk in input.chunks(2 * from as usize / 100) {
+                r.process(chunk, &mut out);
+            }
+            assert!((out.len() as f64 / 2.0 - RATE as f64 / 4.0).abs() <= 1.0, "{from}: {} frames", out.len() / 2);
+            let left: Vec<f32> = out.iter().step_by(2).skip(480).copied().collect(); // past the filter's warm-up
+            let rms = (left.iter().map(|s| s * s).sum::<f32>() / left.len() as f32).sqrt();
+            20.0 * (rms / (0.5 / 2f32.sqrt())).log10()
+        };
+        for from in [88_200, 96_000, 176_400, 192_000] {
+            let (alias, pass) = (level(from, 30_000.0), level(from, 1_000.0));
+            assert!(alias <= -60.0, "{from}: 30 kHz folds to {alias} dB");
+            assert!(pass.abs() <= 0.5, "{from}: 1 kHz at {pass} dB");
+        }
+        assert!(level(48_000, 1_000.0).abs() < 1e-3, "48 kHz passes untouched");
+        assert!(Resampler::new(48_000, RATE, 2).fir.is_empty() && Resampler::new(RATE, 44_100, 2).fir.is_empty(), "no filter, no delay at ≤ 48 kHz");
     }
 }
