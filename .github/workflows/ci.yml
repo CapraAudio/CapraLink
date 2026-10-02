@@ -35,7 +35,7 @@ jobs:
         if: runner.os == 'macOS'
         run: |
           cargo tauri build --target universal-apple-darwin --bundles app -- --locked
-          packaging/macos/build-pkg.sh target/universal-apple-darwin/release/bundle/macos/CapraLink.app "$(jq -r .version app/tauri.conf.json)" dist
+          packaging/macos/build-pkg.sh target/universal-apple-darwin/release/bundle/macos/CapraLink.app "$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[] | select(.name == "capralink") | .version')" dist
       - name: bundle (Linux)
         if: runner.os == 'Linux'
         run: |

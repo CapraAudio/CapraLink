@@ -510,7 +510,7 @@ mod tests {
         c.disconnect().unwrap();
         assert!(c.checks().unwrap()[0].ok);
         let d = c.diagnostics(true, Some("nobody")).unwrap();
-        assert!(d.contains("This computer: This computer") && d.contains("Couldn't get its diagnostics"), "{d}");
+        assert!(!d.lines().any(|l| l.starts_with("This computer:")) && d.contains("Couldn't get its diagnostics"), "{d}"); // the name line is left out when hidden
         let _ = std::fs::remove_dir_all(dir);
     }
 

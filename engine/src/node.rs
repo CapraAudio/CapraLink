@@ -398,10 +398,20 @@ impl Node {
             v.push(check(!cable, title.into(), Some("Windows sends all sound into VB-Cable: set your speakers or headset as the default output again in Sound settings".into())));
         }
         let st = self.st();
+        for (label, saved, list) in [("Send from", &st.cfg.settings.input, crate::input_devices()), ("Play to", &st.cfg.settings.output, crate::output_devices())] {
+            if let Some(d) = saved.as_deref().filter(|d| *d != crate::NO_DEVICE && !list.iter().any(|n| n == d)) {
+                v.push(check(false, format!("{label} device \"{d}\" isn't connected"), Some("Plug it in, then use Refresh devices… in the list, or pick another device".into())));
+            }
+        }
         for p in &st.cfg.peers {
-            let ok = st.found.contains_key(&p.id) || st.session.as_ref().is_some_and(|s| s.peer_id == p.id);
-            let title = if ok { format!("{} is on the network", p.name) } else { format!("{} hasn't been seen on the network", p.name) };
-            v.push(check(ok, title, Some("If it's on, check it's on the same network, or use Edit address with its IP. On Windows, set the network to Private.".into())));
+            let seen = st.found.contains_key(&p.id) || st.session.as_ref().is_some_and(|s| s.peer_id == p.id);
+            // not announced (yet, or multicast is blocked) but reachable by its saved address is normal
+            let title = match (&p.addr, seen) {
+                (_, true) => format!("{} is on the network", p.name),
+                (Some(a), false) => format!("{} hasn't announced itself yet; CapraLink will use its saved address {a}", p.name),
+                (None, false) => format!("{} hasn't been seen on the network", p.name),
+            };
+            v.push(check(seen || p.addr.is_some(), title, Some("If it's on, check it's on the same network, or use Edit address with its IP. On Windows, set the network to Private.".into())));
         }
         v
     }
@@ -413,8 +423,21 @@ impl Node {
         let mut t = String::new();
         let st = self.st();
         let _ = writeln!(t, "CapraLink {} diagnostics, {}", env!("CARGO_PKG_VERSION"), crate::log::now());
-        let _ = writeln!(t, "System: {} {}\nThis computer: {}", std::env::consts::OS, std::env::consts::ARCH, st.cfg.name);
-        let _ = writeln!(t, "\n== Settings ==\n{:#?}", st.cfg.settings);
+        let _ = writeln!(t, "System: {} ({})", crate::os_version(), std::env::consts::ARCH);
+        if !redact {
+            let _ = writeln!(t, "This computer: {}", st.cfg.name);
+        }
+        let s = &st.cfg.settings;
+        let dev = |d: &Option<String>, list: &[String]| match d.as_deref() {
+            None => "System default".to_string(),
+            Some(crate::NO_DEVICE) => "None (off)".to_string(),
+            Some(d) if list.iter().any(|n| n == d) => d.to_string(),
+            Some(d) => format!("{d} (not connected)"),
+        };
+        let on = |b: bool| if b { "on" } else { "off" };
+        let _ = writeln!(t, "\n== Settings ==\nSend from: {}\nPlay to: {}", dev(&s.input, &ins), dev(&s.output, &outs));
+        let _ = writeln!(t, "Channels: {}\nBitrate: {} kbps", if s.channels == 2 { "Stereo" } else { "Mono" }, s.bitrate / 1000);
+        let _ = writeln!(t, "Music Mode: {}\nRun in background: {}\nRemote configuration: {}\nReconnect automatically: {}", on(s.music_mode), on(s.service), on(s.remote_config), on(s.auto_reconnect));
         let _ = writeln!(t, "\n== Audio devices ==\nSend from: {}\nPlay to: {}", ins.join(" | "), outs.join(" | "));
         let _ = writeln!(t, "\n== Paired devices ==");
         let conn = st.session.as_ref().map(|s| s.peer_id.as_str());
@@ -443,7 +466,11 @@ impl Node {
 
     /// Paired device `id`'s diagnostics (it must allow remote configuration).
     pub fn remote_diagnostics(&self, id: &str, redact: bool) -> Result<String> {
-        match self.manage(id, &Msg::Diagnostics { redact })? {
+        let reply = self.manage(id, &Msg::Diagnostics { redact }).map_err(|e| match e.to_string().contains("unsupported request") {
+            true => anyhow!("it runs an older version of CapraLink: update it to include its log"),
+            false => e,
+        });
+        match reply? {
             Msg::Text { text, .. } => Ok(text),
             _ => bail!("unexpected reply"),
         }
@@ -1904,7 +1931,8 @@ mod tests {
         let checks = a.checks();
         assert!(checks[0].ok && checks[0].fix.is_none());
         let seen = checks.iter().find(|c| c.title.contains(&b.state().name)).unwrap();
-        assert!(!seen.ok && seen.title.contains("hasn't been seen") && seen.fix.is_some(), "no mDNS here: b was never seen");
+        // no mDNS here, but pairing by IP saved b's address: not announced, still reachable
+        assert!(seen.ok && seen.title.contains("hasn't announced itself yet") && seen.fix.is_none(), "{}", seen.title);
 
         let err = a.remote_diagnostics(&bid, true).unwrap_err().to_string();
         assert!(err.contains("remote configuration is off"), "{err}");
@@ -1914,7 +1942,8 @@ mod tests {
         std::fs::write(bdir.join(crate::log::OLD), format!("{log}last line from 10.1.2.3\n")).unwrap();
         let t = a.remote_diagnostics(&bid, true).unwrap();
         assert!(t.len() > 3 * TEXT_CHUNK && t.contains(&log) && t.contains("last line from <ip-"), "{}", &t[..500]);
-        assert!(t.contains("This computer: This computer") && !t.contains(&b.state().name), "redacted on b's side");
+        // (test nodes share the hostname, so log lines may say "This computer:" — only the header line counts)
+        assert!(!t.lines().any(|l| l.starts_with("This computer:")) && !t.contains(&b.state().name), "redacted on b's side");
         assert!(a.remote_diagnostics(&bid, false).unwrap().contains(&format!("This computer: {}", b.state().name)));
         let mine = a.diagnostics(false);
         assert!(mine.contains("== Setup checks ==") && mine.contains(&format!("[{}]", &bid[..8])) && !mine.contains(&bid), "ids only as prefixes");

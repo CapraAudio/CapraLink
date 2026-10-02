@@ -2,6 +2,10 @@
 members = ["engine", "app"]
 resolver = "2"
 
+# the one version number: the app, the engine, diagnostics and installers all read it
+[workspace.package]
+version = "0.1.1"
+
 [profile.release]
 opt-level = 3
 lto = true

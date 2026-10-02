@@ -455,7 +455,7 @@ dependencies = [
 
 [[package]]
 name = "capralink_engine"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "chacha20poly1305 0.11.0",

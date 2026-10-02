@@ -1,6 +1,6 @@
 [package]
 name = "capralink"
-version = "0.1.1"
+version.workspace = true
 edition = "2021"
 license = "GPL-3.0-only"
 

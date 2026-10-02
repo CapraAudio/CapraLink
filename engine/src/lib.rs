@@ -348,6 +348,25 @@ fn find(input: bool, want: &Option<String>) -> anyhow::Result<Option<cpal::Devic
 }
 
 /// The system's default playback device's name (Windows setup check).
+/// "macOS 26.0", "Windows 10.0.26100", "SteamOS" …, for diagnostics; falls back to the OS family.
+pub(crate) fn os_version() -> String {
+    let out = |prog: &str, args: &[&str]| {
+        let mut c = system_command(prog);
+        c.args(args).stdin(std::process::Stdio::null());
+        #[cfg(windows)]
+        std::os::windows::process::CommandExt::creation_flags(&mut c, 0x0800_0000); // CREATE_NO_WINDOW
+        c.output().ok().map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string()).filter(|s| !s.is_empty())
+    };
+    let v = if cfg!(target_os = "macos") {
+        out("sw_vers", &["-productVersion"]).map(|v| format!("macOS {v}"))
+    } else if cfg!(windows) {
+        out("cmd", &["/c", "ver"]) // "Microsoft Windows [Version 10.0.26100.1]"
+    } else {
+        std::fs::read_to_string("/etc/os-release").ok().and_then(|s| s.lines().find_map(|l| Some(l.strip_prefix("PRETTY_NAME=")?.trim_matches('"').to_string())))
+    };
+    v.unwrap_or_else(|| std::env::consts::OS.to_string())
+}
+
 #[cfg(windows)]
 pub(crate) fn default_output_name() -> Option<String> {
     cpal::default_host().default_output_device().map(|d| name(&d))
