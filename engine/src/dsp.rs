@@ -247,7 +247,7 @@ const MAX_TARGET: usize = RATE as usize / 8; // 125 ms
 const MUSIC_MAX_TARGET: usize = RATE as usize * 3 / 10; // 300 ms
 const MUSIC_GROW: usize = RATE as usize * 3 / 100; // +30 ms per underrun
 pub const JITTER_WINDOW_US: u32 = 5_000_000; // stall memory 5–10 s ...
-pub const MUSIC_JITTER_WINDOW_US: u32 = 30_000_000; // ... 30–60 s in Music Mode
+pub const MUSIC_JITTER_WINDOW_US: u32 = 120_000_000; // ... 2–4 min in Music Mode (Wi-Fi stalls ~every 60–90 s)
 const WINDOW: usize = RATE as usize / 2; // low-water mark measured over 0.5 s
 const TAU: f32 = 2.0 * RATE as f32; // drift controller: remove a cushion error over ~2 s ...
 const MAX_ADJ: f32 = 0.02; // ... playing at most 2% fast/slow (inaudible on speech)
@@ -656,11 +656,12 @@ mod tests {
         p.set_music(true);
         p.underrun();
         assert_eq!(p.target(), MUSIC_TARGET + MUSIC_GROW, "a surprise stall adds 30 ms in Music Mode");
-        // Music Mode remembers a stall for at least 30 s of smooth packets
+        // Music Mode remembers a stall for at least 2 min of smooth packets (periodic Wi-Fi stalls
+        // came every 60–90 s in the field; a 30 s memory let each one hit a shrunken buffer)
         let mut j = Jitter::default();
         j.push(150_000, 20_000, MUSIC_JITTER_WINDOW_US);
-        for _ in 0..1500 {
-            j.push(20_000, 20_000, MUSIC_JITTER_WINDOW_US); // 30 s
+        for _ in 0..6000 {
+            j.push(20_000, 20_000, MUSIC_JITTER_WINDOW_US); // 120 s
         }
         assert_eq!(j.push(20_000, 20_000, MUSIC_JITTER_WINDOW_US), 130_000);
         // cushion far below target: Music Mode slows by at most 0.5% (pitch-safe)
