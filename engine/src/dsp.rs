@@ -244,7 +244,7 @@ const RELAX: usize = RATE as usize; // ... per second of clean playback
 const MAX_TARGET: usize = RATE as usize / 8; // 125 ms
 // Music Mode trades delay for never hiccuping on stall-prone Wi-Fi: a deeper ceiling, a bigger
 // step after a surprise stall, and (in `Jitter`) a much longer memory of past stalls.
-const MUSIC_MAX_TARGET: usize = RATE as usize * 3 / 10; // 300 ms
+const MUSIC_MAX_TARGET: usize = RATE as usize; // 1 s: rides out a ~0.7 s Wi-Fi dropout (owner OK, Hi-Fi later)
 const MUSIC_GROW: usize = RATE as usize * 3 / 100; // +30 ms per underrun
 pub const JITTER_WINDOW_US: u32 = 5_000_000; // stall memory 5–10 s ...
 pub const MUSIC_JITTER_WINDOW_US: u32 = 120_000_000; // ... 2–4 min in Music Mode (Wi-Fi stalls ~every 60–90 s)
@@ -297,7 +297,7 @@ impl Playout {
     }
 
     /// Normal: 10 ms minimum, 125 ms ceiling, +10 ms per underrun.
-    /// Music Mode: 150 ms minimum, 300 ms ceiling, +30 ms per underrun, speed change ≤ 0.5%.
+    /// Music Mode: 150 ms minimum, 1 s ceiling, +30 ms per underrun, speed change ≤ 0.5%.
     pub fn set_music(&mut self, music: bool) {
         (self.min, self.max, self.grow, self.max_adj) =
             if music { (MUSIC_TARGET, MUSIC_MAX_TARGET, MUSIC_GROW, MUSIC_MAX_ADJ) } else { (TARGET, MAX_TARGET, GROW, MAX_ADJ) };
@@ -647,9 +647,15 @@ mod tests {
         p.set_music(true);
         assert_eq!(p.target(), RATE as usize * 150 / 1000);
         assert_eq!(p.plan(480 + MUSIC_TARGET - 1, 480), Plan::Silence, "prebuffers 150 ms");
-        // a 150 ms stall is covered in Music Mode (ceiling 300 ms), capped at 125 ms normally
+        // a 150 ms stall is covered in Music Mode (ceiling 1 s), capped at 125 ms normally
         p.set_jitter(RATE as usize * 150 / 1000);
         assert_eq!(p.target(), RATE as usize * 155 / 1000);
+        // a ~0.7 s Wi-Fi dropout (seen in the field) is covered too, up to the 1 s ceiling
+        p.set_jitter(RATE as usize * 700 / 1000);
+        assert_eq!(p.target(), RATE as usize * 705 / 1000);
+        p.set_jitter(RATE as usize * 2);
+        assert_eq!(p.target(), MUSIC_MAX_TARGET);
+        p.set_jitter(RATE as usize * 150 / 1000);
         p.set_music(false);
         assert_eq!(p.target(), MAX_TARGET);
         p.set_jitter(0);

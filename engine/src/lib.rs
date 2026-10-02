@@ -304,7 +304,7 @@ impl Link {
         shared.target_loss_perc.store(5, Relaxed);
         shared.complexity.store(5, Relaxed);
         let stop = Arc::new(AtomicBool::new(false));
-        let (mut prod, cons) = HeapRb::<f32>::new(RATE as usize).split(); // 500 ms of stereo
+        let (mut prod, cons) = HeapRb::<f32>::new(RATE as usize * 3).split(); // 1.5 s of stereo: Music Mode buffers up to 1 s + headroom
 
         // ponytail: with Play to = none, packets are still decoded into a ring nobody drains
         // (it just stays full); skip decoding in the RX thread if that CPU ever matters.
