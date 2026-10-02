@@ -2,6 +2,9 @@
      File: BlackHole.c
   
  Copyright (C) 2019 Existential Audio Inc.
+
+ Modified for CapraLink on 2026-10-02: corrected property size checks, made the
+ control list match its reported size and scope, and bounded every object-list loop.
   
 */
 /*==================================================================================================
@@ -567,7 +570,7 @@ static UInt32 device_control_list_size(AudioObjectPropertyScope scope, AudioObje
             UInt32 count = 0;
             for (UInt32 i = 0; i < kDevice_ObjectListSize; i++)
             {
-                count += (kDevice_ObjectList[i].type == kObjectType_Control && (kDevice_ObjectList[i].scope == scope || scope == kAudioObjectPropertyScopeGlobal));
+                count += (kDevice_ObjectList[i].type == kObjectType_Control && (kDevice_ObjectList[i].scope == scope || scope == kAudioObjectPropertyScopeGlobal) && !(!gPitch_Adjust_Enabled && kDevice_ObjectList[i].id==kObjectID_Pitch_Adjust));
             }
 
             return count;
@@ -1501,7 +1504,7 @@ static OSStatus	BlackHole_GetPlugInPropertyData(AudioServerPlugInDriverRef inDri
 			//	qualifier doesn't match any devices. In such case, kAudioObjectUnknown is
 			//	the object ID to return.
 			FailWithAction(inDataSize < sizeof(AudioObjectID), theAnswer = kAudioHardwareBadPropertySizeError, Done, "BlackHole_GetPlugInPropertyData: not enough space for the return value of kAudioPlugInPropertyTranslateUIDToBox");
-			FailWithAction(inQualifierDataSize == sizeof(CFStringRef), theAnswer = kAudioHardwareBadPropertySizeError, Done, "BlackHole_GetPlugInPropertyData: the qualifier is the wrong size for kAudioPlugInPropertyTranslateUIDToBox");
+			FailWithAction(inQualifierDataSize != sizeof(CFStringRef), theAnswer = kAudioHardwareBadPropertySizeError, Done, "BlackHole_GetPlugInPropertyData: the qualifier is the wrong size for kAudioPlugInPropertyTranslateUIDToBox");
 			FailWithAction(inQualifierData == NULL, theAnswer = kAudioHardwareBadPropertySizeError, Done, "BlackHole_GetPlugInPropertyData: no qualifier for kAudioPlugInPropertyTranslateUIDToBox");
 
 			CFStringRef boxUID = get_box_uid();
@@ -1565,7 +1568,7 @@ static OSStatus	BlackHole_GetPlugInPropertyData(AudioServerPlugInDriverRef inDri
 			//	qualifier doesn't match any devices. In such case, kAudioObjectUnknown is
 			//	the object ID to return.
 			FailWithAction(inDataSize < sizeof(AudioObjectID), theAnswer = kAudioHardwareBadPropertySizeError, Done, "BlackHole_GetPlugInPropertyData: not enough space for the return value of kAudioPlugInPropertyTranslateUIDToDevice");
-			FailWithAction(inQualifierDataSize == sizeof(CFStringRef), theAnswer = kAudioHardwareBadPropertySizeError, Done, "BlackHole_GetPlugInPropertyData: the qualifier is the wrong size for kAudioPlugInPropertyTranslateUIDToDevice");
+			FailWithAction(inQualifierDataSize != sizeof(CFStringRef), theAnswer = kAudioHardwareBadPropertySizeError, Done, "BlackHole_GetPlugInPropertyData: the qualifier is the wrong size for kAudioPlugInPropertyTranslateUIDToDevice");
 			FailWithAction(inQualifierData == NULL, theAnswer = kAudioHardwareBadPropertySizeError, Done, "BlackHole_GetPlugInPropertyData: no qualifier for kAudioPlugInPropertyTranslateUIDToDevice");
             
             
@@ -1594,7 +1597,7 @@ static OSStatus	BlackHole_GetPlugInPropertyData(AudioServerPlugInDriverRef inDri
 			//	The resource bundle is a path relative to the path of the plug-in's bundle.
 			//	To specify that the plug-in bundle itself should be used, we just return the
 			//	empty string.
-			FailWithAction(inDataSize < sizeof(AudioObjectID), theAnswer = kAudioHardwareBadPropertySizeError, Done, "BlackHole_GetPlugInPropertyData: not enough space for the return value of kAudioPlugInPropertyResourceBundle");
+			FailWithAction(inDataSize < sizeof(CFStringRef), theAnswer = kAudioHardwareBadPropertySizeError, Done, "BlackHole_GetPlugInPropertyData: not enough space for the return value of kAudioPlugInPropertyResourceBundle");
 			*((CFStringRef*)outData) = CFSTR("");
 			*outDataSize = sizeof(CFStringRef);
 			break;
@@ -2483,7 +2486,7 @@ static OSStatus	BlackHole_GetDevicePropertyData(AudioServerPlugInDriverRef inDri
             //    fill out the list with the right objects
             switch (inObjectID) {
                 case kObjectID_Device:
-                    for (UInt32 i = 0, k = 0; k < theNumberItemsToFetch; i++)
+                    for (UInt32 i = 0, k = 0; i < kDevice_ObjectListSize && k < theNumberItemsToFetch; i++)
                     {
                         if (kDevice_ObjectList[i].scope == inAddress->mScope || inAddress->mScope == kAudioObjectPropertyScopeGlobal)
                         {
@@ -2493,7 +2496,7 @@ static OSStatus	BlackHole_GetDevicePropertyData(AudioServerPlugInDriverRef inDri
                     break;
 
                 case kObjectID_Device2:
-                    for (UInt32 i = 0, k = 0; k < theNumberItemsToFetch; i++)
+                    for (UInt32 i = 0, k = 0; i < kDevice2_ObjectListSize && k < theNumberItemsToFetch; i++)
                     {
                         if (kDevice2_ObjectList[i].scope == inAddress->mScope || inAddress->mScope == kAudioObjectPropertyScopeGlobal)
                         {
@@ -2669,7 +2672,7 @@ static OSStatus	BlackHole_GetDevicePropertyData(AudioServerPlugInDriverRef inDri
             //    fill out the list with as many objects as requested
             switch (inObjectID) {
                 case kObjectID_Device:
-                    for (UInt32 i = 0, k = 0; k < theNumberItemsToFetch; i++)
+                    for (UInt32 i = 0, k = 0; i < kDevice_ObjectListSize && k < theNumberItemsToFetch; i++)
                     {
                         if ((kDevice_ObjectList[i].type == kObjectType_Stream) &&
                             (kDevice_ObjectList[i].scope == inAddress->mScope || inAddress->mScope == kAudioObjectPropertyScopeGlobal))
@@ -2680,7 +2683,7 @@ static OSStatus	BlackHole_GetDevicePropertyData(AudioServerPlugInDriverRef inDri
                     break;
 
                 case kObjectID_Device2:
-                    for (UInt32 i = 0, k = 0; k < theNumberItemsToFetch; i++)
+                    for (UInt32 i = 0, k = 0; i < kDevice2_ObjectListSize && k < theNumberItemsToFetch; i++)
                     {
                         if ((kDevice2_ObjectList[i].type == kObjectType_Stream) &&
                             (kDevice2_ObjectList[i].scope == inAddress->mScope || inAddress->mScope == kAudioObjectPropertyScopeGlobal))
@@ -2706,10 +2709,10 @@ static OSStatus	BlackHole_GetDevicePropertyData(AudioServerPlugInDriverRef inDri
             switch (inObjectID) {
                 case kObjectID_Device:
                     pthread_mutex_lock(&gPlugIn_StateMutex);
-                    for (UInt32 i = 0, k = 0; k < theNumberItemsToFetch; i++)
+                    for (UInt32 i = 0, k = 0; i < kDevice_ObjectListSize && k < theNumberItemsToFetch; i++)
                     {
                         // TODO remove hack! There must be a better way than looking for a fixed i
-                        if ((kDevice_ObjectList[i].type == kObjectType_Control) && !(!gPitch_Adjust_Enabled && kDevice_ObjectList[i].id==kObjectID_Pitch_Adjust))
+                        if ((kDevice_ObjectList[i].type == kObjectType_Control) && (kDevice_ObjectList[i].scope == inAddress->mScope || inAddress->mScope == kAudioObjectPropertyScopeGlobal) && !(!gPitch_Adjust_Enabled && kDevice_ObjectList[i].id==kObjectID_Pitch_Adjust))
                         {
                             ((AudioObjectID*)outData)[k++] = kDevice_ObjectList[i].id;
                         }
@@ -2718,9 +2721,9 @@ static OSStatus	BlackHole_GetDevicePropertyData(AudioServerPlugInDriverRef inDri
                     break;
 
                 case kObjectID_Device2:
-                    for (UInt32 i = 0, k = 0; k < theNumberItemsToFetch; i++)
+                    for (UInt32 i = 0, k = 0; i < kDevice2_ObjectListSize && k < theNumberItemsToFetch; i++)
                     {
-                        if ((kDevice_ObjectList[i].type == kObjectType_Control) && !(!gPitch_Adjust_Enabled && kDevice_ObjectList[i].id==kObjectID_Pitch_Adjust))
+                        if ((kDevice2_ObjectList[i].type == kObjectType_Control) && (kDevice2_ObjectList[i].scope == inAddress->mScope || inAddress->mScope == kAudioObjectPropertyScopeGlobal))
                         {
                             ((AudioObjectID*)outData)[k++] = kDevice2_ObjectList[i].id;
                         }

@@ -1,9 +1,14 @@
 CapraLink macOS virtual audio devices
 
-BlackHole.c is vendored unmodified from BlackHole by Existential Audio Inc.
+BlackHole.c is vendored from BlackHole by Existential Audio Inc.
   https://github.com/ExistentialAudio/BlackHole
   tag v0.7.1, commit e2b22aaaba4e507a097131704bf96dabc004d9cf
 Licensed under GPL-3.0; see LICENSE.BlackHole.
 
-CapraLink customizes it only through compile-time defines and Info.plist
+CapraLink customizes it through compile-time defines and Info.plist
 values set in build.sh (device names, bundle IDs, factory UUIDs).
+
+Modified 2026-10-02: corrected property size checks and made the control
+list match its reported size and scope (see the note at the top of
+BlackHole.c). Upstream BlackHole master still had the original code
+on 2026-10-02.
