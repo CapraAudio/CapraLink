@@ -551,7 +551,8 @@ mod tests {
             })
             .collect();
         for mut s in slow {
-            s.set_read_timeout(Some(AUTH_DEADLINE * 3)).unwrap();
+            // macOS refuses a timeout on a socket the engine already closed: that's the outcome we want
+            let _ = s.set_read_timeout(Some(AUTH_DEADLINE * 3));
             // closed (a reset is fine: it was still sending), not left waiting
             if let Err(e) = s.read_to_end(&mut Vec::new()) {
                 assert!(!matches!(e.kind(), io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut), "{e}");
