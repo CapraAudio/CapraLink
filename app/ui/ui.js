@@ -41,11 +41,13 @@ function showMusic() {
     b.classList.toggle('active', Number(b.dataset.v) === (on ? 2 : channels));
   }
   els.bitrate.disabled = on;
-  // the track fills up to the bitrate actually being sent (adaptive), outside Music Mode
-  const live = on ? null : liveRate;
-  els.bitrate.style.setProperty('--live', live ? Math.min(1, Math.max(0, (live - 8) / (96 - 8))) : 0);
+  // the track fills to the bitrate actually being sent; the target is the knob, or in Music Mode
+  // its fixed 160 kbps ceiling (the knob is hidden then: the user's target doesn't apply)
+  const target = on ? 160 : Number(els.bitrate.value);
+  els.bitrate.classList.toggle('music', on);
+  els.bitrate.style.setProperty('--live', liveRate ? Math.min(1, Math.max(0, (liveRate - 8) / ((on ? 160 : 96) - 8))) : 0);
   // current/target, e.g. "48kbps/64kbps" (0 when nothing is being sent)
-  els.bitrateVal.textContent = on ? MUSIC_RATE : `${live || 0}kbps/${els.bitrate.value}kbps`;
+  els.bitrateVal.textContent = `${liveRate || 0}kbps/${target}kbps`;
 }
 
 // ---- actions ----

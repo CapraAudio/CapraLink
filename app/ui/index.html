@@ -50,7 +50,7 @@
     background: linear-gradient(to right, var(--accent) calc(8px + var(--live) * (100% - 16px)), var(--border) 0); }
   input.rate::-webkit-slider-thumb { -webkit-appearance: none; width: 16px; height: 16px; border-radius: 50%;
     background: #fff; border: 1px solid var(--border); box-shadow: 0 1px 2px rgba(0,0,0,.3); cursor: pointer; }
-  input.rate:disabled::-webkit-slider-thumb { opacity: .5; }
+  input.rate.music::-webkit-slider-thumb { visibility: hidden; }
   .check { display: flex; align-items: center; gap: 6px; font-size: 13px; color: var(--fg); margin: 2px 0 4px; }
   .check input { width: auto; margin: 0; }
   .bitrate-val { font-size: 11px; color: var(--sub); text-align: right; margin-bottom: 8px; }
