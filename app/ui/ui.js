@@ -545,7 +545,10 @@ async function checkUpdate(current) {
     const r = await fetch('https://api.github.com/repos/CapraAudio/CapraLink/releases/latest');
     const tag = r.ok ? (await r.json()).tag_name : '';
     if (!tag || !newer(tag, current)) return;
-    $('version').replaceChildren(button(tag + ' available — Download', 'link', () => invoke('open_releases')));
+    // "New version available! v0.2.0": the notice (opens the release page) left of this version
+    const link = button('New version available!', 'link update', () => invoke('open_releases'));
+    link.title = tag + ' is out: open the download page';
+    $('version').replaceChildren(link, ' v' + current);
   } catch (_) {} // offline: just the version
 }
 
