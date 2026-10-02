@@ -1,7 +1,7 @@
 name: ci
 on:
   push:
-    branches: [main]
+    branches: [main, "test/**"] # test/* branches build installers for trying a change before release
     tags: ["v*"]
   pull_request:
 
