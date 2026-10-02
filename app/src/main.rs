@@ -196,13 +196,19 @@ fn export_diagnostics(window: tauri::WebviewWindow, app: State<App>, redact: boo
     Ok(Some(path.display().to_string()))
 }
 
-/// Tray Quit: the engine goes too unless it is meant to run in the background.
+/// Tray Quit: the engine goes too unless it is meant to run in the background. Never waits more
+/// than 2 s on the engine, so Quit works even if the engine is stuck.
 fn quit(app: &AppHandle) {
     let client = app.state::<App>().client.lock().unwrap_or_else(|e| e.into_inner()).clone();
     if let Some(c) = client {
-        if c.state().is_ok_and(|s| !s.settings.service) {
-            let _ = c.shutdown();
-        }
+        let (done, finished) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            if c.state().is_ok_and(|s| !s.settings.service) {
+                let _ = c.shutdown();
+            }
+            let _ = done.send(());
+        });
+        let _ = finished.recv_timeout(Duration::from_secs(2));
     }
     app.exit(0);
 }

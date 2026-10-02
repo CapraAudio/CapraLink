@@ -247,6 +247,7 @@ struct Inner {
     pending: Mutex<Vec<IpAddr>>, // sources of unauthenticated incoming connections
     pairing: Mutex<()>,          // held by the one PIN attempt allowed at a time
     dialing: Mutex<()>,          // held by this node's one session dial at a time
+    starting: Mutex<()>,         // held while a session's audio starts (one at a time, outside `st`)
     #[cfg(test)]
     hook: Mutex<Option<Hook>>,
 }
@@ -280,7 +281,7 @@ impl Node {
             (None, None)
         };
         let st = St { cfg, pin: new_pin(), failures: 0, pairing_until: None, locked_until: None, found: HashMap::new(), session: None, error: None, vdev: Virtual::setup(), retry: 0, retrying: None };
-        let node = Node(Arc::new(Inner { dir, port, mdns: daemon, st: Mutex::new(st), wake: Condvar::new(), pending: Mutex::default(), pairing: Mutex::default(), dialing: Mutex::default(), #[cfg(test)] hook: Mutex::default() }));
+        let node = Node(Arc::new(Inner { dir, port, mdns: daemon, st: Mutex::new(st), wake: Condvar::new(), pending: Mutex::default(), pairing: Mutex::default(), dialing: Mutex::default(), starting: Mutex::default(), #[cfg(test)] hook: Mutex::default() }));
         if let Some(rx) = browse {
             let n = node.clone();
             std::thread::Builder::new().name("capralink-mdns".into()).spawn(move || {
@@ -863,24 +864,48 @@ impl Node {
     /// `own` (refused if that was cancelled meanwhile); it becomes `last_peer`. An incoming
     /// session clears `last_peer`: the side that dialed owns reconnecting.
     fn activate(&self, id: &str, secret: &[u8; 32], addr: SocketAddr, keys: &Keys, ctl: Arc<Ctl>, own: Option<u64>) -> Result<()> {
+        let _one = self.0.starting.lock().unwrap_or_else(|e| e.into_inner());
+        // the checks run again after the audio has started: either may change while it does
+        let refused = |st: &St| -> Option<&'static str> {
+            // cancelled after its `Link` went out: the peer's copy gets `stop` (own dials are
+            // serialized, so no newer one of ours reached the peer before it)
+            if own.is_some_and(|g| g != st.retry) {
+                return Some("cancelled");
+            }
+            // forgotten (or paired again with a new key) since this session's handshake
+            (!still_paired(&st.cfg, id, secret)).then_some("pairing was removed or changed")
+        };
+        let settings = {
+            let mut st = self.st();
+            match refused(&st) {
+                Some("cancelled") => {
+                    drop(st);
+                    ctl.close();
+                    bail!("cancelled");
+                }
+                Some(why) => bail!("{why}"), // the caller reports it to the peer, then the connection drops
+                None => {}
+            }
+            if let Some(old) = st.session.take() {
+                old.ctl.close(); // its Link drops here, freeing the UDP port before the new bind
+            }
+            use_peer(&mut st.cfg, id);
+            st.cfg.settings.clone()
+        };
+        // Opening devices can wait on the OS (e.g. macOS asking for microphone permission), so never
+        // under the state lock: the window, Quit and everything else keep working meanwhile.
+        #[cfg(test)]
+        self.pause("start audio");
+        let link = start_link(&settings, self.0.port, addr, keys);
         let mut st = self.st();
-        // cancelled after its `Link` went out: the peer's copy gets `stop` (own dials are serialized,
-        // so no newer one of ours reached the peer before it)
-        if own.is_some_and(|g| g != st.retry) {
-            drop(st);
-            ctl.close();
-            bail!("cancelled");
-        }
-        // forgotten (or paired again with a new key) since this session's handshake: refuse it
-        // (the caller reports it to the peer, then the connection drops)
-        ensure!(still_paired(&st.cfg, id, secret), "pairing was removed or changed");
-        if let Some(old) = st.session.take() {
-            old.ctl.close(); // Link drop below frees the UDP port before the new bind
-        }
-        use_peer(&mut st.cfg, id);
-        let link = match start_link(&st.cfg.settings, self.0.port, addr, keys) {
-            Ok(l) => l,
-            Err(e) => {
+        let link = match (link, refused(&st)) {
+            (Ok(l), None) => l,
+            (Ok(_), Some(why)) => {
+                drop(st);
+                ctl.close();
+                bail!("{why}");
+            }
+            (Err(e), _) => {
                 log(&format!("can't start audio with {}: {e:#}", peer_name(&st.cfg, id)));
                 drop(st);
                 ctl.close();
@@ -2484,6 +2509,34 @@ mod tests {
         let _ = ctl.send(&Msg::Link { channels: 1, port: a.port() });
         assert!(!matches!(ctl.recv(), Ok(Some(Msg::Ok))), "a session held open past the deadline was accepted");
         assert!(!is(&b, |d| d.connected));
+        let _ = std::fs::remove_dir_all(adir);
+        let _ = std::fs::remove_dir_all(bdir);
+    }
+
+    #[test]
+    fn a_slow_audio_start_does_not_freeze_the_engine() {
+        let ((a, adir), (b, bdir), _aid, bid) = paired_nodes();
+        // b's audio start hangs, like macOS waiting for the user to allow microphone access
+        let (reached, at) = mpsc::channel();
+        let (go, wait_go) = mpsc::channel::<()>();
+        *b.0.hook.lock().unwrap() = Some(("start audio", Box::new(move || {
+            reached.send(()).unwrap();
+            let _ = wait_go.recv_timeout(Duration::from_secs(5));
+        })));
+        let a2 = a.clone();
+        let dial = std::thread::spawn(move || a2.connect(&bid));
+        at.recv().unwrap();
+        // meanwhile b still answers and changes settings (the window, Quit, remote configuration)
+        let (b2, (done, finished)) = (b.clone(), mpsc::channel());
+        std::thread::spawn(move || {
+            let _ = b2.state();
+            b2.set_settings(Settings { music_mode: true, ..b2.state().settings }).unwrap();
+            done.send(()).unwrap();
+        });
+        assert!(finished.recv_timeout(Duration::from_secs(1)).is_ok(), "the engine froze while audio was starting");
+        go.send(()).unwrap();
+        dial.join().unwrap().unwrap();
+        wait(|| is(&b, |d| d.connected));
         let _ = std::fs::remove_dir_all(adir);
         let _ = std::fs::remove_dir_all(bdir);
     }
