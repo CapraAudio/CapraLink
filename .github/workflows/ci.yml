@@ -118,7 +118,7 @@ jobs:
   # the updater verifies the installers by signature, not by sum.
   release:
     if: startsWith(github.ref, 'refs/tags/v')
-    needs: build
+    needs: [build, decky]
     runs-on: ubuntu-24.04
     permissions:
       contents: write
@@ -129,6 +129,7 @@ jobs:
       - run: |
           mkdir release
           cp artifacts/*/dist/* release/
+          cp artifacts/capralink-decky-plugin/CapraLink.zip "release/CapraLink-Decky-${GITHUB_REF_NAME#v}.zip" # Steam Deck Game Mode plugin
           cd release && sha256sum * > SHA256SUMS.txt && cat SHA256SUMS.txt
       # the release notes come from the annotated tag's message: a tag without a written description fails here
       - env:
