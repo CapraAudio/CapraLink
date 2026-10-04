@@ -1032,6 +1032,7 @@ impl Node {
             }
             st.ptt.talk.tick(Instant::now());
             if st.ptt.talk.on() != was {
+                log(if was { "push-to-talk: stopped talking" } else { "push-to-talk: talking" });
                 if was && chirp(&st, false) {
                     // the stop chirp reaches the user through the link: mute once it has been sent
                     let n = self.clone();
