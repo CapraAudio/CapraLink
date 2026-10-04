@@ -81,6 +81,9 @@ The installers aren't code-signed yet, so the first launch needs one extra step:
   click **Open Anyway**. Allow microphone access when CapraLink asks.
 - **Windows:** if SmartScreen appears, click **More info → Run anyway**. For a CapraLink microphone,
   install [VB-Cable](https://vb-audio.com/Cable/) (free). "Everything this PC plays" needs no driver.
+  The installer isn't code-signed, so if **Smart App Control** is on, Windows may block it outright
+  (it has no "run anyway" for this); CapraLink can't be installed on that PC until a release passes
+  Microsoft's reputation check.
 - **Linux:** make the AppImage executable (`chmod +x`). The virtual devices are created automatically.
   On a Steam Deck, turn on "Run in background" (⚙ in the window) to use CapraLink in Game Mode.
 
