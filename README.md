@@ -46,7 +46,7 @@ next to a game. CapraLink is meant to be set up once, stay in the tray, and get 
   <img src="docs/screenshots/configure.png" width="260" alt="Configuring another computer remotely">
 </p>
 
-<p align="center"><sub>Streaming to a Steam Deck · a device's menu · changing another computer's settings remotely</sub></p>
+<p align="center"><sub>Streaming to a Steam Deck with push-to-talk and Music Mode/Hi-Fi · a device's menu · changing another computer's settings remotely</sub></p>
 
 ## Features
 
@@ -58,7 +58,7 @@ next to a game. CapraLink is meant to be set up once, stay in the tray, and get 
 - **Low delay, light on resources** — Opus audio at 48 kHz with 10 ms frames; bitrate adapts from
   8 to 96 kbps as the network changes, so games aren't affected.
 - **Music Mode** — stereo and higher quality (up to 160 kbps) for music, at the cost of a little more delay.
-- **Hi-Fi** — lossless 24-bit audio on top of Music Mode, with automatic fallback when the network can't keep up.
+- **Music Mode/Hi-Fi** — lossless 24-bit audio on top of Music Mode, with automatic fallback when the network can't keep up.
 - **Push-to-talk** — hold or toggle a key, mouse button or Steam Deck back grip; works while a game has focus.
 - **Volume and mute** — send and receive volume (0–150%) and a mute button, per connection.
 - **Delay readout** — see how much delay each direction has.
@@ -99,14 +99,14 @@ otherwise. It keeps working while a game has focus and never takes the key away 
 - **Windows:** nothing to set up. CapraLink only listens to input (no keyboard hooks).
 - **Steam Deck:** the back grips work directly, with no Steam Input mapping.
 
-**Music Mode and Hi-Fi.** Tick **Music Mode** for stereo, higher-quality audio (it applies to both
-directions, and either computer can turn it on). Tick **Hi-Fi** next to it for lossless 24-bit
+**Music Mode and Music Mode/Hi-Fi.** Tick **Music Mode** for stereo, higher-quality audio (it applies to both
+directions, and either computer can turn it on). Tick **Hi-Fi** next to it for **Music Mode/Hi-Fi**: lossless 24-bit
 audio, about 2.3 Mbit/s each way and up to 1 s of delay. Lost packets are re-sent; if the network
 can't keep up, it falls back to Music Mode by itself and tries again after a clean minute. Both
-computers need CapraLink 0.3.0 or later for Hi-Fi.
+computers need CapraLink 0.3.0 or later for Music Mode/Hi-Fi.
 
 **Delay and connection quality.** Under the window's controls you'll see the connection quality and
-"You hear them: … ms · They hear you: … ms". Normal mode is usually 30–60 ms; Music Mode and Hi-Fi
+"You hear them: … ms · They hear you: … ms". Normal mode is usually 30–60 ms; Music Mode and Music Mode/Hi-Fi
 keep a larger buffer on purpose.
 
 **Steam Deck Game Mode.** In desktop mode, open CapraLink, press ⚙ and turn on **Run in background at login**,
@@ -118,7 +118,7 @@ install the Decky plugin:
 3. In the Quick Access Menu (**…** button) → Decky → ⚙: turn on **Developer mode**, then
    **Developer → Install Plugin from ZIP File** and pick the zip.
 
-The CapraLink panel shows the connection and has Connect/Disconnect, Music Mode, Hi-Fi, Mute,
+The CapraLink panel shows the connection and has Connect/Disconnect, Music Mode, Music Mode/Hi-Fi, Mute,
 volumes, push-to-talk and the delay readout.
 
 **Changing the other computer's settings.** On the other computer, press ⚙ and turn on **Allow paired
@@ -209,7 +209,7 @@ capralink --status              one JSON line: connected {id, name} or null, dev
 capralink --connect NAME_OR_ID  connect to a paired device
 capralink --disconnect
 capralink --music on|off        Music Mode
-capralink --hifi on|off         Hi-Fi (needs Music Mode)
+capralink --hifi on|off         Music Mode/Hi-Fi (needs Music Mode)
 capralink --mute on|off
 capralink --volume send|recv N  0 to 150
 capralink --ptt off|hold|toggle push-to-talk mode
