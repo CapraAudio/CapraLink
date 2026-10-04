@@ -262,6 +262,23 @@ fn evdev_events(buf: &[u8], size: usize) -> impl Iterator<Item = (u16, bool)> + 
     })
 }
 
+/// Steam Deck back grips in the controller's raw state report (kernel hid-steam.c: type 9 at
+/// byte 2; L4 = byte 13 bit 1, R4 = 13.2, L5 = 9.7, R5 = 10.0). Read straight from the controller,
+/// so they work while Steam's menus are open and need no Steam Input mapping.
+const DECK_GRIPS: [(usize, u8, &str); 4] = [(13, 1, "L4"), (9, 7, "L5"), (13, 2, "R4"), (10, 0, "R5")];
+
+/// Which back grips a Deck report holds down (bit i = `DECK_GRIPS[i]`), None for other reports.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn deck_grips(r: &[u8]) -> Option<u8> {
+    (r.len() > 13 && r[0] == 1 && r[2] == 9).then(|| DECK_GRIPS.iter().enumerate().fold(0, |m, (i, &(b, bit, _))| m | ((r[b] >> bit) & 1) << i))
+}
+
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn deck_key(i: usize) -> PttKey {
+    let g = DECK_GRIPS[i].2;
+    PttKey { id: format!("deck:{g}"), label: format!("{g} (back grip)") }
+}
+
 /// Windows virtual-key code (left/right modifiers already told apart).
 #[cfg_attr(not(windows), allow(dead_code))]
 fn vk_key(vk: u16) -> PttKey {
@@ -328,7 +345,7 @@ fn mac_key(code: u16) -> PttKey {
 
 #[cfg(all(target_os = "linux", not(test)))]
 mod linux {
-    use super::{evdev_events, evdev_key, Ev};
+    use super::{deck_grips, deck_key, evdev_events, evdev_key, Ev};
     use std::fs::File;
     use std::io::{ErrorKind, Read};
     use std::os::unix::fs::OpenOptionsExt;
@@ -345,6 +362,7 @@ mod linux {
     pub fn run(stop: &AtomicBool, tx: &Sender<Ev>) {
         let size = 2 * size_of::<usize>() + 8; // struct input_event
         let (mut open, mut status, mut scanned) = (Vec::<(PathBuf, File)>::new(), None, None::<Instant>);
+        let mut pads = Vec::<(PathBuf, File, u8)>::new(); // Steam Deck controller (raw reports), grips held
         let mut buf = vec![0u8; size * 64];
         while !stop.load(SeqCst) {
             if scanned.is_none_or(|t| t.elapsed() > Duration::from_secs(3)) {
@@ -358,6 +376,16 @@ mod linux {
                     if !open.iter().any(|(q, _)| *q == p) {
                         if let Ok(f) = std::fs::OpenOptions::new().read(true).custom_flags(O_NONBLOCK).open(&p) {
                             open.push((p, f));
+                        }
+                    }
+                }
+                // the Deck's own controller (Valve 28DE:1205): its back grips, see `deck_grips`
+                for p in std::fs::read_dir("/dev").into_iter().flatten().flatten().map(|e| e.path()) {
+                    let Some(n) = p.file_name().map(|n| n.to_string_lossy().into_owned()).filter(|n| n.starts_with("hidraw")) else { continue };
+                    let deck = std::fs::read_to_string(format!("/sys/class/hidraw/{n}/device/uevent")).is_ok_and(|u| u.contains("HID_ID=0003:000028DE:00001205"));
+                    if deck && !pads.iter().any(|(q, ..)| *q == p) {
+                        if let Ok(f) = std::fs::OpenOptions::new().read(true).custom_flags(O_NONBLOCK).open(&p) {
+                            pads.push((p, f, 0));
                         }
                     }
                 }
@@ -380,6 +408,21 @@ mod linux {
                     Err(e) if e.kind() == ErrorKind::WouldBlock => break true,
                     Err(e) if e.kind() == ErrorKind::Interrupted => {}
                     _ => break false, // unplugged: found again by the next scan if it comes back
+                }
+            });
+            pads.retain_mut(|(_, f, held)| loop {
+                match f.read(&mut buf[..64]) {
+                    Ok(n) if n > 0 => {
+                        if let Some(now) = deck_grips(&buf[..n]) {
+                            for i in (0..4).filter(|i| (now ^ *held) >> i & 1 == 1) {
+                                let _ = tx.send(Ev::Key(deck_key(i), now >> i & 1 == 1));
+                            }
+                            *held = now;
+                        }
+                    }
+                    Err(e) if e.kind() == ErrorKind::WouldBlock => break true,
+                    Err(e) if e.kind() == ErrorKind::Interrupted => {}
+                    _ => break false,
                 }
             });
             std::thread::sleep(Duration::from_millis(10));
@@ -698,5 +741,20 @@ mod tests {
         let ev = |ty: u16, code: u16, value: i32| [&[0u8; 16][..], &ty.to_ne_bytes(), &code.to_ne_bytes(), &value.to_ne_bytes()].concat();
         let buf = [ev(1, 183, 1), ev(0, 0, 0), ev(1, 183, 2), ev(4, 4, 7), ev(1, 0x110, 1), ev(1, 183, 0)].concat();
         assert_eq!(evdev_events(&buf, 24).collect::<Vec<_>>(), [(183, true), (183, false)], "keys only; repeats, sync, scan and left click skipped");
+    }
+
+    #[test]
+    fn deck_back_grips() {
+        let mut r = [0u8; 64];
+        (r[0], r[2]) = (1, 9);
+        assert_eq!(deck_grips(&r), Some(0));
+        (r[13], r[9], r[10]) = (0b110, 0x80, 1);
+        assert_eq!(deck_grips(&r), Some(0b1111), "L4, L5, R4, R5");
+        r[13] = 0b10;
+        (r[9], r[10]) = (0x7f, 0xfe); // every other button held: no grip
+        assert_eq!(deck_grips(&r), Some(0b0001));
+        r[2] = 1; // not a Deck state report
+        assert_eq!(deck_grips(&r), None);
+        assert_eq!((deck_key(3).id, deck_key(3).label), ("deck:R5".to_string(), "R5 (back grip)".to_string()));
     }
 }

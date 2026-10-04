@@ -121,7 +121,7 @@ function Content() {
           <ButtonItem
             layout="below"
             disabled={capturing}
-            description={st.ptt_key ? `Button: ${st.ptt_key}. Map a Deck button to a keyboard key in Steam Input, then press it here` : "Map a Deck button to a keyboard key in Steam Input, then press it here"}
+            description={st.ptt_key ? `Button: ${st.ptt_key}` : "Press Set button, then a back grip (L4, L5, R4 or R5) or a keyboard key"}
             onClick={async () => {
               setCapturing(true);
               await act(pttSet);
