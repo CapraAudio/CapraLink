@@ -3,7 +3,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 use capralink_engine::log::log;
-use capralink_engine::{Check, Client, Devices, MicCheck, NodeState, RemoteConfig, Settings};
+use capralink_engine::{Check, Client, Devices, MicCheck, NodeState, PttKey, RemoteConfig, Settings};
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::sync::Mutex;
@@ -184,6 +184,12 @@ fn mic_check(app: State<App>) -> Result<MicCheck, String> {
     app.run(Client::mic_check)
 }
 
+/// Waits (up to 10 s) for the next key or button press: the push-to-talk "Set button".
+#[tauri::command(async)]
+fn ptt_capture(app: State<App>) -> Result<PttKey, String> {
+    app.run(Client::ptt_capture)
+}
+
 /// Saves the diagnostics (this computer's, plus paired device `peer`'s) where the user picks
 /// in a Save dialog; returns the path, or None if cancelled. The page never names the path.
 #[tauri::command(async)]
@@ -290,7 +296,7 @@ fn main() {
         .plugin(tauri_plugin_single_instance::init(|app, _, _| show_window(app)))
         .plugin(tauri_plugin_dialog::init())
         .manage(app)
-        .invoke_handler(tauri::generate_handler![devices, state, version, open_releases, levels, fit, pair, pair_ip, open_pairing, connect, disconnect, forget, patch_settings, set_peer_addr, set_name, remote_get, remote_set, checks, test_tone, mic_check, export_diagnostics])
+        .invoke_handler(tauri::generate_handler![devices, state, version, open_releases, levels, fit, pair, pair_ip, open_pairing, connect, disconnect, forget, patch_settings, set_peer_addr, set_name, remote_get, remote_set, checks, test_tone, mic_check, ptt_capture, export_diagnostics])
         .setup(|app| {
             #[cfg(target_os = "macos")]
             app.set_activation_policy(tauri::ActivationPolicy::Accessory);

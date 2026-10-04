@@ -10,7 +10,7 @@
 //! Nonces are 64 hex chars; the HMACs are HMAC-SHA256 over the strings, hex-encoded.
 
 use crate::node::{config_dir_or_default, hex, random, write_private};
-use crate::{AudioDevice, Check, MicCheck, Node, NodeState, RemoteConfig, Settings};
+use crate::{AudioDevice, Check, MicCheck, Node, NodeState, PttKey, RemoteConfig, Settings};
 use anyhow::{anyhow, bail, ensure, Context, Result};
 use hmac::{Hmac, KeyInit, Mac};
 use serde::de::DeserializeOwned;
@@ -220,6 +220,7 @@ fn dispatch(node: &Node, cmd: &str, args: Value) -> Result<Value> {
         "checks" => Ok(serde_json::to_value(node.checks())?),
         "test_tone" => done(crate::test_tone(&node.settings().output)),
         "mic_check" => Ok(serde_json::to_value(crate::mic_check(&node.settings().input)?)?),
+        "ptt_capture" => Ok(serde_json::to_value(node.ptt_capture()?)?),
         "diagnostics" => {
             let mut text = node.diagnostics(a.redact);
             if let Some(peer) = a.peer {
@@ -357,6 +358,12 @@ impl Client {
     /// Records 3 s from the Send from device (well inside `CALL_TIMEOUT`).
     pub fn mic_check(&self) -> Result<MicCheck> {
         self.call("mic_check", Value::Null)
+    }
+
+    /// Waits (up to 10 s, well inside `CALL_TIMEOUT`) for the next key or button press, for
+    /// the push-to-talk "Set button".
+    pub fn ptt_capture(&self) -> Result<PttKey> {
+        self.call("ptt_capture", Value::Null)
     }
 
     /// This computer's diagnostics, plus paired device `peer`'s when given.
