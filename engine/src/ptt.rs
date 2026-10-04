@@ -362,17 +362,30 @@ mod linux {
     use super::{deck_grips, deck_key, evdev_dropped, evdev_events, evdev_key, Ev};
     use std::fs::File;
     use std::io::{ErrorKind, Read};
+    use std::ffi::c_ulong;
     use std::os::unix::fs::OpenOptionsExt;
+    use std::os::unix::io::AsRawFd;
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicBool, Ordering::SeqCst};
     use std::sync::mpsc::Sender;
     use std::time::{Duration, Instant};
 
     const O_NONBLOCK: i32 = 0o4000;
+    const POLLIN: i16 = 1;
+
+    #[repr(C)]
+    struct PollFd {
+        fd: i32,
+        events: i16,
+        revents: i16,
+    }
+
+    extern "C" {
+        fn poll(fds: *mut PollFd, n: c_ulong, timeout_ms: i32) -> i32;
+    }
 
     /// Polls every readable /dev/input/event* (no grab: other programs still get every event),
     /// looking for new devices every few seconds.
-    // ponytail: a 10 ms poll over a handful of files; switch to poll(2) if it ever shows in a profile.
     pub fn run(stop: &AtomicBool, tx: &Sender<Ev>) {
         let size = 2 * size_of::<usize>() + 8; // struct input_event
         let (mut open, mut status, mut scanned) = (Vec::<(PathBuf, File)>::new(), None, None::<Instant>);
@@ -449,7 +462,10 @@ mod linux {
                     }
                 }
             });
-            std::thread::sleep(Duration::from_millis(10));
+            // sleeps until input arrives (an unplugged device wakes it too), or 100 ms to see `stop`
+            let fds = open.iter().map(|(_, f)| f.as_raw_fd()).chain(pads.iter().map(|(_, f, _)| f.as_raw_fd()));
+            let mut fds: Vec<PollFd> = fds.map(|fd| PollFd { fd, events: POLLIN, revents: 0 }).collect();
+            unsafe { poll(fds.as_mut_ptr(), fds.len() as c_ulong, 100) };
         }
     }
 }
