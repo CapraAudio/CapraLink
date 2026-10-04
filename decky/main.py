@@ -6,6 +6,7 @@ import os
 import decky
 
 TIMEOUT = 10  # seconds per CLI call
+PTT_TIMEOUT = 15  # `--ptt-set` waits up to 10 s for a button press
 
 
 def _appimage():
@@ -13,7 +14,7 @@ def _appimage():
     return found[-1] if found else None
 
 
-async def _run(*args):
+async def _run(*args, timeout=TIMEOUT):
     """Runs `capralink <args>` as the Deck user; returns {"ok": bool, "data": parsed JSON or None, "error": str}."""
     exe = _appimage()
     if not exe:
@@ -24,7 +25,7 @@ async def _run(*args):
     env = {**os.environ, "HOME": decky.DECKY_USER_HOME}
     try:
         p = await asyncio.create_subprocess_exec(*cmd, env=env, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
-        out, err = await asyncio.wait_for(p.communicate(), TIMEOUT)
+        out, err = await asyncio.wait_for(p.communicate(), timeout)
     except asyncio.TimeoutError:
         p.kill()
         return {"ok": False, "data": None, "error": "CapraLink didn't answer in time."}
@@ -52,3 +53,15 @@ class Plugin:
 
     async def music(self, on: bool):
         return await _run("--music", "on" if on else "off")
+
+    async def toggle(self, flag: str, on: bool):  # flag: "mute" or "hifi"
+        return await _run(f"--{flag}", "on" if on else "off")
+
+    async def volume(self, which: str, n: int):  # which: "send" or "recv"
+        return await _run("--volume", which, str(n))
+
+    async def ptt(self, mode: str):
+        return await _run("--ptt", mode)
+
+    async def ptt_set(self):
+        return await _run("--ptt-set", timeout=PTT_TIMEOUT)
