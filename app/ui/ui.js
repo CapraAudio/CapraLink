@@ -615,18 +615,41 @@ $('optsBtn').addEventListener('click', (e) => { e.stopPropagation(); setOpts($('
 $('opts').addEventListener('click', (e) => e.stopPropagation()); // clicks inside keep it open
 document.addEventListener('click', () => setOpts(false));
 
-// Shows this version in the corner; if GitHub has a newer release, offers it instead.
-// Only asks GitHub for the latest release's tag, once per window.
+// Shows this version in the corner; if there is a newer release, offers it instead. An install
+// that can update itself (update_check) also gets an "Update now" button; otherwise (deb/rpm,
+// macOS drivers changed, updater unavailable) GitHub's latest release tag is asked, once per window.
 async function checkUpdate(current) {
   $('version').textContent = 'v' + current;
+  let tag = '', inApp = false;
   try {
-    const r = await fetch('https://api.github.com/repos/CapraAudio/CapraLink/releases/latest');
-    const tag = r.ok ? (await r.json()).tag_name : '';
+    const u = await invoke('update_check');
+    if (u) { tag = u.version; inApp = true; }
+  } catch (_) {}
+  try {
+    if (!tag) {
+      const r = await fetch('https://api.github.com/repos/CapraAudio/CapraLink/releases/latest');
+      tag = r.ok ? (await r.json()).tag_name : '';
+    }
     if (!tag || !newer(tag, current)) return;
-    // "New version available! v0.2.0": the notice (opens the release page) left of this version
+    // "New version available! [Update now] v0.2.0": the notice (opens the release page) left of this version
     const link = button('New version available!', 'link update', () => invoke('open_releases'));
     link.title = tag + ' is out: open the download page';
-    $('version').replaceChildren(link, ' v' + current);
+    const parts = [link];
+    if (inApp) {
+      const now = button('Update now', 'btn', async () => {
+        now.disabled = true;
+        now.textContent = 'Updating…';
+        try { await invoke('update_install'); } catch (e) {
+          actionError = String(e); // shown (and kept) by the next poll
+          render();
+          now.disabled = false;
+          now.textContent = 'Update now';
+        }
+      });
+      now.title = 'Install ' + tag + ' and restart CapraLink';
+      parts.push(now);
+    }
+    $('version').replaceChildren(...parts, ' v' + current);
   } catch (_) {} // offline: just the version
 }
 

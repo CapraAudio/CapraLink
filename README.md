@@ -61,7 +61,7 @@ next to a game. CapraLink is meant to be set up once, stay in the tray, and get 
 - **Runs in the background** — optional login service, including Steam Deck Game Mode, with no window open.
 - **Remote configuration** — when allowed, change another computer's devices and settings from this one.
 - **Reconnects by itself** — after a Wi-Fi drop, an IP address change or a restart.
-- **Update check** — the window shows its version and offers a download link when a newer release is out.
+- **Update check** — the window shows its version and offers a download link (and, where possible, one-click **Update now**) when a newer release is out.
 - **Encrypted** — pairing uses SPAKE2; every session is encrypted with fresh keys (Noise + ChaCha20-Poly1305).
 
 ## Install
@@ -83,6 +83,11 @@ The installers aren't code-signed yet, so the first launch needs one extra step:
   install [VB-Cable](https://vb-audio.com/Cable/) (free). "Everything this PC plays" needs no driver.
 - **Linux:** make the AppImage executable (`chmod +x`). The virtual devices are created automatically.
   On a Steam Deck, turn on "Run in background" (⚙ in the window) to use CapraLink in Game Mode.
+
+**Updating:** when a newer version is out, the window shows **Update now**: one click downloads
+it, checks its signature, installs it and restarts CapraLink. Not available for `.deb`/`.rpm`
+installs, nor on macOS when a release changes the audio drivers; there, install the new download
+the usual way.
 
 Wired Ethernet gives the smoothest audio. Wi-Fi works, with a slightly larger buffer on busy networks.
 

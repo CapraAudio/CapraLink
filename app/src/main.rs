@@ -12,6 +12,7 @@ use tauri::menu::{CheckMenuItem, Menu, MenuItem};
 use tauri::tray::{TrayIconBuilder, TrayIconEvent};
 use tauri::{AppHandle, Manager, RunEvent, State, WebviewUrl, WebviewWindowBuilder};
 use tauri_plugin_dialog::DialogExt;
+use tauri_plugin_updater::UpdaterExt;
 
 /// Connection to the engine daemon, (re)made on demand.
 struct App {
@@ -107,6 +108,47 @@ const RELEASES: &str = "https://github.com/CapraAudio/CapraLink/releases/latest"
 #[tauri::command]
 fn version() -> &'static str {
     env!("CARGO_PKG_VERSION")
+}
+
+/// The update this install can apply in place, if any. Not for Linux deb/rpm (the updater only
+/// replaces an AppImage), nor on macOS when the release's audio drivers (`drivers` in latest.json,
+/// the git tree hash of drivers/macos, see build.rs) differ from this build's: the app-only
+/// update would leave the old drivers installed.
+async fn update_available(app: &AppHandle) -> Result<Option<tauri_plugin_updater::Update>, String> {
+    if cfg!(target_os = "linux") && std::env::var_os("APPIMAGE").is_none() {
+        return Ok(None);
+    }
+    let update = app.updater().map_err(|e| e.to_string())?.check().await.map_err(|e| e.to_string())?;
+    Ok(update.filter(|u| !cfg!(target_os = "macos") || u.raw_json["drivers"].as_str() == Some(env!("DRIVERS_REV"))))
+}
+
+#[derive(serde::Serialize)]
+struct UpdateInfo {
+    version: String,
+    notes: String,
+}
+
+/// The in-app update on offer, or None (up to date, or this install can't update itself).
+#[tauri::command]
+async fn update_check(app: AppHandle) -> Result<Option<UpdateInfo>, String> {
+    Ok(update_available(&app).await?.map(|u| UpdateInfo { version: u.version, notes: u.body.unwrap_or_default() }))
+}
+
+/// Downloads and verifies the update, stops the engine (it must restart on the new version, and
+/// Windows can't replace a running exe), installs it and relaunches. Only returns on failure.
+#[tauri::command]
+async fn update_install(app: AppHandle) -> Result<(), String> {
+    let update = update_available(&app).await?.ok_or("No update available")?;
+    let bytes = update.download(|_, _| {}, || {}).await.map_err(|e| format!("Can't download the update: {e}"))?;
+    let a = app.state::<App>();
+    let client = a.client.lock().unwrap_or_else(|e| e.into_inner()).take();
+    // the engine may be running without this window having connected to it
+    if let Some(c) = client.or_else(|| Client::local(a.dir.clone(), a.port.checked_add(1)?).ok()) {
+        let _ = c.shutdown();
+        std::thread::sleep(Duration::from_secs(1)); // let it exit
+    }
+    update.install(bytes).map_err(|e| format!("Can't install the update: {e}"))?;
+    app.restart() // Windows: install() already exited, the installer relaunches
 }
 
 #[tauri::command(async)]
@@ -336,8 +378,9 @@ fn main() {
         // a second launch (no tray on stock GNOME, Start menu on Windows) brings this window back
         .plugin(tauri_plugin_single_instance::init(|app, _, _| show_window(app)))
         .plugin(tauri_plugin_dialog::init())
+        .plugin(tauri_plugin_updater::Builder::new().build())
         .manage(app)
-        .invoke_handler(tauri::generate_handler![devices, state, version, open_releases, levels, fit, pair, pair_ip, open_pairing, connect, disconnect, forget, patch_settings, set_peer_addr, set_name, remote_get, remote_set, checks, test_tone, mic_check, export_diagnostics])
+        .invoke_handler(tauri::generate_handler![devices, state, version, update_check, update_install, open_releases, levels, fit, pair, pair_ip, open_pairing, connect, disconnect, forget, patch_settings, set_peer_addr, set_name, remote_get, remote_set, checks, test_tone, mic_check, export_diagnostics])
         .setup(|app| {
             #[cfg(target_os = "macos")]
             app.set_activation_policy(tauri::ActivationPolicy::Accessory);
