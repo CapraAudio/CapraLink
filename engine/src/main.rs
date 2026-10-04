@@ -98,9 +98,10 @@ fn main() -> anyhow::Result<()> {
         }
         if let Some(s) = st.stats {
             println!(
-                "sent={} received={} lost={} fec_recovered={} underruns={} buffer_ms={:.1} target_ms={:.0} in={:.0}dB out={:.0}dB tx_gap={:.0}ms rx_gap={:.0}ms kbps={} cx={}{}",
+                "sent={} received={} lost={} fec_recovered={} underruns={} buffer_ms={:.1} target_ms={:.0} in={:.0}dB out={:.0}dB tx_gap={:.0}ms rx_gap={:.0}ms kbps={} cx={}{}{}",
                 s.sent, s.received, s.lost, s.fec_recovered, s.underruns, s.buffer_ms, s.target_ms, db(s.in_peak), db(s.out_peak), s.tx_gap_ms, s.rx_gap_ms, s.bitrate / 1000, s.complexity,
-                if s.music { " music" } else { "" }
+                if s.music { " music" } else { "" },
+                if s.hifi { " hifi" } else { "" }
             );
         }
     }

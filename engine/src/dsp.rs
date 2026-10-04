@@ -4,6 +4,7 @@
 use chacha20poly1305::aead::AeadInOut;
 use chacha20poly1305::{ChaCha20Poly1305, KeyInit, Nonce, Tag};
 use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+use std::time::{Duration, Instant};
 
 pub const RATE: u32 = 48_000;
 pub const FRAME: usize = 480; // 10 ms per channel at 48 kHz
@@ -40,6 +41,34 @@ fn nonce(seq: u32) -> Nonce {
     n.into()
 }
 
+/// A NACK's nonce: 1 | 7 zero bytes | counter. It is sent under the audio key of the direction it
+/// asks about (by that direction's receiver, so one writer per key) and can't collide with an
+/// audio nonce.
+fn nack_nonce(counter: u32) -> Nonce {
+    let mut n = [0u8; 12];
+    n[0] = 1;
+    n[8..].copy_from_slice(&counter.to_be_bytes());
+    n.into()
+}
+
+/// Hi-Fi (lossless Music Mode): 48 kHz stereo as 24-bit little-endian PCM, 5 ms per packet
+/// (1440 bytes, so a packet stays under 1500). Losses are resent on request (NACK), not concealed.
+pub const PCM_FRAME: usize = RATE as usize / 200;
+const PCM_BYTES: usize = PCM_FRAME * 2 * 3;
+/// body[0] of a Hi-Fi packet: 0.2.x receivers accept only 1 | 2 there, so they drop it as junk.
+const PCM: u8 = 0x80 | 2;
+pub const HIFI_BITRATE: i32 = RATE as i32 * 2 * 24; // 2304 kbps
+/// NACK datagram: `magic u16 | NACK u8 | counter u32 | AEAD(ranges)`. A distinct byte where audio
+/// has its version, so no audio receiver (old or new) mistakes one for audio.
+const NACK: u8 = b'N';
+const SLOTS: usize = 256; // ring size of the reorder window and the resend store (> REORDER)
+const REORDER: u32 = 200; // 1 s of 5 ms packets: how late a resend may still be played
+const RESYNC: u32 = 1000; // a ~5 s jump: start over instead of playing it out as silence
+const RENACK: Duration = Duration::from_millis(30); // ask again for a still-missing packet after this
+/// A missing packet is given up (5 ms of faded silence) once the playback ring holds less than this.
+pub const GIVE_UP: usize = RATE as usize * 30 / 1000;
+const FADE: usize = RATE as usize / 1000; // 1 ms in/out around a given-up packet
+
 /// Bitrate ceiling in Music Mode (MASTER.md §3.7); normally the user's Bitrate setting (≤ 96 kbps).
 pub const MUSIC_BITRATE: i32 = 160_000;
 
@@ -64,12 +93,14 @@ fn encoder(channels: u16, music: bool, bitrate: i32, complexity: i32, loss_perc:
 }
 
 /// TX side: interleaved f32 frames (10 ms, or 20 ms in Music Mode) in, finished (encrypted)
-/// UDP payloads out. Packet v2: `magic u16 | version u8 | seq u32 | AEAD(channels u8 | opus)`.
+/// UDP payloads out. Packet v2: `magic u16 | version u8 | seq u32 | AEAD(channels u8 | opus)`,
+/// in Hi-Fi `AEAD(PCM | 240 stereo frames of i24 LE)`.
 pub struct Packetizer {
     enc: opus::Encoder,
     aead: ChaCha20Poly1305,
     channels: u8,
     music: bool,
+    pcm: bool,
     seq: u32,
     buf: [u8; MAX_PACKET],
 }
@@ -80,7 +111,7 @@ impl Packetizer {
         let mut buf = [0; MAX_PACKET];
         buf[..2].copy_from_slice(&MAGIC.to_be_bytes());
         buf[2] = VERSION;
-        Ok(Packetizer { enc, aead: cipher(key), channels: channels as u8, music: false, seq: 0, buf })
+        Ok(Packetizer { enc, aead: cipher(key), channels: channels as u8, music: false, pcm: false, seq: 0, buf })
     }
 
     /// Switches channels / Music Mode live by swapping in `m`'s encoder (bitrate, complexity
@@ -92,6 +123,7 @@ impl Packetizer {
         m.enc.set_packet_loss_perc(self.enc.get_packet_loss_perc()?)?;
         std::mem::swap(&mut self.enc, &mut m.enc);
         ((self.channels, m.channels), (self.music, m.music)) = ((m.channels, self.channels), (m.music, self.music));
+        std::mem::swap(&mut self.pcm, &mut m.pcm);
         Ok(())
     }
 
@@ -99,9 +131,20 @@ impl Packetizer {
         self.channels as usize
     }
 
-    /// Samples per channel in one frame: 10 ms, or 20 ms in Music Mode.
+    /// Hi-Fi: packets carry PCM (the encoder stays, idle, for falling back to Music Mode).
+    pub fn pcm(&self) -> bool {
+        self.pcm
+    }
+
+    /// Samples per channel in one frame: 10 ms, 20 ms in Music Mode, 5 ms in Hi-Fi.
     pub fn frame(&self) -> usize {
-        if self.music { 2 * FRAME } else { FRAME }
+        if self.pcm {
+            PCM_FRAME
+        } else if self.music {
+            2 * FRAME
+        } else {
+            FRAME
+        }
     }
 
     pub fn set_bitrate(&mut self, bitrate: i32) -> anyhow::Result<()> {
@@ -123,8 +166,14 @@ impl Packetizer {
         anyhow::ensure!(seq != u32::MAX, "sequence numbers used up: reconnect to rekey");
         self.seq = seq + 1;
         self.buf[3..HEADER].copy_from_slice(&seq.to_be_bytes());
-        self.buf[HEADER] = self.channels;
-        let n = self.enc.encode_float(pcm, &mut self.buf[HEADER + 1..MAX_PACKET - TAG])?;
+        let n = if self.pcm {
+            self.buf[HEADER] = PCM;
+            pack(pcm, &mut self.buf[HEADER + 1..][..PCM_BYTES]);
+            PCM_BYTES
+        } else {
+            self.buf[HEADER] = self.channels;
+            self.enc.encode_float(pcm, &mut self.buf[HEADER + 1..MAX_PACKET - TAG])?
+        };
         let end = HEADER + 1 + n;
         let (hdr, body) = self.buf.split_at_mut(HEADER);
         let tag = self.aead.encrypt_inout_detached(&nonce(seq), hdr, (&mut body[..1 + n]).into()).map_err(|_| anyhow::anyhow!("encrypt failed"))?;
@@ -138,15 +187,33 @@ pub struct Mode {
     enc: opus::Encoder,
     channels: u8,
     pub music: bool,
+    pub pcm: bool,
 }
 
 impl Mode {
-    pub fn new(channels: u16, music: bool) -> anyhow::Result<Self> {
-        Ok(Mode { enc: encoder(channels, music, 64_000, 5, 5)?, channels: channels as u8, music })
+    /// `pcm` (Hi-Fi) is Music Mode sent as PCM: stereo, with a Music Mode encoder to fall back to.
+    pub fn new(channels: u16, music: bool, pcm: bool) -> anyhow::Result<Self> {
+        let (channels, music) = if pcm { (2, true) } else { (channels, music) };
+        Ok(Mode { enc: encoder(channels, music, 64_000, 5, 5)?, channels: channels as u8, music, pcm })
     }
 }
 
-/// Authenticates and decrypts a packet in place; returns (channels, seq, opus payload).
+/// f32 → 24-bit signed little-endian, rounded and clamped (at 24 bits dither isn't needed).
+fn pack(pcm: &[f32], out: &mut [u8]) {
+    for (s, o) in pcm.iter().zip(out.as_chunks_mut::<3>().0) {
+        let v = (s * 8_388_608.0).round().clamp(-8_388_608.0, 8_388_607.0) as i32;
+        o.copy_from_slice(&v.to_le_bytes()[..3]);
+    }
+}
+
+fn unpack(b: &[u8], out: &mut [f32]) {
+    for (o, [x, y, z]) in out.iter_mut().zip(b.as_chunks::<3>().0) {
+        *o = (i32::from_le_bytes([0, *x, *y, *z]) >> 8) as f32 / 8_388_608.0;
+    }
+}
+
+/// Authenticates and decrypts a packet in place; returns (body[0], seq, payload): body[0] is the
+/// channel count (Opus) or `PCM`. (0.2.x accepted only 1 | 2 here.)
 fn open<'a>(aead: &ChaCha20Poly1305, p: &'a mut [u8]) -> Option<(u8, u32, &'a [u8])> {
     if p.len() < HEADER + 1 + TAG || p[..2] != MAGIC.to_be_bytes() || p[2] != VERSION {
         return None;
@@ -156,7 +223,210 @@ fn open<'a>(aead: &ChaCha20Poly1305, p: &'a mut [u8]) -> Option<(u8, u32, &'a [u
     let (body, tag) = rest.split_at_mut(rest.len() - TAG);
     let tag = Tag::try_from(&*tag).ok()?;
     aead.decrypt_inout_detached(&nonce(seq), hdr, (&mut *body).into(), &tag).ok()?;
-    matches!(body[0], 1 | 2).then(|| (body[0], seq, &body[1..]))
+    Some((body[0], seq, &body[1..]))
+}
+
+/// Whether a datagram is a NACK (see `Nacks`), not audio.
+pub fn is_nack(p: &[u8]) -> bool {
+    p.len() > 2 && p[..2] == MAGIC.to_be_bytes() && p[2] == NACK
+}
+
+/// TX side of Hi-Fi resends: authenticates the peer's NACKs (each counter only once, so a replayed
+/// NACK can't make this side resend) and lists the seqs asked for.
+pub struct Nacks {
+    aead: ChaCha20Poly1305,
+    last: Option<u32>,
+}
+
+impl Nacks {
+    /// `key`: this side's send key (the peer sends its NACKs under it).
+    pub fn new(key: &[u8; 32]) -> Self {
+        Nacks { aead: cipher(key), last: None }
+    }
+
+    pub fn open<'a>(&mut self, p: &'a mut [u8]) -> Option<impl Iterator<Item = u32> + 'a> {
+        if p.len() < HEADER + TAG || !is_nack(p) {
+            return None;
+        }
+        let counter = seq_of(p);
+        if self.last.is_some_and(|l| counter <= l) {
+            return None;
+        }
+        let (hdr, rest) = p.split_at_mut(HEADER);
+        let (body, tag) = rest.split_at_mut(rest.len() - TAG);
+        let tag = Tag::try_from(&*tag).ok()?;
+        self.aead.decrypt_inout_detached(&nack_nonce(counter), hdr, (&mut *body).into(), &tag).ok()?;
+        self.last = Some(counter);
+        // ranges: first seq u32 | count u16
+        Some(body.as_chunks::<6>().0.iter().flat_map(|r| {
+            let first = u32::from_be_bytes([r[0], r[1], r[2], r[3]]);
+            first..first.saturating_add(u16::from_be_bytes([r[4], r[5]]).min(REORDER as u16) as u32)
+        }))
+    }
+}
+
+/// The last ~1.3 s of sent Hi-Fi packets, as sent (same seq, same ciphertext), for resending.
+pub struct Resend {
+    buf: Vec<u8>,
+    len: Vec<usize>,
+}
+
+impl Default for Resend {
+    fn default() -> Self {
+        Resend { buf: vec![0; SLOTS * MAX_PACKET], len: vec![0; SLOTS] }
+    }
+}
+
+impl Resend {
+    pub fn keep(&mut self, p: &[u8]) {
+        let i = slot(seq_of(p));
+        self.buf[i * MAX_PACKET..][..p.len()].copy_from_slice(p);
+        self.len[i] = p.len();
+    }
+
+    pub fn get(&self, seq: u32) -> Option<&[u8]> {
+        let p = &self.buf[slot(seq) * MAX_PACKET..][..self.len[slot(seq)]];
+        (p.len() > HEADER && seq_of(p) == seq).then_some(p)
+    }
+}
+
+/// The seq (or NACK counter) in a datagram's header.
+fn seq_of(p: &[u8]) -> u32 {
+    u32::from_be_bytes([p[3], p[4], p[5], p[6]])
+}
+
+fn slot(seq: u32) -> usize {
+    seq as usize % SLOTS
+}
+
+/// RX side of Hi-Fi: a 1 s reorder window. PCM packets are held by seq until they can be played
+/// in order; a missing one is asked for again (NACK) until its playout deadline, then played as
+/// 5 ms of silence faded in and out. Packets already played, duplicates and replays are refused.
+struct Reorder {
+    on: bool,       // the stream is PCM
+    base: u32,      // next seq to play
+    top: u32,       // highest seq taken + 1; top - base ≤ REORDER
+    have: Vec<bool>,
+    nacked: Vec<Option<Instant>>, // last asked for
+    pcm: Vec<f32>,  // SLOTS packets of stereo f32
+    last: [f32; 2], // last frame played: a given-up packet fades out from it
+    silent: bool,   // the last packet was given up: fade the next one in
+    nacks: u32,     // NACK counter (its nonce)
+    nack: [u8; MAX_PACKET],
+}
+
+impl Reorder {
+    fn new() -> Self {
+        let mut nack = [0; MAX_PACKET];
+        nack[..2].copy_from_slice(&MAGIC.to_be_bytes());
+        nack[2] = NACK;
+        let pcm = vec![0.0; SLOTS * PCM_FRAME * 2];
+        Reorder { on: false, base: 0, top: 0, have: vec![false; SLOTS], nacked: vec![None; SLOTS], pcm, last: [0.0; 2], silent: false, nacks: 0, nack }
+    }
+
+    fn reset(&mut self, seq: u32) {
+        (self.on, self.base, self.top) = (true, seq, seq);
+    }
+
+    /// Takes authentic packet `seq`; false if it is refused.
+    fn insert(&mut self, seq: u32, body: &[u8], c: &Counters, out: &mut impl FnMut(&[f32])) -> bool {
+        if seq < self.base || (seq < self.top && self.have[slot(seq)]) {
+            return false; // played, duplicate or replayed
+        }
+        if seq - self.base > RESYNC {
+            self.reset(seq);
+        }
+        while seq - self.base >= REORDER {
+            // the oldest can't wait any longer; past all we know of, the rest is simply lost
+            if !self.step(true, c, out) {
+                inc(&c.lost, (seq + 1 - REORDER - self.base) as u64);
+                self.reset(seq + 1 - REORDER);
+            }
+        }
+        for s in self.top..=seq {
+            (self.have[slot(s)], self.nacked[slot(s)]) = (false, None);
+        }
+        let i = slot(seq);
+        if self.nacked[i].is_some() {
+            inc(&c.fec_recovered, 1); // asked for again, and here it is
+        }
+        unpack(body, &mut self.pcm[i * PCM_FRAME * 2..][..PCM_FRAME * 2]);
+        (self.have[i], self.nacked[i], self.top) = (true, None, self.top.max(seq + 1));
+        true
+    }
+
+    /// Plays the next packet: held as is, missing (with `give_up`) as faded silence, counted lost.
+    /// False if there's nothing to play yet.
+    fn step(&mut self, give_up: bool, c: &Counters, out: &mut impl FnMut(&[f32])) -> bool {
+        let i = slot(self.base);
+        if self.base >= self.top || !(self.have[i] || give_up) {
+            return false;
+        }
+        let p = &mut self.pcm[i * PCM_FRAME * 2..][..PCM_FRAME * 2];
+        if self.have[i] {
+            if self.silent {
+                for (n, f) in p.as_chunks_mut::<2>().0.iter_mut().take(FADE).enumerate() {
+                    f.iter_mut().for_each(|s| *s *= n as f32 / FADE as f32);
+                }
+            }
+            self.last.copy_from_slice(&p[p.len() - 2..]);
+            self.silent = false;
+        } else {
+            for (n, f) in p.as_chunks_mut::<2>().0.iter_mut().enumerate() {
+                let g = if self.silent { 0.0 } else { 1.0 - (n as f32 / FADE as f32).min(1.0) };
+                *f = self.last.map(|s| s * g);
+            }
+            self.silent = true;
+            inc(&c.lost, 1);
+        }
+        out(p);
+        (self.have[i], self.nacked[i]) = (false, None);
+        self.base += 1;
+        true
+    }
+
+    /// Plays what is in order; a missing packet is given up once the playback ring (`fill` frames)
+    /// holds less than `GIVE_UP` (`usize::MAX`: never).
+    fn release(&mut self, mut fill: usize, c: &Counters, out: &mut impl FnMut(&[f32])) {
+        while self.step(fill < GIVE_UP, c, out) {
+            fill = fill.saturating_add(PCM_FRAME);
+        }
+    }
+
+    /// A NACK (ranges: first seq u32 | count u16) for the missing packets not asked for in the
+    /// last `RENACK`, if any.
+    fn nack(&mut self, aead: &ChaCha20Poly1305, now: Instant) -> Option<&[u8]> {
+        if !self.on || self.nacks == u32::MAX {
+            return None;
+        }
+        let (mut n, mut prev) = (HEADER, None);
+        for s in self.base..self.top {
+            let i = slot(s);
+            if self.have[i] || self.nacked[i].is_some_and(|t| now - t < RENACK) {
+                continue;
+            }
+            self.nacked[i] = Some(now);
+            if prev.is_some_and(|p: u32| p + 1 == s) {
+                let count = u16::from_be_bytes([self.nack[n - 2], self.nack[n - 1]]) + 1;
+                self.nack[n - 2..n].copy_from_slice(&count.to_be_bytes());
+            } else {
+                self.nack[n..n + 4].copy_from_slice(&s.to_be_bytes());
+                self.nack[n + 4..n + 6].copy_from_slice(&1u16.to_be_bytes());
+                n += 6; // ≤ 100 ranges in a 200-packet window: fits
+            }
+            prev = Some(s);
+        }
+        if n == HEADER {
+            return None;
+        }
+        let counter = self.nacks;
+        self.nacks += 1;
+        self.nack[3..HEADER].copy_from_slice(&counter.to_be_bytes());
+        let (hdr, body) = self.nack.split_at_mut(HEADER);
+        let tag = aead.encrypt_inout_detached(&nack_nonce(counter), hdr, (&mut body[..n - HEADER]).into()).ok()?;
+        self.nack[n..n + TAG].copy_from_slice(&tag);
+        Some(&self.nack[..n + TAG])
+    }
 }
 
 /// RX side: packets in, 48 kHz stereo-interleaved PCM out (mono is duplicated to both sides).
@@ -167,23 +437,38 @@ pub struct Rx {
     last_len: usize, // samples per channel of the last decoded packet: the size PLC/FEC fill
     pcm: Vec<f32>,
     stereo: Vec<f32>,
+    reorder: Reorder, // Hi-Fi
 }
 
 impl Rx {
     pub fn new(key: &[u8; 32]) -> Self {
-        Rx { aead: cipher(key), dec: None, expected: None, last_len: FRAME, pcm: vec![0.0; MAX_OPUS_FRAME * 2], stereo: vec![0.0; MAX_OPUS_FRAME * 2] }
+        let reorder = Reorder::new();
+        Rx { aead: cipher(key), dec: None, expected: None, last_len: FRAME, pcm: vec![0.0; MAX_OPUS_FRAME * 2], stereo: vec![0.0; MAX_OPUS_FRAME * 2], reorder }
     }
 
     /// Returns the stream's channel count for authentic packets, None for junk and for late,
     /// duplicate or replayed packets (dropped silently). Decrypts `packet` in place.
+    /// Hi-Fi packets go through the reorder window: in-order audio comes out at once, the rest
+    /// waits for `release`.
     pub fn handle(&mut self, packet: &mut [u8], c: &Counters, out: &mut impl FnMut(&[f32])) -> Option<u8> {
         let (ch, seq, opus) = open(&self.aead, packet)?;
+        if ch == PCM && opus.len() == PCM_BYTES {
+            return self.take_pcm(seq, opus, c, out).then_some(2);
+        }
+        if !matches!(ch, 1 | 2) {
+            return None;
+        }
         // seq never wraps under one key (`Packetizer::packet`), so older than expected is never played
         let gap = match self.expected {
             Some(e) if seq < e => return None,
             Some(e) => seq - e,
             None => 0,
         };
+        if self.reorder.on {
+            // back from Hi-Fi: what it still holds comes first (missing packets as silence)
+            while self.reorder.step(true, c, out) {}
+            self.reorder.on = false;
+        }
         inc(&c.received, 1);
         if self.dec.as_ref().is_none_or(|(dch, _)| *dch != ch) {
             let chans = if ch == 1 { opus::Channels::Mono } else { opus::Channels::Stereo };
@@ -206,8 +491,46 @@ impl Rx {
         Some(ch)
     }
 
-    /// The stream's current packet period in µs (10 ms, 20 ms in Music Mode).
+    fn take_pcm(&mut self, seq: u32, body: &[u8], c: &Counters, out: &mut impl FnMut(&[f32])) -> bool {
+        let r = &mut self.reorder;
+        if !r.on {
+            if self.expected.is_some_and(|e| seq < e) {
+                return false;
+            }
+            r.reset(seq);
+        }
+        if !r.insert(seq, body, c, out) {
+            return false;
+        }
+        inc(&c.received, 1);
+        r.release(usize::MAX, c, out);
+        self.expected = Some(r.top); // everything below is closed to Opus packets
+        true
+    }
+
+    /// The stream is Hi-Fi (PCM).
+    pub fn pcm(&self) -> bool {
+        self.reorder.on
+    }
+
+    /// Hi-Fi: plays what is in order, giving up a missing packet once the playback ring holds
+    /// less than `GIVE_UP` (`fill`: 48 kHz frames in it).
+    pub fn release(&mut self, fill: usize, c: &Counters, out: &mut impl FnMut(&[f32])) {
+        if self.reorder.on {
+            self.reorder.release(fill, c, out);
+        }
+    }
+
+    /// Hi-Fi: a NACK datagram for the sender, if packets are missing (again, after `RENACK`).
+    pub fn nack(&mut self, now: Instant) -> Option<&[u8]> {
+        self.reorder.nack(&self.aead, now)
+    }
+
+    /// The stream's current packet period in µs (10 ms, 20 ms in Music Mode, 5 ms in Hi-Fi).
     pub fn period_us(&self) -> u32 {
+        if self.reorder.on {
+            return (PCM_FRAME * 1_000_000 / RATE as usize) as u32;
+        }
         (self.last_len * 1_000_000 / RATE as usize) as u32
     }
 
@@ -236,6 +559,7 @@ impl Rx {
 
 pub const TARGET: usize = RATE as usize / 100; // 10 ms: minimum cushion ...
 pub const MUSIC_TARGET: usize = 15 * TARGET; // ... 150 ms in Music Mode (covers a typical Wi-Fi stall from the start)
+pub const HIFI_TARGET: usize = 30 * TARGET; // ... 300 ms in Hi-Fi: time for resends to arrive
 const MARGIN: usize = RATE as usize / 200; // 5 ms on top of measured jitter
 const HEADROOM: usize = RATE as usize / 10; // fill beyond need + target + 100 ms is discarded
 // Music Mode never drops audio to shrink the buffer (an audible skip): the ≤ 0.5% speed-up drains it
@@ -313,6 +637,13 @@ impl Playout {
             (TARGET, MAX_TARGET, GROW, MAX_ADJ, HEADROOM)
         };
         self.drain = music;
+    }
+
+    /// After `set_music`: a Hi-Fi stream (PCM) waits for resends, so it keeps at least 300 ms.
+    pub fn set_hifi(&mut self, hifi: bool) {
+        if hifi {
+            self.min = HIFI_TARGET;
+        }
     }
 
     pub fn target(&self) -> usize {
@@ -415,6 +746,37 @@ impl RateControl {
             self.bitrate = (self.bitrate + 8_000).min(self.ceiling);
         }
         (self.bitrate, loss_pct.round().clamp(0.0, 30.0) as u8)
+    }
+}
+
+/// When Hi-Fi gives way to Music Mode (Opus): fed the peer's 1 s reports while Hi-Fi is wanted.
+/// More than 2% unrecovered loss or 2+ underruns over the last 10 s fall back; a minute of clean
+/// reports (≤ 2% loss, no underruns) tries Hi-Fi again.
+#[derive(Default)]
+pub struct Fallback {
+    recent: [[u64; 3]; 10], // (received + lost, lost, underruns) per report
+    at: usize,
+    clean: u32,
+    pub fallen: bool,
+}
+
+impl Fallback {
+    /// Returns whether Hi-Fi is fallen back now.
+    pub fn on_report(&mut self, received: u64, lost: u64, underruns: u64) -> bool {
+        let total = received + lost;
+        if self.fallen {
+            let clean = underruns == 0 && lost * 50 <= total;
+            self.clean = if clean { self.clean + 1 } else { 0 };
+            if self.clean >= 60 {
+                *self = Fallback::default();
+            }
+            return self.fallen;
+        }
+        self.recent[self.at] = [total, lost, underruns];
+        self.at = (self.at + 1) % self.recent.len();
+        let [total, lost, underruns] = self.recent.iter().fold([0; 3], |a, r| [a[0] + r[0], a[1] + r[1], a[2] + r[2]]);
+        self.fallen = lost * 50 > total || underruns >= 2;
+        self.fallen
     }
 }
 
@@ -613,7 +975,7 @@ mod tests {
         let mut tx = Packetizer::new(1, 64_000, &key).unwrap();
         let tone = |n: usize, ch: usize| -> Vec<f32> { (0..n * ch).map(|i| 0.5 * (i as f32 * 0.13 / ch as f32).sin()).collect() };
         let mut packets: Vec<Vec<u8>> = (0..10).map(|_| tx.packet(&tone(FRAME, 1)).unwrap().to_vec()).collect();
-        tx.set_mode(&mut Mode::new(2, true).unwrap()).unwrap();
+        tx.set_mode(&mut Mode::new(2, true, false).unwrap()).unwrap();
         assert_eq!((tx.channels(), tx.frame()), (2, 2 * FRAME));
         packets.extend((0..10).map(|_| tx.packet(&tone(2 * FRAME, 2)).unwrap().to_vec()));
         // seq (the AEAD nonce) keeps counting across the encoder swap: no reuse
@@ -638,7 +1000,7 @@ mod tests {
         assert_eq!(c.lost.load(Relaxed), 2);
 
         // and back to normal
-        tx.set_mode(&mut Mode::new(1, false).unwrap()).unwrap();
+        tx.set_mode(&mut Mode::new(1, false, false).unwrap()).unwrap();
         assert_eq!(tx.frame(), FRAME);
         let p = tx.packet(&tone(FRAME, 1)).unwrap();
         assert_eq!(u32::from_be_bytes([p[3], p[4], p[5], p[6]]), 20);
@@ -671,6 +1033,223 @@ mod tests {
         assert_eq!(u32::from_be_bytes([p[3], p[4], p[5], p[6]]), u32::MAX - 1);
         assert!(tx.packet(&[0.0; FRAME]).is_err());
         assert!(tx.packet(&[0.0; FRAME]).is_err(), "stays refused");
+    }
+
+    /// Hi-Fi packets 0..n, each one constant `level(k)`, so what plays tells which packet it was.
+    fn hifi_stream(n: u32) -> ([u8; 32], Vec<Vec<u8>>) {
+        let key = [7u8; 32];
+        let mut tx = Packetizer::new(1, 64_000, &key).unwrap();
+        tx.set_mode(&mut Mode::new(1, true, true).unwrap()).unwrap();
+        (key, (0..n).map(|k| tx.packet(&[level(k); PCM_FRAME * 2]).unwrap().to_vec()).collect())
+    }
+
+    fn level(k: u32) -> f32 {
+        (k + 1) as f32 / 1024.0 // exact in 24 bits
+    }
+
+    /// Which packet a 5 ms chunk was (by its last sample); None = given up (silence).
+    fn id(s: &[f32]) -> Option<u32> {
+        let v = s[s.len() - 1];
+        (v != 0.0).then(|| (v * 1024.0).round() as u32 - 1)
+    }
+
+    /// Feeds one packet: (accepted, the chunks played).
+    fn feed(rx: &mut Rx, c: &Counters, p: &[u8]) -> (bool, Vec<Option<u32>>) {
+        let mut played = vec![];
+        let ok = rx.handle(&mut p.to_vec(), c, &mut |s: &[f32]| {
+            assert_eq!(s.len(), PCM_FRAME * 2);
+            played.push(id(s));
+        });
+        (ok.is_some(), played)
+    }
+
+    #[test]
+    fn hifi_pcm_round_trip() {
+        let key = [7u8; 32];
+        let mut tx = Packetizer::new(1, 64_000, &key).unwrap();
+        tx.packet(&[0.0; FRAME]).unwrap();
+        tx.set_mode(&mut Mode::new(1, true, true).unwrap()).unwrap();
+        assert_eq!((tx.pcm(), tx.channels(), tx.frame()), (true, 2, PCM_FRAME), "Hi-Fi: stereo, 5 ms");
+        let lsb = 1.0 / 8_388_608.0;
+        let mut pcm: Vec<f32> = (0..PCM_FRAME * 2).map(|i| (i as f32 * 0.37).sin() * 0.9).collect();
+        pcm[..6].copy_from_slice(&[1.0, -1.5, 0.4 * lsb, 0.6 * lsb, -0.6 * lsb, f32::NAN]);
+        let p = tx.packet(&pcm).unwrap().to_vec();
+        assert_eq!(p.len(), HEADER + 1 + 1440 + TAG);
+        assert!(p.len() <= MAX_PACKET);
+        assert_eq!(seq_of(&p), 1, "seq (the nonce) continues across the switch");
+        let (kind, _, body) = open(&cipher(&key), &mut p.clone()).map(|(k, s, b)| (k, s, b.to_vec())).unwrap();
+        assert_eq!((kind, body.len()), (0x82, 1440));
+        assert!(!matches!(kind, 1 | 2), "0.2.x's open() accepts only 1 | 2 there: an old receiver drops it as junk");
+
+        let (mut rx, c, mut out) = (Rx::new(&key), Counters::default(), vec![]);
+        assert_eq!(rx.handle(&mut p.clone(), &c, &mut |s: &[f32]| out.extend_from_slice(s)), Some(2));
+        assert_eq!(out.len(), PCM_FRAME * 2);
+        assert_eq!(&out[..6], &[8_388_607.0 * lsb, -1.0, 0.0, lsb, -lsb, 0.0], "clamped, rounded to 24 bits; NaN is silence");
+        for (o, i) in out.iter().zip(&pcm).skip(6) {
+            assert_eq!(*o, (i * 8_388_608.0).round() * lsb, "lossless to 24 bits");
+        }
+        assert_eq!((rx.pcm(), rx.period_us(), c.received.load(Relaxed)), (true, 5_000, 1));
+        assert_eq!(rx.handle(&mut p.clone(), &c, &mut |_: &[f32]| panic!("replay played")), None);
+
+        // CPU: pack + encrypt, then decrypt + unpack, per 5 ms packet
+        let t = std::time::Instant::now();
+        for _ in 0..1000 {
+            let mut p = tx.packet(&pcm).unwrap().to_vec();
+            rx.handle(&mut p, &c, &mut |_: &[f32]| {});
+        }
+        let us = t.elapsed().as_micros() as f64 / 1000.0;
+        eprintln!("Hi-Fi: {us:.1} µs per 5 ms packet, both ends");
+        assert!(us < 5000.0, "{us} µs: can't keep up with 5 ms packets"); // ~5 µs in release
+    }
+
+    #[test]
+    fn hifi_reorder_window() {
+        let (key, p) = hifi_stream(260);
+        let (mut rx, c) = (Rx::new(&key), Counters::default());
+        assert_eq!(feed(&mut rx, &c, &p[0]), (true, vec![Some(0)]), "in order: played at once");
+        assert_eq!(feed(&mut rx, &c, &p[2]), (true, vec![]), "out of order: held");
+        assert_eq!(feed(&mut rx, &c, &p[1]), (true, vec![Some(1), Some(2)]), "the gap filled: both play");
+        assert_eq!(feed(&mut rx, &c, &p[1]), (false, vec![]), "played: duplicate refused");
+        assert_eq!(feed(&mut rx, &c, &p[4]), (true, vec![]));
+        assert_eq!(feed(&mut rx, &c, &p[4]), (false, vec![]), "held: duplicate refused");
+        assert!(rx.nack(Instant::now()).is_some(), "3 is asked for");
+        assert_eq!(feed(&mut rx, &c, &p[3]), (true, vec![Some(3), Some(4)]), "the resend fills the gap");
+        assert_eq!(c.fec_recovered.load(Relaxed), 1, "counted as recovered");
+        assert_eq!(feed(&mut rx, &c, &p[3]), (false, vec![]), "a resend is taken once");
+        assert_eq!(feed(&mut rx, &c, &p[0]), (false, vec![]), "replay refused");
+        assert_eq!((c.received.load(Relaxed), c.lost.load(Relaxed)), (5, 0));
+        assert_eq!(feed(&mut rx, &c, &p[6]), (true, vec![]));
+        // 1 s (200 packets) further on: 5 can't wait any longer, 7..=50 were never seen
+        let (ok, played) = feed(&mut rx, &c, &p[250]);
+        assert!(ok);
+        assert_eq!(played, [None, Some(6)], "5 given up as silence, 6 played");
+        assert_eq!(c.lost.load(Relaxed), 1 + 44, "5, and 7..=50 skipped");
+        assert_eq!(feed(&mut rx, &c, &p[50]), (false, vec![]), "too old");
+        assert_eq!(feed(&mut rx, &c, &p[52]), (true, vec![]), "in the window: held");
+    }
+
+    #[test]
+    fn hifi_nack_and_resend() {
+        let (key, p) = hifi_stream(12);
+        let (mut rx, c) = (Rx::new(&key), Counters::default());
+        assert!(rx.nack(Instant::now()).is_none(), "not Hi-Fi yet: nothing to ask");
+        for i in [0, 3, 5] {
+            feed(&mut rx, &c, &p[i]);
+        }
+        let t = Instant::now();
+        let nack = rx.nack(t).unwrap().to_vec();
+        assert!(is_nack(&nack) && !is_nack(&p[0]));
+        assert!(rx.nack(t + Duration::from_millis(10)).is_none(), "not again before RENACK");
+        let mut nacks = Nacks::new(&key);
+        assert!(Nacks::new(&[8; 32]).open(&mut nack.clone()).is_none(), "wrong key");
+        let mut bad = nack.clone();
+        bad[HEADER] ^= 1;
+        assert!(nacks.open(&mut bad).is_none(), "tampered");
+        let seqs: Vec<u32> = nacks.open(&mut nack.clone()).unwrap().collect();
+        assert_eq!(seqs, [1, 2, 4], "two ranges: 1..=2 and 4");
+        assert!(nacks.open(&mut nack.clone()).is_none(), "a replayed NACK is refused");
+        assert_eq!(feed(&mut rx, &c, &nack), (false, vec![]), "a NACK is never audio");
+
+        // the sender finds the packets as sent: same seq, same ciphertext
+        let mut sent = Resend::default();
+        p.iter().for_each(|q| sent.keep(q));
+        for s in &seqs {
+            assert_eq!(sent.get(*s), Some(&p[*s as usize][..]));
+        }
+        assert_eq!(sent.get(12), None, "never sent");
+        let (_, later) = hifi_stream(SLOTS as u32 + 2);
+        sent.keep(&later[SLOTS + 1]);
+        assert_eq!(sent.get(1), None, "overwritten after SLOTS packets");
+
+        // 1 and 2 come back; 4 is asked for again, once RENACK has passed
+        feed(&mut rx, &c, &p[1]);
+        feed(&mut rx, &c, &p[2]);
+        let again = rx.nack(t + RENACK).unwrap().to_vec();
+        assert_eq!(nacks.open(&mut again.clone()).unwrap().collect::<Vec<_>>(), [4]);
+        // a ring that never runs low never gives up; one that does gives 4 up
+        let mut played = vec![];
+        rx.release(GIVE_UP, &c, &mut |s: &[f32]| played.push(id(s)));
+        assert!(played.is_empty());
+        rx.release(0, &c, &mut |s: &[f32]| played.push(id(s)));
+        assert_eq!(played, [None, Some(5)]);
+        assert!(rx.nack(t + RENACK * 10).is_none(), "nothing missing any more");
+    }
+
+    #[test]
+    fn hifi_gives_up_with_fades() {
+        let (key, p) = hifi_stream(3);
+        let (mut rx, c) = (Rx::new(&key), Counters::default());
+        feed(&mut rx, &c, &p[0]);
+        feed(&mut rx, &c, &p[2]);
+        let mut out: Vec<Vec<f32>> = vec![];
+        rx.release(GIVE_UP, &c, &mut |s: &[f32]| out.push(s.to_vec()));
+        assert!(out.is_empty(), "still time for a resend");
+        rx.release(GIVE_UP - 1, &c, &mut |s: &[f32]| out.push(s.to_vec()));
+        assert_eq!(out.len(), 2, "1 as silence, then 2");
+        assert_eq!(c.lost.load(Relaxed), 1, "counted lost");
+        let (gap, next) = (&out[0], &out[1]);
+        assert_eq!(gap[0], level(0), "fades out from the last sample played ...");
+        assert!(gap[2 * FADE / 2] > 0.0 && gap[2 * FADE / 2] < level(0));
+        assert!(gap[2 * FADE..].iter().all(|s| *s == 0.0), "... to silence within 1 ms");
+        assert_eq!(next[0], 0.0, "the next packet fades in ...");
+        assert!(next.chunks(2).take(FADE).zip(next.chunks(2).skip(1)).all(|(a, b)| a[0] <= b[0]));
+        assert!(next[2 * FADE..].iter().all(|s| *s == level(2)), "... over 1 ms");
+    }
+
+    #[test]
+    fn hifi_and_opus_share_one_seq_space() {
+        let key = [7u8; 32];
+        let mut tx = Packetizer::new(1, 64_000, &key).unwrap();
+        let mut p: Vec<Vec<u8>> = (0..5).map(|_| tx.packet(&[0.1; FRAME]).unwrap().to_vec()).collect();
+        tx.set_mode(&mut Mode::new(1, true, true).unwrap()).unwrap();
+        p.extend((5..10).map(|_| tx.packet(&[0.1; PCM_FRAME * 2]).unwrap().to_vec()));
+        tx.set_mode(&mut Mode::new(2, true, false).unwrap()).unwrap(); // fallback: Music Mode
+        assert_eq!((tx.pcm(), tx.channels(), tx.frame()), (false, 2, 2 * FRAME));
+        p.extend((10..15).map(|_| tx.packet(&[0.1; 4 * FRAME]).unwrap().to_vec()));
+        let (mut rx, c, mut sizes) = (Rx::new(&key), Counters::default(), vec![]);
+        for (i, q) in p.iter().enumerate() {
+            if i != 7 {
+                assert!(rx.handle(&mut q.clone(), &c, &mut |s: &[f32]| sizes.push(s.len() / 2)).is_some(), "{i}");
+            }
+            assert_eq!(rx.pcm(), (5..10).contains(&i), "{i}");
+        }
+        // 7 was given up (silence) when Opus took over at 10
+        assert_eq!(sizes, [[FRAME; 5].as_slice(), &[PCM_FRAME; 5], &[2 * FRAME; 5]].concat());
+        assert_eq!((c.lost.load(Relaxed), c.received.load(Relaxed)), (1, 14));
+        let never = &mut |_: &[f32]| panic!("replay played");
+        for i in [2, 6, 7, 12] {
+            assert_eq!(rx.handle(&mut p[i].clone(), &c, never), None, "{i}: replayed or too late");
+        }
+    }
+
+    #[test]
+    fn hifi_fallback() {
+        let mut f = Fallback::default();
+        for _ in 0..30 {
+            assert!(!f.on_report(200, 0, 0));
+        }
+        for _ in 0..20 {
+            assert!(!f.on_report(196, 4, 0), "2% unrecovered loss is still OK");
+        }
+        assert!(!f.on_report(200, 0, 1), "one underrun is OK ...");
+        for _ in 0..8 {
+            assert!(!f.on_report(200, 0, 0));
+        }
+        assert!(f.on_report(200, 0, 1), "... a second within 10 s falls back");
+        for _ in 0..30 {
+            assert!(f.on_report(50, 0, 0));
+        }
+        assert!(f.on_report(50, 0, 1), "an underrun restarts the clean minute");
+        for _ in 0..59 {
+            assert!(f.on_report(50, 1, 0), "≤ 2% loss is clean");
+        }
+        assert!(!f.on_report(50, 0, 0), "a clean minute: Hi-Fi again");
+        assert!(!f.on_report(200, 0, 1), "with a fresh 10 s window");
+        let mut f = Fallback::default();
+        for _ in 0..9 {
+            f.on_report(200, 0, 0);
+        }
+        assert!(f.on_report(150, 50, 0), "> 2% lost over the last 10 s");
     }
 
     #[test]

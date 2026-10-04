@@ -1,7 +1,7 @@
 //! One node per process: config, mDNS discovery, PIN pairing (SPAKE2), the Noise control
 //! channel and the single active `Link` (MASTER.md §3.3).
 
-use crate::dsp::{ceiling, RateControl, MUSIC_TARGET, RATE, TARGET};
+use crate::dsp::{ceiling, Fallback, RateControl, MUSIC_TARGET, RATE, TARGET};
 use crate::log::log;
 use crate::ptt::{self, Ev, PttKey, PttMode, Talk};
 use crate::vdev::Virtual;
@@ -254,8 +254,17 @@ enum Msg {
     SetSettings { settings: serde_json::Map<String, serde_json::Value>, #[serde(default)] name: Option<String> },
     /// This side's own Music Mode setting, sent after the session starts and on every change
     /// (MASTER.md §3.7). Old peers never send it (= off) and ignore it. `name` = the sender's own
-    /// device name (at session start and on a rename; absent from old peers).
-    Mode { music: bool, #[serde(default)] name: Option<String> },
+    /// device name (at session start and on a rename; absent from old peers). `hifi` = the
+    /// sender's own Hi-Fi setting, `hifi_ok` = it can do Hi-Fi (both absent from 0.2.x = can't).
+    Mode {
+        music: bool,
+        #[serde(default)]
+        name: Option<String>,
+        #[serde(default)]
+        hifi: bool,
+        #[serde(default)]
+        hifi_ok: bool,
+    },
     /// Manage request: the diagnostics text (`Node::diagnostics`), answered with `Text`.
     Diagnostics { redact: bool },
     /// A long text, in pieces: `more` on all but the last (see `send_text`).
@@ -274,6 +283,8 @@ struct Session {
     link: Option<Link>,
     ctl: Arc<Ctl>,
     peer_music: bool, // the peer's last `Mode`
+    peer_hifi: (bool, bool), // ... its (hifi, hifi_ok)
+    hifi_fallback: bool, // this side's Hi-Fi sending fell back to Opus (see `Fallback`)
     mine: bool,       // this node dialed it (only the initiator auto-reconnects)
     recent: VecDeque<[u64; 3]>, // per-second (received, lost, underruns) of our Link, newest last
     rtt_ms: Option<f32>, // control-channel round trip, from `Report` echoes
@@ -460,6 +471,7 @@ impl Node {
             let peer_send = s.peer_ms.0.unwrap_or(if x.music { 30.0 } else { 20.0 });
             x.delay_in_ms = recv.map(|r| one_way(peer_send, s.rtt_ms, r));
             x.delay_out_ms = send.zip(s.peer_ms.1).map(|(m, r)| one_way(m, s.rtt_ms, r));
+            x.hifi_fallback = s.hifi_fallback && hifi(&st);
             x
         });
         NodeState {
@@ -549,7 +561,7 @@ impl Node {
         let on = |b: bool| if b { "on" } else { "off" };
         let _ = writeln!(t, "\n== Settings ==\nSend from: {}\nPlay to: {}", dev(&s.input, &ins), dev(&s.output, &outs));
         let _ = writeln!(t, "Channels: {}\nBitrate: {} kbps", if s.channels == 2 { "Stereo" } else { "Mono" }, s.bitrate / 1000);
-        let _ = writeln!(t, "Music Mode: {}\nRun in background: {}\nRemote configuration: {}\nReconnect automatically: {}", on(s.music_mode), on(s.service), on(s.remote_config), on(s.auto_reconnect));
+        let _ = writeln!(t, "Music Mode: {}{}\nRun in background: {}\nRemote configuration: {}\nReconnect automatically: {}", on(s.music_mode), if s.hifi { " (Hi-Fi)" } else { "" }, on(s.service), on(s.remote_config), on(s.auto_reconnect));
         let key = s.ptt_key.as_ref().map_or(String::new(), |k| format!(" ({})", k.label));
         let _ = writeln!(t, "Send volume: {}%{}\nReceive volume: {}%\nPush-to-talk: {:?}{key}", s.send_volume, if s.mute { ", muted" } else { "" }, s.recv_volume, s.ptt);
         if let Some(e) = &st.ptt.error {
@@ -855,7 +867,7 @@ impl Node {
                 }
                 s = Audio::of(&old).apply(s);
             }
-            let music = s.music_mode;
+            let mode = (s.music_mode, s.hifi);
             let audio_changed = restarts(&old, &s);
             if !s.auto_reconnect && st.retrying.is_some() {
                 self.cancel_retry(&mut st);
@@ -870,10 +882,10 @@ impl Node {
             self.sync_ptt(&mut st);
             apply_live(&st);
             let sess = st.session.as_ref();
-            (sess.filter(|_| audio_changed).map(|s| (s.peer_id.clone(), s.addr)), sess.filter(|_| !audio_changed && old.music_mode != music).map(|s| (s.ctl.clone(), music)))
+            (sess.filter(|_| audio_changed).map(|s| (s.peer_id.clone(), s.addr)), sess.filter(|_| !audio_changed && (old.music_mode, old.hifi) != mode).map(|s| (s.ctl.clone(), mode)))
         };
-        if let Some((ctl, music)) = notify {
-            let _ = ctl.send(&Msg::Mode { music, name: None });
+        if let Some((ctl, (music, hifi))) = notify {
+            let _ = ctl.send(&Msg::Mode { music, name: None, hifi, hifi_ok: true });
         }
         match running {
             Some((id, addr)) => self.connect_to(&id, &[addr]),
@@ -1126,7 +1138,7 @@ impl Node {
             }
         };
         self.cancel_retry(&mut st);
-        st.session = Some(Session { peer_id: id.to_string(), addr, link, ctl: ctl.clone(), peer_music: false, mine: own.is_some(), recent: VecDeque::new(), rtt_ms: None, peer_ms: (None, None) });
+        st.session = Some(Session { peer_id: id.to_string(), addr, link, ctl: ctl.clone(), peer_music: false, peer_hifi: (false, false), hifi_fallback: false, mine: own.is_some(), recent: VecDeque::new(), rtt_ms: None, peer_ms: (None, None) });
         log(&format!("session started with {} at {addr}, {}", peer_name(&st.cfg, id), if own.is_some() { "dialed from here" } else { "dialed by the other computer" }));
         st.error = None;
         set_addr(&mut st.cfg, id, addr.to_string());
@@ -1148,6 +1160,7 @@ impl Node {
     fn serve(&self, ctl: Arc<Ctl>, peer: &str) {
         let _ = ctl.stream.set_read_timeout(Some(Duration::from_secs(1)));
         let mut rate = RateControl::new(ceiling(self.st().cfg.settings.bitrate, false));
+        let mut fallback = Fallback::default();
         let mut last_counts = (0u64, 0u64, 0u64);
         let (mut last_rx, mut last_report, mut last_log) = (Instant::now(), Instant::now(), Instant::now());
         let mut rebuilding = false; // a reconnect for `Failure::Rebuild` is under way
@@ -1162,9 +1175,21 @@ impl Node {
                     their_ts = ts.map(|t| (t, last_rx)).or(their_ts);
                     let ceil = {
                         let mut st = self.st();
+                        // Hi-Fi wanted: the peer's report says whether this side's sending keeps up
+                        let want = hifi(&st);
+                        if !want {
+                            fallback = Fallback::default();
+                        }
+                        let fallen = want && fallback.on_report(received, lost, underruns);
                         if let Some(s) = st.session.as_mut().filter(|s| Arc::ptr_eq(&s.ctl, &ctl)) {
                             s.rtt_ms = echo.map(|(t, waited)| ms().saturating_sub(t).saturating_sub(waited) as f32).or(s.rtt_ms);
                             s.peer_ms = (send_ms, recv_ms);
+                            if std::mem::replace(&mut s.hifi_fallback, fallen) != fallen {
+                                if want {
+                                    log(if fallen { "Hi-Fi: the network can't keep up, falling back to Music Mode" } else { "Hi-Fi: trying again after a clean minute" });
+                                }
+                                apply_live(&st);
+                            }
                         }
                         ceiling(st.cfg.settings.bitrate, music(&st))
                     };
@@ -1172,11 +1197,11 @@ impl Node {
                     let (bitrate, loss_perc) = rate.on_report(received, lost, underruns);
                     self.apply_rate(&ctl, bitrate, loss_perc);
                 }
-                Ok(Some(Msg::Mode { music, name })) => {
+                Ok(Some(Msg::Mode { music, name, hifi, hifi_ok })) => {
                     last_rx = Instant::now();
                     let mut st = self.st();
                     if let Some(s) = st.session.as_mut().filter(|s| Arc::ptr_eq(&s.ctl, &ctl)) {
-                        s.peer_music = music;
+                        (s.peer_music, s.peer_hifi) = (music, (hifi, hifi_ok));
                     }
                     apply_live(&st);
                     let name = name.map(|n| clean_name(n.trim())).filter(|n| !n.is_empty());
@@ -1278,11 +1303,11 @@ impl Node {
         }
     }
 
-    /// Tells the peer this side's Music Mode and name.
+    /// Tells the peer this side's Music Mode, Hi-Fi and name.
     fn send_mode(&self, ctl: &Ctl) {
         let m = {
             let st = self.st();
-            Msg::Mode { music: st.cfg.settings.music_mode, name: Some(st.cfg.name.clone()) }
+            Msg::Mode { music: st.cfg.settings.music_mode, name: Some(st.cfg.name.clone()), hifi: st.cfg.settings.hifi, hifi_ok: true }
         };
         let _ = ctl.send(&m);
     }
@@ -1551,11 +1576,17 @@ fn music(st: &St) -> bool {
     st.cfg.settings.music_mode || st.session.as_ref().is_some_and(|s| s.peer_music)
 }
 
-/// Pushes the effective Music Mode, the volumes, mute and push-to-talk to the running Link.
+/// Hi-Fi wanted for this link: in Music Mode, either side has it on and the peer can do it.
+fn hifi(st: &St) -> bool {
+    let peer = st.session.as_ref().map_or((false, false), |s| s.peer_hifi);
+    music(st) && (st.cfg.settings.hifi || peer.0) && peer.1
+}
+
+/// Pushes the effective Music Mode and Hi-Fi, the volumes, mute and push-to-talk to the running Link.
 fn apply_live(st: &St) {
-    if let Some(link) = st.session.as_ref().and_then(|s| s.link.as_ref()) {
+    if let Some((sess, link)) = st.session.as_ref().and_then(|s| Some((s, s.link.as_ref()?))) {
         let s = &st.cfg.settings;
-        link.set_music(music(st));
+        link.set_mode(music(st), hifi(st) && !sess.hifi_fallback);
         link.set_volume(s.send_volume, s.recv_volume, s.mute || (s.ptt != PttMode::Off && !st.ptt.talk.on()));
     }
 }
@@ -2250,6 +2281,32 @@ mod tests {
         assert!(music(&b.st()), "a still has it on");
         assert!(Arc::ptr_eq(&ca, &ctl(&a)) && Arc::ptr_eq(&cb, &ctl(&b)), "same sessions: no reconnect");
         assert!(load(&adir).unwrap().settings.music_mode && !load(&bdir).unwrap().settings.music_mode);
+
+        // Hi-Fi: either side wants it, both can (both told the other at session start), live
+        let peer_hifi = |n: &Node| n.st().session.as_ref().map(|s| s.peer_hifi);
+        assert_eq!((peer_hifi(&a), peer_hifi(&b)), (Some((false, true)), Some((false, true))));
+        assert!(!hifi(&a.st()) && !hifi(&b.st()));
+        b.patch_settings(serde_json::json!({ "hifi": true }).as_object().unwrap()).unwrap();
+        wait(|| peer_hifi(&a) == Some((true, true)));
+        assert!(hifi(&a.st()) && hifi(&b.st()), "either side on = both on");
+        assert!(Arc::ptr_eq(&ca, &ctl(&a)) && Arc::ptr_eq(&cb, &ctl(&b)), "no reconnect");
+        assert!(load(&bdir).unwrap().settings.hifi);
+        a.set_settings(Settings { music_mode: false, ..a.state().settings }).unwrap();
+        wait(|| !music(&b.st()));
+        assert!(!hifi(&a.st()) && !hifi(&b.st()), "no effect without Music Mode");
+        // the truth table, on a's side
+        for (music_on, mine, wants, can, on) in [
+            (true, true, false, true, true),
+            (true, false, true, true, true),
+            (true, false, false, true, false),
+            (true, true, true, false, false), // an older peer can't
+            (false, true, true, true, false),
+        ] {
+            let mut st = a.st();
+            (st.cfg.settings.music_mode, st.cfg.settings.hifi) = (music_on, mine);
+            st.session.as_mut().unwrap().peer_hifi = (wants, can);
+            assert_eq!(hifi(&st), on, "music {music_on}, mine {mine}, peer wants {wants}, can {can}");
+        }
         let _ = std::fs::remove_dir_all(adir);
         let _ = std::fs::remove_dir_all(bdir);
     }
@@ -2470,14 +2527,16 @@ mod tests {
         assert!(matches!(m, Msg::SetSettings { name: None, .. }), "old SetSettings JSON without `name` parses");
 
         let m: Msg = serde_json::from_str(r#"{"type":"mode","music":true}"#).unwrap();
-        assert!(matches!(m, Msg::Mode { music: true, name: None }), "old Mode JSON without `name` parses");
+        assert!(matches!(m, Msg::Mode { music: true, name: None, hifi: false, hifi_ok: false }), "old Mode JSON without `name` or Hi-Fi parses: can't do Hi-Fi");
         #[derive(Deserialize)]
         #[serde(tag = "type", rename_all = "lowercase")]
         enum Old {
             Mode { music: bool },
         }
-        let new = serde_json::to_vec(&Msg::Mode { music: true, name: Some("B".into()) }).unwrap();
+        let new = serde_json::to_vec(&Msg::Mode { music: true, name: Some("B".into()), hifi: true, hifi_ok: true }).unwrap();
         assert!(matches!(serde_json::from_slice(&new), Ok(Old::Mode { music: true })), "an old peer reads the new Mode");
+        let m: Msg = serde_json::from_slice(&new).unwrap();
+        assert!(matches!(m, Msg::Mode { music: true, hifi: true, hifi_ok: true, .. }));
         let st: Stats = serde_json::from_str(r#"{"sent":0,"received":0,"lost":0,"fec_recovered":0,"underruns":0,"buffer_ms":0,"target_ms":0,
             "in_peak":0,"out_peak":0,"tx_gap_ms":0,"rx_gap_ms":0,"bitrate":0,"complexity":0}"#).unwrap();
         assert!(!st.music, "old Stats JSON without `music` parses");
