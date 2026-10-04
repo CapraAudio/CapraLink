@@ -26,6 +26,10 @@ jobs:
     env:
       TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
       TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+      # macOS: our own (self-signed) code-signing certificate, so macOS sees every build as the same
+      # app and keeps its permissions (microphone, Input Monitoring) across updates; ad-hoc without it
+      MACOS_SIGNING_P12: ${{ secrets.MACOS_SIGNING_P12 }}
+      MACOS_SIGNING_PASSWORD: ${{ secrets.MACOS_SIGNING_PASSWORD }}
     steps:
       # third-party actions pinned to full commit SHAs (tag in the comment)
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -46,10 +50,24 @@ jobs:
       - name: bundle (macOS universal app + installer package)
         if: runner.os == 'macOS'
         run: |
+          if [ -n "$MACOS_SIGNING_P12" ]; then
+            kc=$RUNNER_TEMP/signing.keychain-db
+            security create-keychain -p ci "$kc" && security set-keychain-settings "$kc" && security unlock-keychain -p ci "$kc"
+            base64 -d <<<"$MACOS_SIGNING_P12" > "$RUNNER_TEMP/signing.p12"
+            security import "$RUNNER_TEMP/signing.p12" -k "$kc" -P "$MACOS_SIGNING_PASSWORD" -T /usr/bin/codesign
+            rm "$RUNNER_TEMP/signing.p12"
+            security set-key-partition-list -S apple-tool:,apple: -s -k ci "$kc" > /dev/null
+            security list-keychains -d user -s "$kc" $(security list-keychains -d user | tr -d '"')
+            # codesign only uses a certificate trusted for code signing
+            security find-certificate -c "CapraLink Code Signing" -p "$kc" > "$RUNNER_TEMP/signing.pem"
+            sudo security add-trusted-cert -d -r trustRoot -p codeSign -k /Library/Keychains/System.keychain "$RUNNER_TEMP/signing.pem"
+            export APPLE_SIGNING_IDENTITY="CapraLink Code Signing" # overrides tauri.conf.json's ad-hoc "-"
+          fi
           sign=(); [ -z "$TAURI_SIGNING_PRIVATE_KEY" ] || sign=(--config '{"bundle":{"createUpdaterArtifacts":true}}')
           cargo tauri build --target universal-apple-darwin --bundles app "${sign[@]}" -- --locked
           version=$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[] | select(.name == "capralink") | .version')
           bundle=target/universal-apple-darwin/release/bundle/macos
+          codesign -dvv $bundle/CapraLink.app 2>&1 | grep -E "^(Authority|Signature|TeamIdentifier)=" || true; codesign -d -r- $bundle/CapraLink.app
           packaging/macos/build-pkg.sh $bundle/CapraLink.app "$version" dist
           # the in-app update replaces just the .app (the pkg also installs the audio drivers)
           [ -z "$TAURI_SIGNING_PRIVATE_KEY" ] || for e in "" .sig; do cp "$bundle/CapraLink.app.tar.gz$e" "dist/CapraLink-$version-macOS.app.tar.gz$e"; done
