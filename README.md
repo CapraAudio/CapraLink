@@ -136,10 +136,18 @@ The public API, meaning what a version number promises to keep compatible, is:
 
 ```text
 capralink --status              one JSON line: connected {id, name} or null, devices [{id, name, online, connected}],
-                                music_mode, quality ("good"/"fair"/"poor" or null), error
+                                music_mode, quality ("good"/"fair"/"poor" or null), error, mute, send_volume, recv_volume,
+                                ptt, ptt_key (name or null), talking, ptt_error, hifi, hifi_active,
+                                delay_in_ms, delay_out_ms (null when not connected)
 capralink --connect NAME_OR_ID  connect to a paired device
 capralink --disconnect
 capralink --music on|off        Music Mode
+capralink --hifi on|off         Hi-Fi (needs Music Mode)
+capralink --mute on|off
+capralink --volume send|recv N  0 to 150
+capralink --ptt off|hold|toggle push-to-talk mode
+capralink --ptt-set             wait up to 10 s for a key or button press, make it the push-to-talk
+                                button (turning push-to-talk on in hold mode if it was off), print its name
 ```
 
 Before 1.0.0, a breaking change bumps MINOR instead of MAJOR, and the release notes call it out.

@@ -310,7 +310,14 @@ fn cli(args: &[String], dir: Option<PathBuf>, port: u16) -> anyhow::Result<Optio
             let devices: Vec<_> = peers.iter().map(|d| serde_json::json!({ "id": d.id, "name": d.name, "online": d.online, "connected": d.connected })).collect();
             // the peer's own Music Mode isn't part of NodeState, so `music_mode` is this computer's setting
             let quality = st.quality.as_ref().map(|q| q.grade.as_str());
-            Ok(Some(serde_json::json!({ "connected": connected, "devices": devices, "music_mode": st.settings.music_mode, "quality": quality, "error": st.error }).to_string()))
+            let (se, stats) = (&st.settings, st.stats.as_ref());
+            Ok(Some(serde_json::json!({
+                "connected": connected, "devices": devices, "music_mode": se.music_mode, "quality": quality, "error": st.error,
+                "mute": se.mute, "send_volume": se.send_volume, "recv_volume": se.recv_volume, "ptt": se.ptt,
+                "ptt_key": se.ptt_key.as_ref().map(|k| &k.label), "talking": st.talking, "ptt_error": st.ptt_error,
+                "hifi": se.hifi, "hifi_active": stats.is_some_and(|s| s.hifi),
+                "delay_in_ms": stats.and_then(|s| s.delay_in_ms), "delay_out_ms": stats.and_then(|s| s.delay_out_ms),
+            }).to_string()))
         }
         ["--connect", who] => {
             let d = st.devices.iter().find(|d| d.paired && (d.id == who || d.name.eq_ignore_ascii_case(who)));
@@ -318,7 +325,20 @@ fn cli(args: &[String], dir: Option<PathBuf>, port: u16) -> anyhow::Result<Optio
         }
         ["--disconnect"] => c.disconnect().map(|_| None),
         ["--music", v] => c.patch_settings(serde_json::json!({ "music_mode": parse_on_off(v)? })).map(|_| None),
-        _ => anyhow::bail!("usage: capralink --status | --connect NAME_OR_ID | --disconnect | --music on|off"),
+        ["--mute", v] => c.patch_settings(serde_json::json!({ "mute": parse_on_off(v)? })).map(|_| None),
+        ["--hifi", v] => c.patch_settings(serde_json::json!({ "hifi": parse_on_off(v)? })).map(|_| None),
+        ["--volume", which @ ("send" | "recv"), n] => {
+            let n: u16 = n.parse().ok().filter(|n| *n <= 150).ok_or_else(|| anyhow::anyhow!("--volume takes 0 to 150, not {n}"))?;
+            c.patch_settings(serde_json::json!({ format!("{which}_volume"): n })).map(|_| None)
+        }
+        ["--ptt", m @ ("off" | "hold" | "toggle")] => c.patch_settings(serde_json::json!({ "ptt": m })).map(|_| None),
+        ["--ptt-set"] => {
+            let key = c.ptt_capture()?; // waits up to 10 s for a key or button press
+            let mode = if st.settings.ptt == capralink_engine::PttMode::Off { "hold".into() } else { serde_json::json!(st.settings.ptt) };
+            c.patch_settings(serde_json::json!({ "ptt_key": key, "ptt": mode }))?;
+            Ok(Some(key.label))
+        }
+        _ => anyhow::bail!("usage: capralink --status | --connect NAME_OR_ID | --disconnect | --music on|off | --mute on|off | --hifi on|off | --volume send|recv 0-150 | --ptt off|hold|toggle | --ptt-set"),
     }
 }
 
@@ -326,7 +346,7 @@ fn parse_on_off(v: &str) -> anyhow::Result<bool> {
     match v {
         "on" => Ok(true),
         "off" => Ok(false),
-        _ => anyhow::bail!("--music takes on or off, not {v}"),
+        _ => anyhow::bail!("expected on or off, not {v}"),
     }
 }
 
@@ -366,7 +386,7 @@ fn main() {
 
     // Scriptable client (Steam Deck plugin, shell): talks to a running engine, never opens the UI.
     let args: Vec<String> = std::env::args().skip(1).collect();
-    if matches!(args.first().map(String::as_str), Some("--status" | "--connect" | "--disconnect" | "--music")) {
+    if matches!(args.first().map(String::as_str), Some("--status" | "--connect" | "--disconnect" | "--music" | "--mute" | "--hifi" | "--volume" | "--ptt" | "--ptt-set")) {
         match cli(&args, dir, port) {
             Ok(Some(out)) => println!("{out}"),
             Ok(None) => {}
