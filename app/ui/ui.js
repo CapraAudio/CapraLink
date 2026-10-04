@@ -2,12 +2,14 @@ const { invoke } = window.__TAURI__.core;
 const $ = (id) => document.getElementById(id);
 const els = {
   input: $('input'), output: $('output'), channels: $('channels'), bitrate: $('bitrate'),
-  bitrateVal: $('bitrateVal'), service: $('service'), remoteCfg: $('remoteCfg'), autoRc: $('autoRc'), music: $('music'), error: $('error'), status: $('status'), stats: $('stats'), quality: $('quality'), devices: $('devices'),
+  bitrateVal: $('bitrateVal'), service: $('service'), remoteCfg: $('remoteCfg'), autoRc: $('autoRc'), music: $('music'), hifi: $('hifi'), error: $('error'), status: $('status'), stats: $('stats'), quality: $('quality'), devices: $('devices'),
   myNameRow: $('myNameRow'),
 };
 
 let channels = 1;
 let effectiveMusic = false;
+let effectiveHifi = false, hifiFallback = false;
+let pttMode = 'off', pttWaiting = false, pttSig = '';
 let liveRate = null; // kbps actually being sent, while streaming // the link is in Music Mode (either side has it on)
 let settingsLoaded = false;
 let currentId;
@@ -58,9 +60,14 @@ function showMusic() {
   // its fixed 160 kbps ceiling (the knob is hidden then: the user's target doesn't apply)
   const target = on ? 160 : Number(els.bitrate.value);
   els.bitrate.classList.toggle('music', on);
-  els.bitrate.style.setProperty('--live', liveRate ? Math.min(1, Math.max(0, (liveRate - 8) / ((on ? 160 : 96) - 8))) : 0);
+  const lossless = !!liveRate && effectiveHifi;
+  els.hifi.disabled = !on; // Hi-Fi rides on Music Mode
+  els.bitrate.style.setProperty('--live', lossless ? 1 : liveRate ? Math.min(1, Math.max(0, (liveRate - 8) / ((on ? 160 : 96) - 8))) : 0);
   // current/target, e.g. "48kbps/64kbps" (0 when nothing is being sent)
-  els.bitrateVal.textContent = `${liveRate || 0}kbps/${target}kbps`;
+  els.bitrateVal.textContent = `${liveRate || 0}kbps/${lossless ? 'lossless' : target + 'kbps'}`;
+  $('musicHint').textContent = hifiFallback ? "Hi-Fi paused: the network couldn't keep up — using Music Mode, retrying shortly."
+    : els.hifi.checked ? "Lossless 24-bit, about 2.3 Mbit/s each way, up to 1 s of delay. Falls back to Music Mode if the network can't keep up."
+    : 'Stereo, higher quality, a little more delay — applies to both directions of the link.';
   els.bitrate.setAttribute('aria-valuetext', `${target} kbps ${on ? 'ceiling (Music Mode)' : 'target'}, sending ${liveRate || 0} kbps`);
 }
 
@@ -87,6 +94,40 @@ els.channels.addEventListener('click', (e) => {
 });
 els.bitrate.addEventListener('input', showMusic);
 els.music.addEventListener('change', () => { showMusic(); saveSetting(() => ({ music_mode: els.music.checked })); });
+els.hifi.addEventListener('change', () => { showMusic(); saveSetting(() => ({ hifi: els.hifi.checked })); });
+// volumes: the percentage follows the slider live, the engine is told when it is let go
+for (const [id, key] of [['sendVol', 'send_volume'], ['recvVol', 'recv_volume']]) {
+  const showVol = () => { $(id + 'V').textContent = $(id).value + '%'; $(id).setAttribute('aria-valuetext', $(id).value + ' percent'); };
+  $(id).addEventListener('input', showVol);
+  $(id).addEventListener('change', () => saveSetting(() => ({ [key]: Number($(id).value) })));
+  $(id).showVol = showVol;
+}
+$('mute').addEventListener('click', () => saveSetting(() => ({ mute: $('mute').getAttribute('aria-pressed') !== 'true' })));
+$('pttMode').addEventListener('change', () => saveSetting(() => ({ ptt: $('pttMode').value })));
+$('pttSet').addEventListener('click', async () => {
+  if (pttWaiting) return;
+  pttWaiting = true; showPtt(); announce('Press a key or button');
+  try {
+    const k = await invoke('ptt_capture');
+    pttWaiting = false;
+    saveSetting(() => ({ ptt_key: k, ptt: pttMode === 'off' ? 'hold' : pttMode }));
+  } catch (e) { pttWaiting = false; actionError = String(e); poll(); }
+});
+// Push-to-talk controls: the select needs a button first; the hint says what to do next
+let pttKey = null, pttError = null;
+function showPtt() {
+  $('pttSet').textContent = pttWaiting ? 'Press a key or button…' : pttKey ? 'Change button…' : 'Set button…';
+  $('pttMode').disabled = !pttKey;
+  $('pttMode').value = pttMode;
+  const sig = JSON.stringify([pttKey, pttMode, pttError]);
+  if (sig === pttSig) return;
+  pttSig = sig;
+  const h = $('pttHint');
+  h.classList.toggle('err', !!pttError);
+  if (pttError) { h.textContent = pttError; return; }
+  if (!pttKey) { h.textContent = "Set a button first. It works while games have focus, and you'll hear a chirp when you start and stop talking."; return; }
+  h.replaceChildren('Button: ', el('b', 'keycap', pttKey.label), '. ' + (pttMode === 'hold' ? 'Hold it to talk.' : pttMode === 'toggle' ? 'Press once to start, again to stop.' : 'Choose Hold or Toggle above.'));
+}
 els.bitrate.addEventListener('change', () => saveSetting(() => ({ bitrate: Number(els.bitrate.value) * 1000 })));
 // "Refresh devices…" re-reads this computer's devices and keeps both selections
 async function refreshDevices() {
@@ -353,8 +394,22 @@ function remotePanel() {
   rate.addEventListener('input', () => { s.bitrate = Number(rate.value) * 1000; sync(); });
   lab('Bitrate Target', rate);
   box.appendChild(val);
+  const vol = (text, key) => {
+    const r = el('input'), out = el('div', 'bitrate-val');
+    r.type = 'range'; r.min = 0; r.max = 150; r.value = s[key] ?? 100;
+    const sh = () => { out.textContent = r.value + '%'; r.setAttribute('aria-valuetext', r.value + ' percent'); };
+    r.addEventListener('input', () => { s[key] = Number(r.value); sh(); });
+    sh(); lab(text, r); box.appendChild(out);
+  };
+  vol('Send volume', 'send_volume');
+  const mute = el('label', 'check'), mcb = el('input');
+  mcb.type = 'checkbox'; mcb.checked = !!s.mute;
+  mcb.addEventListener('change', () => { s.mute = mcb.checked; });
+  mute.append(mcb, ' Mute');
+  box.appendChild(mute);
   box.appendChild(el('h2', 'sub', 'Receiving'));
   pick('Play to', 'CapraLink Input', 'apps on that computer record from it', 'output');
+  vol('Receive volume', 'recv_volume');
   const music = el('label', 'check');
   const cb = el('input');
   cb.type = 'checkbox'; cb.checked = !!s.music_mode;
@@ -464,7 +519,22 @@ async function poll() {
   els.remoteCfg.checked = st.settings.remote_config;
   els.autoRc.checked = st.settings.auto_reconnect;
   els.music.checked = !!st.settings.music_mode; // also follows the tray menu's toggle
+  els.hifi.checked = !!cfg.hifi;
   effectiveMusic = !!(st.stats && st.stats.music);
+  effectiveHifi = !!(st.stats && st.stats.hifi);
+  hifiFallback = !!(st.stats && st.stats.hifi_fallback);
+  for (const [id, v] of [['sendVol', cfg.send_volume], ['recvVol', cfg.recv_volume]]) {
+    if (document.activeElement !== $(id)) $(id).value = v ?? 100; // not while it is being dragged
+    $(id).showVol();
+  }
+  $('mute').setAttribute('aria-pressed', !!cfg.mute);
+  $('mute').textContent = cfg.mute ? 'Muted' : 'Mute';
+  pttMode = cfg.ptt || 'off'; pttKey = cfg.ptt_key || null; pttError = st.ptt_error || null;
+  showPtt();
+  // with push-to-talk on, the sending meter dims while you are not talking
+  const quiet = pttMode !== 'off' && !!pttKey && !st.talking;
+  $('inBar').classList.toggle('idle', quiet);
+  $('inBar').setAttribute('aria-label', quiet ? 'Sending level (not talking)' : 'Sending level');
   showMusic();
   devices = st.devices;
   render();
@@ -484,6 +554,9 @@ async function poll() {
     els.stats.textContent = '';
   }
   showQuality(st.quality, cur);
+  const dly = [['You hear them', s && s.delay_in_ms], ['They hear you', s && s.delay_out_ms]].filter((d) => d[1] != null).map((d) => d[0] + ': ' + d[1] + ' ms');
+  $('delay').textContent = dly.join(' · ');
+  $('delay').hidden = !peer || !dly.length;
   showPeerLog(cur);
   setError([actionError || st.error, st.virtual_error].filter(Boolean).join(' · '));
 }
