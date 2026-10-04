@@ -620,6 +620,18 @@ mod mac {
             while !stop.load(SeqCst) {
                 // session tap, at the head, listen-only
                 let port = CGEventTapCreate(1, 0, 1, mask, callback, tap.cast());
+                // without the permission macOS may still create the tap but never deliver key
+                // events to it: ask the permission itself, so the window can say what to do
+                if !port.is_null() && !CGPreflightListenEventAccess() {
+                    CFMachPortInvalidate(port);
+                    CFRelease(port);
+                    if !denied {
+                        denied = true;
+                        let _ = tx.send(Ev::Status(Some("Allow CapraLink in System Settings → Privacy & Security → Input Monitoring (if it's already on, remove it with −, then quit and reopen CapraLink)".into())));
+                    }
+                    std::thread::sleep(Duration::from_secs(2));
+                    continue;
+                }
                 if port.is_null() {
                     if !denied {
                         denied = true;
