@@ -135,6 +135,23 @@
   .pinrow .pin { width: calc(7ch + 0.84em); white-space: nowrap; }
   .remote { padding: 6px 0 0; border-top: 1px solid var(--border); }
   .remote .btns { display: flex; gap: 6px; justify-content: flex-end; padding-bottom: 8px; }
+  .vol { display: flex; align-items: center; gap: 8px; margin-bottom: 6px; }
+  .vol label { margin: 0; width: 92px; flex: none; }
+  .vol input { margin: 0; }
+  .vol span { font-size: 11px; color: var(--sub); width: 34px; text-align: right; flex: none; }
+  .mute { width: auto; margin: 0; border: 1px solid var(--border); background: var(--bg); color: var(--fg); border-radius: 6px; padding: 1px 8px; font-size: 11px; cursor: pointer; flex: none; }
+  .mute[aria-pressed=true] { background: var(--danger); color: #fff; border-color: var(--danger); }
+  .ptt { display: flex; gap: 6px; align-items: center; margin-bottom: 8px; }
+  .ptt select { margin: 0; flex: 1; }
+  .ptt .btn { flex: none; }
+  .keycap { font-size: 11px; color: var(--sub); }
+  .musicrow { display: flex; align-items: center; gap: 18px; }
+  .musicrow .check { margin: 2px 0 4px; }
+  .check.sub { padding-left: 10px; border-left: 1px solid var(--border); }
+  .check.sub:has(input:disabled) { color: var(--sub); }
+  .delay { display: block; color: var(--sub); font-size: 11px; margin-top: 2px; }
+  .hint.err { color: var(--danger-fg); }
+  .bar.idle { opacity: .35; }
 </style>
 </head>
 <body>
@@ -200,6 +217,14 @@
       <button data-v="1" class="active" aria-pressed="true">Mono</button>
       <button data-v="2" aria-pressed="false">Stereo</button>
     </div>
+    <div class="vol"><label for="sendVol">Send volume</label><input id="sendVol" type="range" min="0" max="150" value="100" aria-valuetext="100 percent" /><span id="sendVolV">100%</span>
+      <button class="mute" id="mute" aria-pressed="false" title="Send silence instead of your microphone">Mute</button></div>
+    <label for="pttMode">Push-to-talk</label>
+    <div class="ptt">
+      <select id="pttMode" disabled><option value="off">Off</option><option value="hold">Hold to talk</option><option value="toggle">Press to toggle</option></select>
+      <button class="btn ghost" id="pttSet">Set button…</button>
+    </div>
+    <div class="hint" id="pttHint"></div>
     <label for="bitrate">Bitrate Target</label>
     <input id="bitrate" class="rate" type="range" min="8" max="96" step="8" value="64" />
     <div class="bitrate-val" id="bitrateVal">64 kbps</div>
@@ -209,15 +234,20 @@
     <h2 class="withbar"><span class="for">Receiving<span class="peer" id="recvPeer"></span></span> <div class="bar" id="outBar" role="meter" aria-label="Receiving level" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0"><i id="outLevel"></i></div></h2>
     <label for="output">Play to</label>
     <select id="output"></select>
+    <div class="vol"><label for="recvVol">Receive volume</label><input id="recvVol" type="range" min="0" max="150" value="100" aria-valuetext="100 percent" /><span id="recvVolV">100%</span></div>
     <div class="hint" id="cableNote" hidden>Windows needs VB-Cable (free) for a CapraLink microphone: vb-audio.com/Cable</div>
   </section>
 
   <section>
-    <label class="check"><input id="music" type="checkbox" /> Music Mode</label>
-    <div class="hint">Stereo, higher quality, a little more delay — applies to both directions of the link.</div>
+    <div class="musicrow">
+      <label class="check"><input id="music" type="checkbox" /> Music Mode</label>
+      <label class="check sub" title="Lossless 24-bit audio (about 2.3 Mbit/s). Needs Music Mode."><input id="hifi" type="checkbox" /> Hi-Fi</label>
+    </div>
+    <div class="hint" id="musicHint">Stereo, higher quality, a little more delay — applies to both directions of the link.</div>
   </section>
 
   <div class="quality" id="quality" hidden></div>
+  <div class="delay" id="delay" style="text-align:center" hidden></div>
   <div id="stats" style="margin-top:4px;" hidden></div>
   <div id="error"></div>
   <div class="sr" id="live" role="status" aria-live="polite"></div>
