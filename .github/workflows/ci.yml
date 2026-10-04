@@ -68,7 +68,7 @@ jobs:
       - run: |
           mkdir -p out/CapraLink
           cp -r dist main.py plugin.json package.json LICENSE out/CapraLink/
-          rm out/CapraLink/dist/*.map
+          rm -f out/CapraLink/dist/*.map
           cd out && zip -r CapraLink.zip CapraLink
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:

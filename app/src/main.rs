@@ -252,7 +252,8 @@ fn sync_music(app: AppHandle, item: CheckMenuItem<tauri::Wry>) {
 /// `--status`, `--connect NAME_OR_ID`, `--disconnect`, `--music on|off`. Needs the engine already
 /// running (it never starts one: a script shouldn't leave a daemon behind). Returns what to print.
 fn cli(args: &[String], dir: Option<PathBuf>, port: u16) -> anyhow::Result<Option<String>> {
-    let c = Client::local(dir, port + 1).map_err(|e| anyhow::anyhow!("the CapraLink engine isn't running ({e}); open CapraLink first"))?;
+    let rpc = port.checked_add(1).ok_or_else(|| anyhow::anyhow!("port 65535 leaves no room for the engine port above it"))?;
+    let c = Client::local(dir, rpc).map_err(|e| anyhow::anyhow!("the CapraLink engine isn't running ({e}); open CapraLink first"))?;
     let st = c.state()?;
     match args.iter().map(String::as_str).collect::<Vec<_>>()[..] {
         ["--status"] => {
