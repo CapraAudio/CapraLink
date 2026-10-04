@@ -25,9 +25,9 @@ pub fn system_command(program: &str) -> std::process::Command {
 use anyhow::{anyhow, Context};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::{FromSample, Sample, SampleFormat, SizedSample};
-use dsp::{Complexity, Counters, Jitter, Mode, Packetizer, Plan, Playout, Resampler, Rx, FRAME, JITTER_WINDOW_US, MUSIC_JITTER_WINDOW_US, RATE, TARGET};
+use dsp::{is_nack, Complexity, Counters, Jitter, Mode, Nacks, Packetizer, Plan, Playout, Resampler, Resend, Rx, FRAME, HIFI_BITRATE, JITTER_WINDOW_US, MAX_PACKET, MUSIC_JITTER_WINDOW_US, RATE, TARGET};
 use ringbuf::traits::{Consumer, Observer, Producer, Split};
-use ringbuf::{HeapCons, HeapRb};
+use ringbuf::{HeapCons, HeapProd, HeapRb};
 use std::net::{SocketAddr, UdpSocket};
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, AtomicU8, Ordering::Relaxed};
 use std::sync::{Arc, Mutex};
@@ -188,6 +188,9 @@ pub struct Settings {
     /// Push-to-talk: send silence except while talking. Needs `ptt_key`.
     pub ptt: PttMode,
     pub ptt_key: Option<PttKey>,
+    /// Hi-Fi: Music Mode sent lossless (24-bit PCM, ~2.3 Mbps) when either side wants it and both
+    /// can. No effect while Music Mode is off. Live.
+    pub hifi: bool,
 }
 
 impl Default for Settings {
@@ -206,6 +209,7 @@ impl Default for Settings {
             mute: false,
             ptt: PttMode::Off,
             ptt_key: None,
+            hifi: false,
         }
     }
 }
@@ -269,6 +273,13 @@ pub struct Stats {
     pub delay_in_ms: Option<u32>,
     #[serde(default)]
     pub delay_out_ms: Option<u32>,
+    /// This computer sends Hi-Fi (lossless) right now; `bitrate` then reads 2304 kbps.
+    #[serde(default)]
+    pub hifi: bool,
+    /// Hi-Fi is on for this link but fell back to Music Mode (Opus) because the network couldn't
+    /// keep up; it is tried again after a clean minute.
+    #[serde(default)]
+    pub hifi_fallback: bool,
 }
 
 #[derive(Default)]
@@ -287,7 +298,12 @@ struct Shared {
     bitrate: AtomicI32, // currently applied, for Stats
     complexity: AtomicU8,
     music: AtomicBool, // effective Music Mode, set by the node
-    mode: Mutex<Option<TxMode>>, // the encoder/resampler for `music`, prepared for `Tx::apply_mode`
+    hifi: AtomicBool,  // send Hi-Fi (effective, not fallen back), set by the node
+    mode: Mutex<Option<TxMode>>, // the encoder/resampler for `music`/`hifi`, prepared for `Tx::apply_mode`
+    rx_pcm: AtomicBool, // the received stream is Hi-Fi
+    // Hi-Fi packets sent, for resending; the capture callback only try_locks it (a packet it
+    // can't store then can't be resent, which the receiver handles like a loss)
+    resend: Mutex<Resend>,
     callback_us: AtomicU32, // slowest capture callback, reset on read
     failure: Mutex<Option<Failure>>, // see `err_cb`
     send_gain: AtomicU32, // f32 bits, applied before encoding (0 = silence)
@@ -300,13 +316,15 @@ struct Shared {
 impl Shared {
     /// `tx`: (Channels setting, capture rate) when sending. The capture callback allocates
     /// nothing for a switch: its new encoder and resampler are built here and swapped in there.
-    fn set_music(&self, on: bool, tx: Option<(u16, u32)>) {
-        if self.music.swap(on, Relaxed) == on {
+    fn set_mode(&self, music: bool, hifi: bool, tx: Option<(u16, u32)>) {
+        let hifi = hifi && music;
+        if (self.music.swap(music, Relaxed) == music) & (self.hifi.swap(hifi, Relaxed) == hifi) {
             return;
         }
         if let Some((ch, rate)) = tx {
-            let ch = if on { 2 } else { ch };
-            let m = Mode::new(ch, on).ok().map(|pk| TxMode { pk, rs: (rate != RATE).then(|| Resampler::new(rate, RATE, ch as usize)) });
+            drop(self.resend.lock()); // a first lock may allocate (lazily boxed on some OSes): not in the callback
+            let ch = if music { 2 } else { ch };
+            let m = Mode::new(ch, music, hifi).ok().map(|pk| TxMode { pk, rs: (rate != RATE).then(|| Resampler::new(rate, RATE, ch as usize)) });
             // whatever was in the slot (e.g. the encoder the callback swapped out) is freed here
             let _old = self.mode.lock().map(|mut slot| std::mem::replace(&mut *slot, m));
         }
@@ -349,7 +367,8 @@ impl Link {
         let (in_dev, out_dev) = (find(true, &cfg.input)?.map(|(_, d)| d), find(false, &cfg.output)?.map(|(_, d)| d));
 
         let sock = UdpSocket::bind(("0.0.0.0", port)).with_context(|| format!("bind UDP port {port}"))?;
-        sock.set_read_timeout(Some(Duration::from_millis(200)))?;
+        // short, so Hi-Fi asks again for missing packets (and gives them up) while none arrive
+        sock.set_read_timeout(Some(Duration::from_millis(20)))?;
         // A full send queue drops a packet (`send_dropped`) instead of stalling the capture
         // callback. Not `set_nonblocking`: that flag is shared with the RX thread's clone.
         // ponytail: still waits up to one timer tick (1–4 ms on Linux, 1 ms on Windows; macOS
@@ -364,7 +383,7 @@ impl Link {
         // silent while push-to-talk is on, until the node says this side is talking
         shared.gains(gain(cfg.send_volume, cfg.mute || cfg.ptt != PttMode::Off), gain(cfg.recv_volume, false));
         let stop = Arc::new(AtomicBool::new(false));
-        let (mut prod, cons) = HeapRb::<f32>::new(RATE as usize * 3).split(); // 1.5 s of stereo: Music Mode buffers up to 1 s + headroom
+        let (prod, cons) = HeapRb::<f32>::new(RATE as usize * 3).split(); // 1.5 s of stereo: Music Mode buffers up to 1 s + headroom
 
         // ponytail: with Play to = none, packets are still decoded into a ring nobody drains
         // (it just stays full); skip decoding in the RX thread if that CPU ever matters.
@@ -388,26 +407,8 @@ impl Link {
         let tx = input.as_ref().map(|(_, rate)| (cfg.channels, *rate));
 
         let rx = {
-            let (shared, stop, mut rx) = (shared.clone(), stop.clone(), Rx::new(&keys.recv));
-            std::thread::Builder::new().name("capralink-rx".into()).spawn(move || {
-                let (mut buf, mut last, mut jitter) = ([0u8; 2048], None, Jitter::default());
-                while !stop.load(Relaxed) {
-                    // Errors are timeouts (checked above) or transient (e.g. ICMP resets on Windows).
-                    // ponytail: exact source match; a multi-homed peer replying from another
-                    // interface is ignored — relax to IP-only (packets are authenticated) if seen.
-                    let Ok((n, from)) = sock.recv_from(&mut buf) else { continue };
-                    if from != peer {
-                        continue;
-                    }
-                    if let Some(ch) = rx.handle(&mut buf[..n], &shared.c, &mut |pcm: &[f32]| {
-                        prod.push_slice(pcm);
-                    }) {
-                        let g = gap(&mut last, &shared.rx_gap_us);
-                        shared.jitter_us.store(jitter.push(g, rx.period_us(), if shared.music.load(Relaxed) { MUSIC_JITTER_WINDOW_US } else { JITTER_WINDOW_US }), Relaxed);
-                        shared.rx_channels.store(ch, Relaxed);
-                    }
-                }
-            })?
+            let (shared, stop, rx, nacks) = (shared.clone(), stop.clone(), Rx::new(&keys.recv), Nacks::new(&keys.send));
+            std::thread::Builder::new().name("capralink-rx".into()).spawn(move || receive(sock, peer, rx, nacks, prod, &shared, &stop))?
         };
         Ok(Link { shared, stop, rx: Some(rx), tx, _input: input.map(|(s, _)| s), _output: output })
     }
@@ -449,12 +450,15 @@ impl Link {
             callback_max_us: max(&self.shared.callback_us),
             delay_in_ms: None, // filled in by the node, which knows the network part
             delay_out_ms: None,
+            hifi: self.shared.hifi.load(Relaxed),
+            hifi_fallback: false, // filled in by the node
         }
     }
 
-    /// Switches this link's sender and receiver into or out of Music Mode, live.
-    pub fn set_music(&self, on: bool) {
-        self.shared.set_music(on, self.tx);
+    /// Switches this link's sender and receiver into or out of Music Mode, and its sender into or
+    /// out of Hi-Fi (only in Music Mode), live.
+    pub fn set_mode(&self, music: bool, hifi: bool) {
+        self.shared.set_mode(music, hifi, self.tx);
     }
 
     /// Sets the Send/Receive volumes (percent), live; `silent` sends silence (mute, or
@@ -473,7 +477,13 @@ impl Link {
     /// playback; None for a direction that is off.
     pub fn latency(&self) -> (Option<f32>, Option<f32>) {
         let ms = |a: &AtomicU32| a.load(Relaxed) as f32 / 1000.0;
-        let frame = if self.shared.music.load(Relaxed) { 20.0 } else { 10.0 };
+        let frame = if self.shared.hifi.load(Relaxed) {
+            5.0
+        } else if self.shared.music.load(Relaxed) {
+            20.0
+        } else {
+            10.0
+        };
         let recv = f32::from_bits(self.shared.buffer_ms.load(Relaxed)) + ms(&self.shared.out_latency_us);
         (self.tx.map(|_| ms(&self.shared.in_latency_us) + frame), self._output.is_some().then_some(recv))
     }
@@ -494,6 +504,51 @@ impl Link {
     pub fn report_counters(&self) -> (u64, u64, u64, f32) {
         let c = &self.shared.c;
         (c.received.load(Relaxed), c.lost.load(Relaxed), c.underruns.load(Relaxed), self.shared.jitter_us.load(Relaxed) as f32 / 1000.0)
+    }
+}
+
+/// The RX thread: the peer's audio into the playback ring; in Hi-Fi also NACKs out for what's
+/// missing, and resends back for the peer's NACKs (from `Shared::resend`).
+fn receive(sock: UdpSocket, peer: SocketAddr, mut rx: Rx, mut nacks: Nacks, mut prod: HeapProd<f32>, shared: &Shared, stop: &AtomicBool) {
+    let (mut buf, mut last, mut jitter) = ([0u8; 2048], None, Jitter::default());
+    let mut resend = [0u8; MAX_PACKET];
+    while !stop.load(Relaxed) {
+        // Errors are timeouts (checked above) or transient (e.g. ICMP resets on Windows).
+        // ponytail: exact source match; a multi-homed peer replying from another
+        // interface is ignored — relax to IP-only (packets are authenticated) if seen.
+        match sock.recv_from(&mut buf) {
+            Ok((n, from)) if from == peer && is_nack(&buf[..n]) => {
+                for seq in nacks.open(&mut buf[..n]).into_iter().flatten() {
+                    // copied out, so the capture callback's try_lock isn't held up by the send
+                    let len = shared.resend.lock().ok().and_then(|r| {
+                        let p = r.get(seq)?;
+                        resend[..p.len()].copy_from_slice(p);
+                        Some(p.len())
+                    });
+                    if let Some(len) = len {
+                        let _ = sock.send_to(&resend[..len], peer);
+                    }
+                }
+            }
+            Ok((n, from)) if from == peer => {
+                if let Some(ch) = rx.handle(&mut buf[..n], &shared.c, &mut |pcm: &[f32]| {
+                    prod.push_slice(pcm);
+                }) {
+                    let g = gap(&mut last, &shared.rx_gap_us);
+                    shared.jitter_us.store(jitter.push(g, rx.period_us(), if shared.music.load(Relaxed) { MUSIC_JITTER_WINDOW_US } else { JITTER_WINDOW_US }), Relaxed);
+                    shared.rx_channels.store(ch, Relaxed);
+                }
+            }
+            _ => {}
+        }
+        // Hi-Fi: a missing packet whose playout time has come is given up; the others are asked for
+        rx.release(prod.occupied_len() / 2, &shared.c, &mut |pcm: &[f32]| {
+            prod.push_slice(pcm);
+        });
+        if let Some(nack) = rx.nack(Instant::now()) {
+            let _ = sock.send_to(nack, peer);
+        }
+        shared.rx_pcm.store(rx.pcm(), Relaxed);
     }
 }
 
@@ -742,7 +797,13 @@ impl Tx {
             self.frame.extend_from_slice(&chunk[..take]);
             if self.frame.len() == frame_len {
                 let t0 = Instant::now();
+                let pcm = self.pk.pcm();
                 if let Ok(p) = self.pk.packet(&self.frame) {
+                    if pcm {
+                        if let Ok(mut r) = self.shared.resend.try_lock() {
+                            r.keep(p);
+                        }
+                    }
                     if self.sock.send_to(p, self.peer).is_ok() {
                         self.shared.c.sent.fetch_add(1, Relaxed);
                         gap(&mut self.last_send, &self.shared.tx_gap_us);
@@ -751,7 +812,8 @@ impl Tx {
                     }
                 }
                 // The controller thinks in 10 ms frames: a 20 ms frame counts as two, each with
-                // half the encode time (same CPU share, same ~5 s hold).
+                // half the encode time (same CPU share, same ~5 s hold). Hi-Fi (5 ms): no
+                // encoding, nothing to steer.
                 let tens = self.pk.frame() / FRAME;
                 let us = t0.elapsed().as_micros() as f32 / tens as f32;
                 for _ in 0..tens {
@@ -768,16 +830,17 @@ impl Tx {
         self.shared.callback_us.fetch_max(start.elapsed().as_micros() as u32, Relaxed);
     }
 
-    /// Follows the node's Music Mode flag: forced stereo, 20 ms frames, complexity up to 10.
-    /// Swaps in the encoder and resampler `Shared::set_music` prepared (seq continues; the old
+    /// Follows the node's Music Mode flag: forced stereo, 20 ms frames, complexity up to 10;
+    /// and its Hi-Fi flag: 5 ms PCM frames.
+    /// Swaps in the encoder and resampler `Shared::set_mode` prepared (seq continues; the old
     /// ones go back into the slot, freed there); a partial frame is dropped.
     fn apply_mode(&mut self) {
-        let music = self.shared.music.load(Relaxed);
-        if music == self.music {
+        let (music, hifi) = (self.shared.music.load(Relaxed), self.shared.hifi.load(Relaxed));
+        if (music, hifi) == (self.music, self.pk.pcm()) {
             return;
         }
         let Ok(mut slot) = self.shared.mode.try_lock() else { return }; // retried next callback
-        let Some(m) = slot.as_mut().filter(|m| m.pk.music == music) else { return };
+        let Some(m) = slot.as_mut().filter(|m| (m.pk.music, m.pk.pcm) == (music, hifi)) else { return };
         if self.pk.set_mode(&mut m.pk).is_err() {
             return;
         }
@@ -788,15 +851,22 @@ impl Tx {
         if self.pk.set_complexity(level).is_ok() {
             self.shared.complexity.store(level, Relaxed);
         }
+        self.shared.bitrate.store(self.shown(self.last_bitrate), Relaxed);
         self.frame.clear(); // has room for a 20 ms stereo frame
     }
 
+    /// The bitrate Stats show: Hi-Fi's, or the encoder's.
+    fn shown(&self, bitrate: i32) -> i32 {
+        if self.pk.pcm() { HIFI_BITRATE } else { bitrate }
+    }
+
     /// Applies the session thread's latest bitrate/loss% target, only when it actually changed.
+    /// In Hi-Fi it goes to the idle encoder, ready for a fallback.
     fn apply_rate(&mut self) {
         let bitrate = self.shared.target_bitrate.load(Relaxed);
         if bitrate != self.last_bitrate && self.pk.set_bitrate(bitrate).is_ok() {
             self.last_bitrate = bitrate;
-            self.shared.bitrate.store(bitrate, Relaxed);
+            self.shared.bitrate.store(self.shown(bitrate), Relaxed);
         }
         let loss_perc = self.shared.target_loss_perc.load(Relaxed);
         if loss_perc != self.last_loss_perc && self.pk.set_packet_loss_perc(loss_perc).is_ok() {
@@ -884,6 +954,7 @@ impl Playback {
             self.scratch.clear();
             let base_need = (missing as f64 * self.base_step).ceil() as usize + 1;
             self.plan.set_music(self.shared.music.load(Relaxed));
+            self.plan.set_hifi(self.shared.rx_pcm.load(Relaxed));
             self.plan.set_jitter(self.shared.jitter_us.load(Relaxed) as usize * RATE as usize / 1_000_000);
             match self.plan.plan(avail, base_need) {
                 Plan::Play { discard, ratio } => {
@@ -1105,7 +1176,7 @@ fn capture_callback_doesnt_allocate() {
     let mut tx = Tx::new(&Settings::default(), pk, UdpSocket::bind("127.0.0.1:0").unwrap(), peer.local_addr().unwrap(), shared.clone(), 2, rate);
     let chunk = [0.1f32; 2 * 960]; // 10 ms of device stereo
     tx.process(&chunk, 0);
-    shared.set_music(true, Some((1, rate))); // what `Link::set_music` does
+    shared.set_mode(true, false, Some((1, rate))); // what `Link::set_mode` does
     shared.gains(1.5, 1.0); // 150%: through the soft clip
     let before = alloc_count::allocations();
     for _ in 0..10 {
@@ -1115,6 +1186,79 @@ fn capture_callback_doesnt_allocate() {
     assert!(tx.music && tx.pk.channels() == 2 && tx.pk.frame() == 2 * FRAME, "switched to Music Mode");
     assert_eq!(shared.c.sent.load(Relaxed), 1 + 5, "one 10 ms mono packet, then five 20 ms stereo ones");
     assert!(shared.callback_us.load(Relaxed) > 0);
+    // Hi-Fi: PCM packets, kept for resending, still without allocating
+    shared.set_mode(true, true, Some((1, rate)));
+    let (before, sent) = (alloc_count::allocations(), shared.c.sent.load(Relaxed));
+    for _ in 0..10 {
+        tx.process(&chunk, 0);
+    }
+    assert_eq!(alloc_count::allocations() - before, 0, "the capture callback allocated in Hi-Fi");
+    assert!(tx.pk.pcm() && tx.pk.frame() == dsp::PCM_FRAME, "switched to Hi-Fi");
+    let sent = shared.c.sent.load(Relaxed) - sent;
+    assert!((19..=20).contains(&sent), "5 ms packets: {sent}");
+    assert_eq!(shared.bitrate.load(Relaxed), HIFI_BITRATE);
+    let last = u32::from_be_bytes(tx.pk.packet(&[0.0; 2 * dsp::PCM_FRAME]).unwrap()[3..7].try_into().unwrap()) - 1;
+    assert!(shared.resend.lock().unwrap().get(last).is_some(), "kept for resending");
+}
+
+/// a's sender → a relay that loses some packets → b's receiver; b's NACKs go back through the
+/// relay to a's receive thread, which resends: b ends up with every packet, in order.
+#[cfg(test)]
+#[test]
+fn hifi_loopback_resends_fill_losses() {
+    let bind = || {
+        let s = UdpSocket::bind("127.0.0.1:0").unwrap();
+        s.set_read_timeout(Some(Duration::from_millis(20))).unwrap();
+        let a = s.local_addr().unwrap();
+        (s, a)
+    };
+    let ((sa, a_addr), (sb, b_addr), (relay, relay_addr)) = (bind(), bind(), bind());
+    let (key, other) = ([7u8; 32], [9u8; 32]); // a → b, b → a
+    let (a_sh, b_sh, stop) = (Shared::default(), Shared::default(), AtomicBool::new(false));
+    a_sh.gains(1.0, 1.0);
+    let a_shared = Arc::new(a_sh);
+    a_shared.set_mode(true, true, Some((1, RATE)));
+    let pk = Packetizer::new(1, 64_000, &key).unwrap();
+    let mut tx = Tx::new(&Settings::default(), pk, sa.try_clone().unwrap(), relay_addr, a_shared.clone(), 2, RATE);
+    let (a_prod, _a_cons) = HeapRb::<f32>::new(RATE as usize).split();
+    let (mut b_prod, mut b_cons) = HeapRb::<f32>::new(RATE as usize * 3).split();
+    let cushion = RATE as usize / 10 * 2; // 100 ms already buffered: no deadline hits
+    b_prod.push_slice(&vec![0.0; cushion]);
+    let lose = |seq: u32| seq % 10 == 3 || (100..110).contains(&seq); // 29 of 200, each once
+    let tone: Vec<f32> = (0..2 * RATE as usize).map(|i| (i as f32 * 0.013).sin() * 0.7).collect(); // 1 s, stereo
+    std::thread::scope(|s| {
+        let (a, b, st) = (&*a_shared, &b_sh, &stop);
+        s.spawn(move || receive(sa, relay_addr, Rx::new(&other), Nacks::new(&key), a_prod, a, st));
+        s.spawn(move || receive(sb, relay_addr, Rx::new(&key), Nacks::new(&other), b_prod, b, st));
+        s.spawn(move || {
+            let (mut buf, mut seen) = ([0u8; 2048], std::collections::HashSet::new());
+            while !st.load(Relaxed) {
+                let Ok((n, from)) = relay.recv_from(&mut buf) else { continue };
+                let seq = u32::from_be_bytes(buf[3..7].try_into().unwrap());
+                if from == a_addr && seen.insert(seq) && lose(seq) {
+                    continue; // lost, the first time
+                }
+                let _ = relay.send_to(&buf[..n], if from == a_addr { b_addr } else { a_addr });
+            }
+        });
+        for chunk in tone.chunks(2 * 480) {
+            tx.process(chunk, 0);
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        let t = Instant::now();
+        while b.c.received.load(Relaxed) < 200 && t.elapsed() < Duration::from_secs(3) {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        stop.store(true, Relaxed);
+    });
+    let c = &b_sh.c;
+    assert_eq!(a_shared.c.sent.load(Relaxed), 200);
+    assert_eq!((c.received.load(Relaxed), c.fec_recovered.load(Relaxed), c.lost.load(Relaxed)), (200, 29, 0));
+    assert!(b_sh.rx_pcm.load(Relaxed));
+    let mut got = vec![0.0; b_cons.occupied_len()];
+    b_cons.pop_slice(&mut got);
+    let want: Vec<f32> = tone.iter().map(|x| (x * 8_388_608.0).round() / 8_388_608.0).collect();
+    assert!(got[cushion..] == want[..], "every packet, in order, lossless to 24 bits");
 }
 
 #[cfg(test)]

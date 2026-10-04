@@ -35,6 +35,22 @@ playback device
 - **Delay readout:** each direction's one-way delay is estimated as capture buffer + one frame +
   half the control channel's round trip + playout buffer + playback buffer. The 1 s reports carry
   a timestamp echo for the round trip and each side's own part of the delay.
+- **Hi-Fi (lossless Music Mode):** a per-computer setting. It's on when Music Mode is on, either side
+  wants Hi-Fi and both can do it (computers say so when the session starts; older versions can't).
+  It switches live, like Music Mode.
+  - **Packets:** 48 kHz stereo, 24-bit PCM, 5 ms each (1440 bytes, about 2.3 Mbps). Same header,
+    encryption and packet counter as Opus. The first encrypted byte is `0x82` instead of the channel
+    count, so older versions drop these packets.
+  - **Losses are resent, not concealed.** The sender keeps its last ~1.3 s of packets exactly as
+    sent. The receiver holds out-of-order packets in a 1 s window and asks for missing ones with a
+    NACK (encrypted UDP datagram listing seq ranges). It asks again every 30 ms until the packet's
+    playout time. A resend reuses the original bytes, so no nonce is ever reused.
+  - **Playout:** the playout buffer keeps at least 300 ms (up to 1 s) for resends to arrive. A packet
+    still missing when the buffer runs low (under 30 ms) plays as 5 ms of silence with 1 ms fades
+    and counts as lost.
+  - **Fallback:** if the receiver reports more than 2% unrecovered loss, or 2+ underruns, over 10 s,
+    the sender falls back to Opus Music Mode (the window shows it). After a clean minute it tries
+    Hi-Fi again.
 
 ## Push-to-talk key listener
 
@@ -74,6 +90,9 @@ Keys are compared with the chosen one in memory and never logged or sent anywher
   - Packet headers are authenticated.
   - Replayed or forged packets are dropped.
   - A session ends before its packet counter could ever repeat a nonce.
+  - Hi-Fi NACKs travel under the key of the direction they ask about, in their own nonce space
+    (first nonce byte 1, audio's is 0) with their own counter. Each counter is accepted once, so
+    a replayed NACK can't trigger resends.
 - **Remote configuration:** off by default. When on, paired computers can change audio settings and
   the device name, but never the background-service or remote-configuration switches.
 - **Limits:** incoming connections must finish their handshake within a few seconds, and only a few
