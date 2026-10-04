@@ -4,7 +4,7 @@ resolver = "2"
 
 # the one version number: the app, the engine, diagnostics and installers all read it
 [workspace.package]
-version = "0.3.0"
+version = "0.3.1"
 
 [profile.release]
 opt-level = 3
