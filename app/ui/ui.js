@@ -26,6 +26,18 @@ let currentPin = '';
 let pinShown = false;
 let audioSig = '';      // the engine's audio settings as last loaded into the fields
 let forgetting = null;  // device whose "Forget <name>?" confirmation is open
+let lastPeer;           // connected device id at the last poll (undefined before the first: no announcement)
+let lastErr = '';
+
+// Polite screen-reader announcement (the #live region). Callers announce only on a change.
+const announce = (msg) => { $('live').textContent = msg; };
+function setError(msg) {
+  els.error.textContent = msg;
+  if (msg !== lastErr && msg) announce(msg);
+  lastErr = msg;
+}
+// Moves focus back to the control that opened a popover/panel for device `id` (its ⋯ or Pair button)
+const focusOpener = (id) => { const b = [...els.devices.querySelectorAll('[data-opener]')].find((n) => n.dataset.opener === id); if (b) b.focus(); };
 
 function setChannels(v) {
   channels = v;
@@ -39,6 +51,7 @@ function showMusic() {
   for (const b of els.channels.children) {
     b.disabled = on;
     b.classList.toggle('active', Number(b.dataset.v) === (on ? 2 : channels));
+    b.setAttribute('aria-pressed', b.classList.contains('active'));
   }
   els.bitrate.disabled = on;
   // the track fills to the bitrate actually being sent; the target is the knob, or in Music Mode
@@ -48,6 +61,7 @@ function showMusic() {
   els.bitrate.style.setProperty('--live', liveRate ? Math.min(1, Math.max(0, (liveRate - 8) / ((on ? 160 : 96) - 8))) : 0);
   // current/target, e.g. "48kbps/64kbps" (0 when nothing is being sent)
   els.bitrateVal.textContent = `${liveRate || 0}kbps/${target}kbps`;
+  els.bitrate.setAttribute('aria-valuetext', `${target} kbps ${on ? 'ceiling (Music Mode)' : 'target'}, sending ${liveRate || 0} kbps`);
 }
 
 // ---- actions ----
@@ -106,13 +120,14 @@ function renderName(name) {
     return;
   }
   const input = el('input');
+  input.setAttribute('aria-label', 'Device name');
   input.value = renaming;
-  const cancel = () => { renaming = null; lastNameSig = ''; renderName(name); };
+  const cancel = () => { renaming = null; lastNameSig = ''; renderName(name); box.querySelector('button').focus(); };
   const save = async () => { const n = renaming; if (await act('set_name', { name: n })) cancel(); };
   input.addEventListener('input', () => { renaming = input.value; });
   input.addEventListener('keydown', (e) => {
     if (e.key === 'Enter') save();
-    if (e.key === 'Escape') cancel();
+    if (e.key === 'Escape') { e.stopPropagation(); cancel(); }
   });
   box.appendChild(input);
   box.appendChild(button('Save', 'btn', save));
@@ -126,7 +141,7 @@ els.ipPin.addEventListener('input', () => { els.ipPin.value = els.ipPin.value.re
 async function pairIp() {
   const addr = els.ipAddr.value, pin = els.ipPin.value;
   busy = true; actionError = ''; els.ipPairBtn.disabled = true; render();
-  try { await invoke('pair_ip', { addr, pin }); els.ipAddr.value = ''; els.ipPin.value = ''; }
+  try { await invoke('pair_ip', { addr, pin }); els.ipAddr.value = ''; els.ipPin.value = ''; announce('Paired'); }
   catch (e) { actionError = String(e); }
   busy = false; els.ipPairBtn.disabled = false;
   await poll();
@@ -156,6 +171,11 @@ function render() {
   if (sig === lastDevices) return;
   lastDevices = sig;
   const list = els.devices;
+  // a rebuild (from the poll or any action) keeps keyboard focus on the same control, if it still exists
+  const ctl = () => [...list.querySelectorAll('button,input,select')];
+  const key = (n) => n.tagName + '|' + (n.textContent || n.placeholder || n.getAttribute('aria-label'));
+  const at = list.contains(document.activeElement) ? ctl().indexOf(document.activeElement) : -1;
+  const was = at >= 0 && key(document.activeElement);
   list.innerHTML = '';
   if (!devices.length) {
     list.appendChild(el('div', 'empty', 'Looking for other CapraLink computers on this network…'));
@@ -166,13 +186,31 @@ function render() {
     const top = el('div', 'top');
     top.appendChild(el('div', 'name', d.name));
     if (d.paired) {
-      top.appendChild(button('⋯', 'more', (e) => { e.stopPropagation(); menuFor = menuFor === d.id ? null : d.id; lastDevices = ''; render(); }));
+      const more = button('⋯', 'more', (e) => {
+        e.stopPropagation();
+        const open = menuFor !== d.id;
+        menuFor = open ? d.id : null; lastDevices = ''; render();
+        if (open) els.devices.querySelector('.menu button').focus(); else focusOpener(d.id);
+      });
+      more.dataset.opener = d.id;
+      more.setAttribute('aria-label', 'More actions for ' + d.name);
+      more.setAttribute('aria-haspopup', 'menu');
+      more.setAttribute('aria-expanded', menuFor === d.id);
+      top.appendChild(more);
       if (menuFor === d.id) {
         const m = el('div', 'menu');
-        const item = (t, f, cls) => { const b = button(t, cls || '', () => { menuFor = null; lastDevices = ''; f(); }); m.appendChild(b); };
+        m.setAttribute('role', 'menu');
+        m.addEventListener('keydown', (e) => { // arrow keys move between the items
+          const items = [...m.children], i = items.indexOf(document.activeElement);
+          if (e.key === 'ArrowDown') items[(i + 1) % items.length].focus();
+          else if (e.key === 'ArrowUp') items[(i + items.length - 1) % items.length].focus();
+          else return;
+          e.preventDefault();
+        });
+        const item = (t, f, cls) => { const b = button(t, cls || '', () => { menuFor = null; lastDevices = ''; f(); }); b.setAttribute('role', 'menuitem'); m.appendChild(b); };
         if (d.reachable) item('Configure', () => openRemote(d.id));
         item('Edit address', () => { editAddr = { id: d.id, draft: d.addr || '' }; render(); });
-        item('Forget', () => { forgetting = d.id; render(); }, 'danger');
+        item('Forget', () => { forgetting = d.id; render(); els.devices.querySelector('.forget .link').focus(); }, 'danger');
         top.appendChild(m);
       }
     }
@@ -186,19 +224,21 @@ function render() {
     const bottom = el('div', 'bottom');
     bottom.appendChild(el('div', 'st', status));
     if (!d.paired) {
-      bottom.appendChild(button('Pair', 'btn', () => { pairingId = pairingId === d.id ? null : d.id; pinDraft = ''; render(); }));
+      const b = button('Pair', 'btn', () => { pairingId = pairingId === d.id ? null : d.id; pinDraft = ''; render(); });
+      b.dataset.opener = d.id; b.setAttribute('aria-label', 'Pair with ' + d.name);
+      bottom.appendChild(b);
     } else if (d.connected) {
-      bottom.appendChild(button('Disconnect', 'btn stop', () => act('disconnect')));
+      bottom.appendChild(button('Disconnect', 'btn stop', () => act('disconnect'))).setAttribute('aria-label', 'Disconnect from ' + d.name);
     } else if (d.reachable) {
-      bottom.appendChild(button('Connect', 'btn', () => act('connect', { id: d.id })));
+      bottom.appendChild(button('Connect', 'btn', () => act('connect', { id: d.id }))).setAttribute('aria-label', 'Connect to ' + d.name);
     }
     row.appendChild(bottom);
     list.appendChild(row);
     if (pairingId === d.id && !d.paired) {
       const box = el('div', 'pairbox');
       const pin = el('input');
-      pin.maxLength = 6; pin.inputMode = 'numeric'; pin.placeholder = '6-digit PIN'; pin.value = pinDraft;
-      const confirm = () => { const p = pin.value; pairingId = null; act('pair', { id: d.id, pin: p }); };
+      pin.setAttribute('aria-label', 'PIN shown on ' + d.name); pin.maxLength = 6; pin.inputMode = 'numeric'; pin.placeholder = '6-digit PIN'; pin.value = pinDraft;
+      const confirm = async () => { const p = pin.value; pairingId = null; if (await act('pair', { id: d.id, pin: p })) announce('Paired with ' + d.name); };
       pin.addEventListener('input', () => { pin.value = pin.value.replace(/\D/g, ''); pinDraft = pin.value; });
       pin.addEventListener('keydown', (e) => { if (e.key === 'Enter') confirm(); });
       box.appendChild(pin);
@@ -209,14 +249,12 @@ function render() {
     if (editAddr && editAddr.id === d.id && d.paired) {
       const box = el('div', 'pairbox');
       const input = el('input', 'ip');
+      input.setAttribute('aria-label', 'IP address of ' + d.name);
       input.placeholder = '192.168.1.20'; input.value = editAddr.draft;
-      const cancel = () => { editAddr = null; render(); };
+      const cancel = () => { editAddr = null; render(); focusOpener(d.id); };
       const save = async () => { if (await act('set_peer_addr', { id: d.id, addr: input.value })) cancel(); };
       input.addEventListener('input', () => { editAddr.draft = input.value; });
-      input.addEventListener('keydown', (e) => {
-        if (e.key === 'Enter') save();
-        if (e.key === 'Escape') cancel();
-      });
+      input.addEventListener('keydown', (e) => { if (e.key === 'Enter') save(); }); // Escape: see below
       box.appendChild(input);
       box.appendChild(button('Save', 'btn', save));
       box.appendChild(button('Cancel', 'link', cancel));
@@ -224,7 +262,8 @@ function render() {
       setTimeout(() => input.focus());
     }
     if (forgetting === d.id && d.paired) {
-      const box = el('div', 'pairbox');
+      const box = el('div', 'pairbox forget');
+      box.setAttribute('role', 'group'); box.setAttribute('aria-label', 'Forget ' + d.name + '?');
       box.appendChild(el('span', null, 'Forget ' + d.name + '?'));
       box.appendChild(button('Forget', 'btn stop', () => { forgetting = null; act('forget', { id: d.id }); }));
       box.appendChild(button('Cancel', 'link', () => { forgetting = null; render(); }));
@@ -232,7 +271,26 @@ function render() {
     }
     if (remote && remote.id === d.id && d.paired) list.appendChild(remotePanel());
   }
+  if (at >= 0) { const n = ctl()[at]; if (n && key(n) === was) n.focus(); }
 }
+
+// Escape closes the topmost open popover/panel and returns focus to the control that opened it.
+// To make another popover close this way, add a line: [is it open, close it].
+document.addEventListener('keydown', (e) => {
+  if (e.key !== 'Escape') return;
+  const closeFor = (get, set) => () => { const id = get(); set(null); lastDevices = ''; render(); focusOpener(id); };
+  const layers = [
+    [!$('opts').hidden, () => setOpts(false, true)],
+    [menuFor, closeFor(() => menuFor, (v) => { menuFor = v; })],
+    [forgetting, closeFor(() => forgetting, (v) => { forgetting = v; })],
+    [editAddr, closeFor(() => editAddr.id, (v) => { editAddr = v; })],
+    [pairingId, closeFor(() => pairingId, (v) => { pairingId = v; })],
+    [remote, closeFor(() => remote.id, (v) => { remote = v; })],
+    [!$('trouble').hidden, () => { $('trouble').hidden = true; $('optsBtn').focus(); }],
+  ];
+  const open = layers.find((l) => l[0]);
+  if (open) { open[1](); e.preventDefault(); }
+});
 
 // ---- remote configuration (edits live in remote.draft, so a rebuild keeps them) ----
 async function openRemote(id) {
@@ -242,19 +300,22 @@ async function openRemote(id) {
   catch (e) { actionError = String(e); }
   busy = false; lastDevices = '';
   await poll();
+  const first = els.devices.querySelector('.remote input'); // keyboard users land in the panel
+  if (first) first.focus();
 }
 
 function remotePanel() {
   const r = remote, s = r.draft;
   const box = el('div', 'remote');
+  box.setAttribute('role', 'group'); box.setAttribute('aria-label', 'Settings on ' + r.name);
   box.appendChild(el('h2', null, 'Settings on ' + r.name));
-  box.appendChild(el('label', null, 'Name'));
+  let n = 0; // a label tied to its control
+  const lab = (text, ctl) => { ctl.id = 'remote-' + n++; const l = el('label', null, text); l.htmlFor = ctl.id; box.append(l, ctl); };
   const nameInput = el('input');
   nameInput.value = r.nameDraft;
   nameInput.addEventListener('input', () => { r.nameDraft = nameInput.value; });
-  box.appendChild(nameInput);
+  lab('Name', nameInput);
   const pick = (label, special, hint, key) => {
-    box.appendChild(el('label', null, label));
     const sel = el('select');
     const devs = r[key + '_devices']; // absent from an older computer: its lists are names
     fill(sel, devs && devs.length ? devs : r[key + 's'], special, hint);
@@ -265,19 +326,21 @@ function remotePanel() {
       catch (e) { actionError = String(e); }
       lastDevices = ''; render(); // rebuilds the panel from the draft, so choices stay
     });
-    box.appendChild(sel);
+    lab(label, sel);
   };
   box.appendChild(el('h2', 'sub', 'Sending'));
   pick('Send from', 'CapraLink Output', 'apps on that computer play into it', 'input');
   box.appendChild(el('label', null, 'Channels'));
   const seg = el('div', 'seg');
+  seg.setAttribute('role', 'group'); seg.setAttribute('aria-label', 'Channels');
   const rate = el('input');
   const val = el('div', 'bitrate-val');
   const sync = () => {
     const on = !!s.music_mode;
-    for (const c of seg.children) { c.disabled = on; c.classList.toggle('active', Number(c.dataset.v) === (on ? 2 : s.channels)); }
+    for (const c of seg.children) { c.disabled = on; c.classList.toggle('active', Number(c.dataset.v) === (on ? 2 : s.channels)); c.setAttribute('aria-pressed', c.classList.contains('active')); }
     rate.disabled = on;
     val.textContent = on ? MUSIC_RATE : rate.value + ' kbps';
+    rate.setAttribute('aria-valuetext', on ? MUSIC_RATE : rate.value + ' kbps target');
   };
   for (const [v, t] of [[1, 'Mono'], [2, 'Stereo']]) {
     const b = el('button', null, t);
@@ -286,10 +349,9 @@ function remotePanel() {
     seg.appendChild(b);
   }
   box.appendChild(seg);
-  box.appendChild(el('label', null, 'Bitrate Target'));
   rate.type = 'range'; rate.min = 8; rate.max = 96; rate.step = 8; rate.value = Math.round(s.bitrate / 1000);
   rate.addEventListener('input', () => { s.bitrate = Number(rate.value) * 1000; sync(); });
-  box.appendChild(rate);
+  lab('Bitrate Target', rate);
   box.appendChild(val);
   box.appendChild(el('h2', 'sub', 'Receiving'));
   pick('Play to', 'CapraLink Input', 'apps on that computer record from it', 'output');
@@ -334,6 +396,7 @@ function showPin(on) {
   pinShown = on;
   $('pin').textContent = on && currentPin ? currentPin : '••• •••';
   $('pinToggle').textContent = on ? 'Hide' : 'Show';
+  $('pinToggle').setAttribute('aria-label', on ? 'Hide PIN' : 'Show PIN');
   $('pinToggle').disabled = pairLocked > 0;
   $('pinHint').textContent = pairLocked > 0
     ? 'Pairing locked for ' + (pairLocked >= 60 ? Math.ceil(pairLocked / 60) + ' min' : pairLocked + ' s') + ' after a wrong PIN'
@@ -351,7 +414,13 @@ $('pinToggle').addEventListener('click', async () => {
 
 // ---- VU meters: ~15 updates/s from the engine's VU levels; CSS animates between them ----
 const pct = (p) => (Math.max(-60, 20 * Math.log10(p || 1e-9)) + 60) / 60 * 100;
+let meterAt = 0; // screen readers get the level about once a second, not at the animation rate
 function setBars(inP, outP) {
+  if (Date.now() - meterAt >= 1000) {
+    meterAt = Date.now();
+    $('inBar').setAttribute('aria-valuenow', Math.round(pct(inP)));
+    $('outBar').setAttribute('aria-valuenow', Math.round(pct(outP)));
+  }
   $('inLevel').style.width = (100 - pct(inP)) + '%';   // the cover shrinks as the level rises
   $('outLevel').style.width = (100 - pct(outP)) + '%';
 }
@@ -369,7 +438,7 @@ setInterval(async () => {
 
 async function poll() {
   let st;
-  try { st = await invoke('state'); } catch (e) { els.error.textContent = String(e); return; }
+  try { st = await invoke('state'); } catch (e) { setError(String(e)); return; }
   renderName(st.name);
   currentPin = st.pin.slice(0, 3) + ' ' + st.pin.slice(3);
   pairSecs = st.pairing_secs; pairLocked = st.pairing_locked_secs;
@@ -401,6 +470,9 @@ async function poll() {
   render();
   const peer = devices.find((d) => d.connected);
   els.status.textContent = peer ? 'Streaming' : 'Idle';
+  const peerId = peer ? peer.id : null;
+  if (lastPeer !== undefined && peerId !== lastPeer) announce(peer ? 'Streaming: connected to ' + peer.name : 'Idle: disconnected');
+  lastPeer = peerId;
   els.status.classList.toggle('on', !!peer);
   const s = st.stats;
   liveRate = s ? Math.round(s.bitrate / 1000) : null;
@@ -413,7 +485,7 @@ async function poll() {
   }
   showQuality(st.quality, cur);
   showPeerLog(cur);
-  els.error.textContent = [actionError || st.error, st.virtual_error].filter(Boolean).join(' · ');
+  setError([actionError || st.error, st.virtual_error].filter(Boolean).join(' · '));
 }
 
 // ---- connection quality: the bottom line (click for the detailed stats) and the Troubleshooting panel ----
@@ -454,11 +526,11 @@ async function runChecks() {
   } catch (e) { ul.replaceChildren(); $('audioResult').textContent = String(e); }
 }
 $('troubleBtn').addEventListener('click', () => {
-  $('opts').hidden = true;
+  setOpts(false);
   $('trouble').hidden = !$('trouble').hidden;
-  if (!$('trouble').hidden) runChecks();
+  if (!$('trouble').hidden) { runChecks(); $('trouble').focus(); }
 });
-$('troubleClose').addEventListener('click', () => { $('trouble').hidden = true; });
+$('troubleClose').addEventListener('click', () => { $('trouble').hidden = true; $('optsBtn').focus(); });
 // runs one audio test with its button disabled; `go` returns the result line
 async function audioTest(btn, go) {
   btn.disabled = true;
@@ -533,9 +605,15 @@ new ResizeObserver(fitWindow).observe(document.body);
 
 document.addEventListener('click', () => { if (menuFor) { menuFor = null; lastDevices = ''; render(); } });
 
-$('optsBtn').addEventListener('click', (e) => { e.stopPropagation(); $('opts').hidden = !$('opts').hidden; });
+// opens/closes the ⚙ popover; opening moves focus into it, closing with `focus` returns it to the gear
+function setOpts(open, focus) {
+  $('opts').hidden = !open;
+  $('optsBtn').setAttribute('aria-expanded', open);
+  if (open) $('service').focus(); else if (focus) $('optsBtn').focus();
+}
+$('optsBtn').addEventListener('click', (e) => { e.stopPropagation(); setOpts($('opts').hidden); });
 $('opts').addEventListener('click', (e) => e.stopPropagation()); // clicks inside keep it open
-document.addEventListener('click', () => { $('opts').hidden = true; });
+document.addEventListener('click', () => setOpts(false));
 
 // Shows this version in the corner; if GitHub has a newer release, offers it instead.
 // Only asks GitHub for the latest release's tag, once per window.
@@ -564,7 +642,7 @@ function newer(a, b) {
   invoke('version').then(checkUpdate, () => {});
   // options must exist before saved selections can apply; the engine may still be starting
   for (;;) {
-    try { await loadDevices(); break; } catch (e) { els.error.textContent = String(e); }
+    try { await loadDevices(); break; } catch (e) { setError(String(e)); }
     await new Promise((r) => setTimeout(r, 2000));
   }
   await poll();
