@@ -249,6 +249,38 @@ fn sync_music(app: AppHandle, item: CheckMenuItem<tauri::Wry>) {
     });
 }
 
+/// `--status`, `--connect NAME_OR_ID`, `--disconnect`, `--music on|off`. Needs the engine already
+/// running (it never starts one: a script shouldn't leave a daemon behind). Returns what to print.
+fn cli(args: &[String], dir: Option<PathBuf>, port: u16) -> anyhow::Result<Option<String>> {
+    let c = Client::local(dir, port + 1).map_err(|e| anyhow::anyhow!("the CapraLink engine isn't running ({e}); open CapraLink first"))?;
+    let st = c.state()?;
+    match args.iter().map(String::as_str).collect::<Vec<_>>()[..] {
+        ["--status"] => {
+            let peers: Vec<_> = st.devices.iter().filter(|d| d.paired).collect();
+            let connected = peers.iter().find(|d| d.connected).map(|d| serde_json::json!({ "id": d.id, "name": d.name }));
+            let devices: Vec<_> = peers.iter().map(|d| serde_json::json!({ "id": d.id, "name": d.name, "online": d.online, "connected": d.connected })).collect();
+            // the peer's own Music Mode isn't part of NodeState, so `music_mode` is this computer's setting
+            let quality = st.quality.as_ref().map(|q| q.grade.as_str());
+            Ok(Some(serde_json::json!({ "connected": connected, "devices": devices, "music_mode": st.settings.music_mode, "quality": quality, "error": st.error }).to_string()))
+        }
+        ["--connect", who] => {
+            let d = st.devices.iter().find(|d| d.paired && (d.id == who || d.name.eq_ignore_ascii_case(who)));
+            c.connect(&d.ok_or_else(|| anyhow::anyhow!("no paired device named {who}"))?.id).map(|_| None)
+        }
+        ["--disconnect"] => c.disconnect().map(|_| None),
+        ["--music", v] => c.patch_settings(serde_json::json!({ "music_mode": parse_on_off(v)? })).map(|_| None),
+        _ => anyhow::bail!("usage: capralink --status | --connect NAME_OR_ID | --disconnect | --music on|off"),
+    }
+}
+
+fn parse_on_off(v: &str) -> anyhow::Result<bool> {
+    match v {
+        "on" => Ok(true),
+        "off" => Ok(false),
+        _ => anyhow::bail!("--music takes on or off, not {v}"),
+    }
+}
+
 const WINDOW_LABEL: &str = "main";
 
 // macOS menu bar: black silhouette that the system recolours; elsewhere: white for dark panels
@@ -279,6 +311,20 @@ fn main() {
         if let Err(e) = capralink_engine::daemon(dir, port) {
             log(&format!("engine stopped: {e:#}"));
             std::process::exit(1);
+        }
+        return;
+    }
+
+    // Scriptable client (Steam Deck plugin, shell): talks to a running engine, never opens the UI.
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    if matches!(args.first().map(String::as_str), Some("--status" | "--connect" | "--disconnect" | "--music")) {
+        match cli(&args, dir, port) {
+            Ok(Some(out)) => println!("{out}"),
+            Ok(None) => {}
+            Err(e) => {
+                eprintln!("capralink: {e:#}");
+                std::process::exit(1);
+            }
         }
         return;
     }
@@ -333,4 +379,14 @@ fn main() {
             (app, RunEvent::Reopen { .. }) => show_window(app),
             _ => {}
         });
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn music_arg() {
+        assert!(super::parse_on_off("on").unwrap());
+        assert!(!super::parse_on_off("off").unwrap());
+        assert!(super::parse_on_off("yes").is_err());
+    }
 }

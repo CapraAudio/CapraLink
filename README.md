@@ -125,7 +125,17 @@ The public API, meaning what a version number promises to keep compatible, is:
 
 1. **Computers on different versions can pair and connect** (network protocol and remote configuration).
 2. **Your settings and pairings survive an update** (`config.json`).
-3. **The `capralinkd` command-line options.**
+3. **The command-line options** of `capralinkd` and of `capralink` (below).
+
+`capralink` itself is a small client of the running engine (it never opens a window or starts the engine, and exits non-zero with a message on stderr if it can't do what you asked):
+
+```text
+capralink --status              one JSON line: connected {id, name} or null, devices [{id, name, online, connected}],
+                                music_mode, quality ("good"/"fair"/"poor" or null), error
+capralink --connect NAME_OR_ID  connect to a paired device
+capralink --disconnect
+capralink --music on|off        Music Mode
+```
 
 Before 1.0.0, a breaking change bumps MINOR instead of MAJOR, and the release notes call it out.
 
