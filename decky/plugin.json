@@ -1,0 +1,10 @@
+{
+  "name": "CapraLink",
+  "author": "Capra Audio",
+  "flags": [],
+  "api_version": 1,
+  "publish": {
+    "tags": ["audio", "utility"],
+    "description": "Connect, disconnect and toggle Music Mode for CapraLink audio streaming from Game Mode."
+  }
+}

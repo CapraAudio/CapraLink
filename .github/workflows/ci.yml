@@ -55,6 +55,26 @@ jobs:
             target/release/capralink
             target/release/capralink.exe
 
+  # Steam Deck Game Mode plugin (Decky Loader); node and npm come with the runner image
+  decky:
+    runs-on: ubuntu-24.04
+    defaults:
+      run:
+        working-directory: decky
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - run: npm ci --no-audit --no-fund
+      - run: npm run typecheck && npm run build
+      - run: |
+          mkdir -p out/CapraLink
+          cp -r dist main.py plugin.json package.json LICENSE out/CapraLink/
+          rm out/CapraLink/dist/*.map
+          cd out && zip -r CapraLink.zip CapraLink
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: capralink-decky-plugin
+          path: decky/out/CapraLink.zip
+
   # a v* tag makes a draft GitHub Release with the installers and their SHA-256 sums;
   # it is published by hand after a look
   release:
