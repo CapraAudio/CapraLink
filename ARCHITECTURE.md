@@ -26,6 +26,29 @@ playback device
 - **Encoder load:** Opus complexity follows how long encoding takes, so CapraLink stays light next to games.
 - **Playout buffer:** it grows when the network is bursty and shrinks back when it calms down. Clock
   drift between the two computers is absorbed by tiny speed changes: at most 2%, or 0.5% in Music Mode.
+- **Volume and mute:** per connection, 0–150% each way. Send volume is applied before encoding,
+  receive volume before playback; above 100% loud peaks are bent softly towards full scale instead
+  of clipping. Mute sends silence (the stream keeps running). Both change live, without reconnecting.
+- **Push-to-talk:** per connection, Hold (talks while the key is held, plus 200 ms) or Toggle. While
+  not talking the sender sends silence, the same way as mute. A short two-tone chirp plays on this
+  computer when talking starts (rising) and stops (falling).
+- **Delay readout:** each direction's one-way delay is estimated as capture buffer + one frame +
+  half the control channel's round trip + playout buffer + playback buffer. The 1 s reports carry
+  a timestamp echo for the round trip and each side's own part of the delay.
+
+## Push-to-talk key listener
+
+The engine listens for the push-to-talk key only while one is set for the current connection (or
+while the window is waiting for "Set button"). It only listens: games and other apps still get
+every key, and no low-level keyboard hooks are installed.
+
+- **Linux:** reads the `/dev/input/event*` devices this user can read (controllers usually are;
+  keyboards and mice need the `input` group).
+- **Windows:** Raw Input on a hidden window, keyboard and mouse (middle, back and forward buttons).
+- **macOS:** a listen-only event tap, which needs the Input Monitoring permission (macOS asks the
+  first time).
+
+Keys are compared with the chosen one in memory and never logged or sent anywhere.
 
 ## Virtual devices
 

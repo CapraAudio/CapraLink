@@ -3,10 +3,12 @@
 mod dsp;
 pub mod log;
 mod node;
+mod ptt;
 mod rpc;
 mod vdev;
 
 pub use node::{Check, Device, Node, NodeState, Quality, RemoteConfig};
+pub use ptt::{PttKey, PttMode};
 pub use rpc::{daemon, daemon_exe, serve_rpc, Client, Devices};
 
 /// A command for a system tool (pactl, systemctl, reg, hostname). Inside an AppImage,
@@ -178,12 +180,52 @@ pub struct Settings {
     pub music_mode: bool,
     /// Reconnect to the last computer this one connected to, after a drop or a restart (MASTER.md §3.9).
     pub auto_reconnect: bool,
+    /// Volume (percent, 0–`MAX_VOLUME`) of what this computer sends / plays from the other one. Live.
+    pub send_volume: u16,
+    pub recv_volume: u16,
+    /// Send silence (the stream keeps running). Live.
+    pub mute: bool,
+    /// Push-to-talk: send silence except while talking. Needs `ptt_key`.
+    pub ptt: PttMode,
+    pub ptt_key: Option<PttKey>,
 }
 
 impl Default for Settings {
     fn default() -> Self {
-        Settings { input: None, output: None, bitrate: 64_000, channels: 1, service: false, remote_config: false, music_mode: false, auto_reconnect: true }
+        Settings {
+            input: None,
+            output: None,
+            bitrate: 64_000,
+            channels: 1,
+            service: false,
+            remote_config: false,
+            music_mode: false,
+            auto_reconnect: true,
+            send_volume: 100,
+            recv_volume: 100,
+            mute: false,
+            ptt: PttMode::Off,
+            ptt_key: None,
+        }
     }
+}
+
+/// Highest Send/Receive volume, percent.
+pub const MAX_VOLUME: u16 = 150;
+
+/// Gain for a volume percent; 0 when `silent` (mute, or push-to-talk while not talking).
+fn gain(volume: u16, silent: bool) -> f32 {
+    if silent { 0.0 } else { volume as f32 / 100.0 }
+}
+
+/// `x * g`; above 0.9 it bends smoothly towards ±1 instead of clipping hard. Only when `g`
+/// isn't 1, so 100% stays bit-exact.
+fn amplify(x: f32, g: f32) -> f32 {
+    if g == 1.0 {
+        return x;
+    }
+    let y = x * g;
+    if y.abs() <= 0.9 { y } else { y.signum() * (0.9 + 0.1 * ((y.abs() - 0.9) / 0.1).tanh()) }
 }
 
 /// Per-session audio keys (ChaCha20-Poly1305): one per direction.
@@ -221,6 +263,12 @@ pub struct Stats {
     /// Slowest capture callback (µs) since the previous `stats()` call.
     #[serde(default)]
     pub callback_max_us: u32,
+    /// Estimated one-way delay, ms: "you hear them" (None when Play to is off) and "they hear
+    /// you" (None when Send from is off or the other computer runs an older version).
+    #[serde(default)]
+    pub delay_in_ms: Option<u32>,
+    #[serde(default)]
+    pub delay_out_ms: Option<u32>,
 }
 
 #[derive(Default)]
@@ -242,6 +290,11 @@ struct Shared {
     mode: Mutex<Option<TxMode>>, // the encoder/resampler for `music`, prepared for `Tx::apply_mode`
     callback_us: AtomicU32, // slowest capture callback, reset on read
     failure: Mutex<Option<Failure>>, // see `err_cb`
+    send_gain: AtomicU32, // f32 bits, applied before encoding (0 = silence)
+    recv_gain: AtomicU32, // f32 bits, applied before playback
+    chirp: AtomicU8,      // push-to-talk chirp for the playback callback to play: 1 = start, 2 = stop
+    in_latency_us: AtomicU32,  // capture: the oldest sample's age when its callback runs
+    out_latency_us: AtomicU32, // playback: how long until a written sample is heard
 }
 
 impl Shared {
@@ -257,6 +310,11 @@ impl Shared {
             // whatever was in the slot (e.g. the encoder the callback swapped out) is freed here
             let _old = self.mode.lock().map(|mut slot| std::mem::replace(&mut *slot, m));
         }
+    }
+
+    fn gains(&self, send: f32, recv: f32) {
+        self.send_gain.store(send.to_bits(), Relaxed);
+        self.recv_gain.store(recv.to_bits(), Relaxed);
     }
 }
 
@@ -303,6 +361,8 @@ impl Link {
         shared.bitrate.store(initial_bitrate, Relaxed);
         shared.target_loss_perc.store(5, Relaxed);
         shared.complexity.store(5, Relaxed);
+        // silent while push-to-talk is on, until the node says this side is talking
+        shared.gains(gain(cfg.send_volume, cfg.mute || cfg.ptt != PttMode::Off), gain(cfg.recv_volume, false));
         let stop = Arc::new(AtomicBool::new(false));
         let (mut prod, cons) = HeapRb::<f32>::new(RATE as usize * 3).split(); // 1.5 s of stereo: Music Mode buffers up to 1 s + headroom
 
@@ -387,12 +447,35 @@ impl Link {
             music: self.shared.music.load(Relaxed),
             send_dropped: c.send_dropped.load(Relaxed),
             callback_max_us: max(&self.shared.callback_us),
+            delay_in_ms: None, // filled in by the node, which knows the network part
+            delay_out_ms: None,
         }
     }
 
     /// Switches this link's sender and receiver into or out of Music Mode, live.
     pub fn set_music(&self, on: bool) {
         self.shared.set_music(on, self.tx);
+    }
+
+    /// Sets the Send/Receive volumes (percent), live; `silent` sends silence (mute, or
+    /// push-to-talk while not talking).
+    pub fn set_volume(&self, send: u16, recv: u16, silent: bool) {
+        self.shared.gains(gain(send, silent), gain(recv, false));
+    }
+
+    /// Mixes the push-to-talk chirp into this link's playback; false if Play to is off.
+    pub fn chirp(&self, start: bool) -> bool {
+        self.shared.chirp.store(if start { 1 } else { 2 }, Relaxed);
+        self._output.is_some()
+    }
+
+    /// (sending, receiving) part of the delay, ms: capture + one frame, and playout buffer +
+    /// playback; None for a direction that is off.
+    pub fn latency(&self) -> (Option<f32>, Option<f32>) {
+        let ms = |a: &AtomicU32| a.load(Relaxed) as f32 / 1000.0;
+        let frame = if self.shared.music.load(Relaxed) { 20.0 } else { 10.0 };
+        let recv = f32::from_bits(self.shared.buffer_ms.load(Relaxed)) + ms(&self.shared.out_latency_us);
+        (self.tx.map(|_| ms(&self.shared.in_latency_us) + frame), self._output.is_some().then_some(recv))
     }
 
     /// Sets the sender's target bitrate/loss%, applied by the capture callback (MASTER.md §3.5).
@@ -465,29 +548,34 @@ pub(crate) fn default_output_name() -> Option<String> {
 
 /// Plays about a second of a soft 440 Hz tone on the Play to device; returns when it's done.
 pub fn test_tone(output: &Option<String>) -> anyhow::Result<()> {
+    // 1 s, 50 ms fades
+    play(output, 1.0, |t| 0.2 * (t.min(1.0 - t) / 0.05).clamp(0.0, 1.0) * (std::f32::consts::TAU * 440.0 * t).sin())
+}
+
+/// Plays `secs` of `wave(t)` (t in seconds; it must be silent from `secs` on) on the Play to
+/// device `output`; returns when it's done.
+pub(crate) fn play(output: &Option<String>, secs: f32, wave: fn(f32) -> f32) -> anyhow::Result<()> {
     let (_, dev) = find(false, output)?.ok_or_else(|| anyhow!("Play to is set to None"))?;
     let sc = pick_config(dev.default_output_config()?, dev.supported_output_configs()?);
     let (ch, rate, c) = (sc.channels() as usize, sc.sample_rate(), sc.config());
-    let err = |e: cpal::Error| crate::log::log(&format!("test tone: {e}"));
+    let err = |e: cpal::Error| crate::log::log(&format!("playing a sound: {e}"));
     let mut n = 0u32;
     let s = match sc.sample_format() {
-        SampleFormat::F32 => dev.build_output_stream(c, move |d: &mut [f32], _: &_| tone(d, &mut n, ch, rate), err, None)?,
-        SampleFormat::I16 => dev.build_output_stream(c, move |d: &mut [i16], _: &_| tone(d, &mut n, ch, rate), err, None)?,
-        SampleFormat::I32 => dev.build_output_stream(c, move |d: &mut [i32], _: &_| tone(d, &mut n, ch, rate), err, None)?,
-        SampleFormat::U16 => dev.build_output_stream(c, move |d: &mut [u16], _: &_| tone(d, &mut n, ch, rate), err, None)?,
+        SampleFormat::F32 => dev.build_output_stream(c, move |d: &mut [f32], _: &_| render(d, &mut n, ch, rate, wave), err, None)?,
+        SampleFormat::I16 => dev.build_output_stream(c, move |d: &mut [i16], _: &_| render(d, &mut n, ch, rate, wave), err, None)?,
+        SampleFormat::I32 => dev.build_output_stream(c, move |d: &mut [i32], _: &_| render(d, &mut n, ch, rate, wave), err, None)?,
+        SampleFormat::U16 => dev.build_output_stream(c, move |d: &mut [u16], _: &_| render(d, &mut n, ch, rate, wave), err, None)?,
         f => anyhow::bail!("unsupported output sample format {f}"),
     };
     s.play()?;
-    std::thread::sleep(Duration::from_millis(1200)); // the tone plus the device's buffer
+    std::thread::sleep(Duration::from_secs_f32(secs + 0.2)); // the sound plus the device's buffer
     Ok(())
 }
 
-/// Next frames of the test tone (`n` = frames played so far): 1 s, 50 ms fades, then silence.
-fn tone<T: SizedSample + FromSample<f32>>(out: &mut [T], n: &mut u32, ch: usize, rate: u32) {
+/// Next frames of `wave` (`n` = frames played so far).
+fn render<T: SizedSample + FromSample<f32>>(out: &mut [T], n: &mut u32, ch: usize, rate: u32, wave: fn(f32) -> f32) {
     for f in out.chunks_exact_mut(ch) {
-        let t = *n as f32 / rate as f32;
-        let fade = (t.min(1.0 - t) / 0.05).clamp(0.0, 1.0);
-        f.fill(T::from_sample(0.2 * fade * (std::f32::consts::TAU * 440.0 * t).sin()));
+        f.fill(T::from_sample(wave(*n as f32 / rate as f32)));
         *n = n.saturating_add(1);
     }
 }
@@ -601,6 +689,7 @@ struct Tx {
     sock: UdpSocket,
     peer: SocketAddr,
     dev_ch: usize,
+    rate: u32, // capture rate
     music: bool,
     rs: Option<Resampler>,
     mixed: Vec<f32>,
@@ -616,7 +705,8 @@ struct Tx {
 impl Tx {
     // ponytail: encode + send run inside the capture callback; move them to a dedicated
     // encode thread fed by a ring if callbacks ever overrun (`callback_max_us`).
-    fn process<T: SizedSample>(&mut self, data: &[T])
+    /// `age_us` = the device's age of the first sample (callback - capture timestamp), 0 if unknown.
+    fn process<T: SizedSample>(&mut self, data: &[T], age_us: u32)
     where
         f32: FromSample<T>,
     {
@@ -624,11 +714,15 @@ impl Tx {
         self.apply_mode();
         self.apply_rate();
         let (dev_ch, out_ch) = (self.dev_ch, self.pk.channels());
+        // at least this callback's own buffer, when the host's timestamps don't say more
+        let buffer_us = (data.len() / dev_ch) as u64 * 1_000_000 / self.rate as u64;
+        self.shared.in_latency_us.store(age_us.max(buffer_us as u32), Relaxed);
+        let g = f32::from_bits(self.shared.send_gain.load(Relaxed));
         self.mixed.clear();
         for f in data.chunks_exact(dev_ch) {
-            let s = |i: usize| f32::from_sample(f[i.min(dev_ch - 1)]);
+            let s = |i: usize| amplify(f32::from_sample(f[i.min(dev_ch - 1)]), g);
             if out_ch == 1 {
-                self.mixed.push((0..dev_ch).map(s).sum::<f32>() / dev_ch as f32);
+                self.mixed.push(amplify((0..dev_ch).map(|i| f32::from_sample(f[i])).sum::<f32>() / dev_ch as f32, g));
             } else {
                 self.mixed.extend([s(0), s(1)]);
             }
@@ -720,6 +814,7 @@ impl Tx {
             sock,
             peer,
             dev_ch,
+            rate,
             music: false,
             rs: (rate != RATE).then(|| Resampler::new(rate, RATE, ch)),
             mixed: Vec::with_capacity(16_384 * 2), // stereo: Music Mode can switch to it
@@ -747,11 +842,15 @@ fn build_input(dev: &cpal::Device, cfg: &Settings, pk: Packetizer, sock: UdpSock
     if let cpal::SupportedBufferSize::Range { min, max } = *sc.buffer_size() {
         c.buffer_size = cpal::BufferSize::Fixed((rate / 100).clamp(min, max));
     }
+    let age = |i: &cpal::InputCallbackInfo| {
+        let t = i.timestamp();
+        t.callback.duration_since(t.capture).as_micros().min(1_000_000) as u32
+    };
     let s = match fmt {
-        SampleFormat::F32 => dev.build_input_stream(c, move |d: &[f32], _: &_| tx.process(d), err_cb, None)?,
-        SampleFormat::I16 => dev.build_input_stream(c, move |d: &[i16], _: &_| tx.process(d), err_cb, None)?,
-        SampleFormat::I32 => dev.build_input_stream(c, move |d: &[i32], _: &_| tx.process(d), err_cb, None)?,
-        SampleFormat::U16 => dev.build_input_stream(c, move |d: &[u16], _: &_| tx.process(d), err_cb, None)?,
+        SampleFormat::F32 => dev.build_input_stream(c, move |d: &[f32], i: &_| tx.process(d, age(i)), err_cb, None)?,
+        SampleFormat::I16 => dev.build_input_stream(c, move |d: &[i16], i: &_| tx.process(d, age(i)), err_cb, None)?,
+        SampleFormat::I32 => dev.build_input_stream(c, move |d: &[i32], i: &_| tx.process(d, age(i)), err_cb, None)?,
+        SampleFormat::U16 => dev.build_input_stream(c, move |d: &[u16], i: &_| tx.process(d, age(i)), err_cb, None)?,
         f => anyhow::bail!("unsupported input sample format {f}"),
     };
     Ok((s, rate))
@@ -765,12 +864,18 @@ struct Playback {
     scratch: Vec<f32>, // 48 kHz stereo pulled from the ring
     staged: Vec<f32>,  // device-rate stereo waiting to be written
     dev_ch: usize,
+    rate: u32, // device rate
+    chirp: Option<(bool, u32)>, // push-to-talk chirp playing: (start, frames played)
     shared: Arc<Shared>,
 }
 
 impl Playback {
-    fn fill<T: SizedSample + FromSample<f32>>(&mut self, out: &mut [T]) {
+    /// `ahead_us` = how long until the first frame is heard (playback - callback timestamp), 0 if unknown.
+    fn fill<T: SizedSample + FromSample<f32>>(&mut self, out: &mut [T], ahead_us: u32) {
         let frames = out.len() / self.dev_ch;
+        // at least this callback's own buffer, when the host's timestamps don't say more
+        let buffer_us = frames as u64 * 1_000_000 / self.rate as u64;
+        self.shared.out_latency_us.store(ahead_us.max(buffer_us as u32), Relaxed);
         let fill_ms = (self.cons.occupied_len() / 2) as f32 * 1000.0 / RATE as f32;
         self.shared.buffer_ms.store(fill_ms.to_bits(), Relaxed);
         while self.staged.len() / 2 < frames {
@@ -799,7 +904,12 @@ impl Playback {
             // silence goes straight to the device, bypassing the resampler
             self.staged.resize(frames * 2, 0.0);
         }
+        let g = f32::from_bits(self.shared.recv_gain.load(Relaxed));
+        if g != 1.0 {
+            self.staged[..frames * 2].iter_mut().for_each(|s| *s = amplify(*s, g));
+        }
         meter(&self.shared.out_peak, &self.staged[..frames * 2]);
+        self.mix_chirp(frames);
         let target_ms = self.plan.target() as f32 * 1000.0 / RATE as f32;
         self.shared.target_ms.store(target_ms.to_bits(), Relaxed);
         let mono = self.shared.rx_channels.load(Relaxed) == 1;
@@ -819,6 +929,24 @@ impl Playback {
         }
         self.staged.drain(..frames * 2);
     }
+
+    /// Adds the push-to-talk chirp (if one was asked for or is playing) to the next `frames`.
+    fn mix_chirp(&mut self, frames: usize) {
+        match self.shared.chirp.swap(0, Relaxed) {
+            0 => {}
+            n => self.chirp = Some((n == 1, 0)),
+        }
+        let Some((start, n)) = self.chirp.as_mut() else { return };
+        for f in self.staged[..frames * 2].as_chunks_mut::<2>().0 {
+            let c = ptt::chirp(*start, *n as f32 / self.rate as f32);
+            f[0] += c;
+            f[1] += c;
+            *n += 1;
+        }
+        if *n as f32 >= ptt::CHIRP_SECS * self.rate as f32 {
+            self.chirp = None;
+        }
+    }
 }
 
 fn build_output(dev: &cpal::Device, cons: HeapCons<f32>, shared: Arc<Shared>) -> anyhow::Result<cpal::Stream> {
@@ -833,6 +961,8 @@ fn build_output(dev: &cpal::Device, cons: HeapCons<f32>, shared: Arc<Shared>) ->
         scratch: Vec::with_capacity(TARGET * 40),
         staged: Vec::with_capacity(TARGET * 40),
         dev_ch: sc.channels() as usize,
+        rate,
+        chirp: None,
         shared,
     };
     let mut c = sc.config();
@@ -843,11 +973,15 @@ fn build_output(dev: &cpal::Device, cons: HeapCons<f32>, shared: Arc<Shared>) ->
             c.buffer_size = cpal::BufferSize::Fixed((rate / 100).clamp(min, max));
         }
     }
+    let ahead = |i: &cpal::OutputCallbackInfo| {
+        let t = i.timestamp();
+        t.playback.duration_since(t.callback).as_micros().min(1_000_000) as u32
+    };
     Ok(match fmt {
-        SampleFormat::F32 => dev.build_output_stream(c, move |d: &mut [f32], _: &_| pb.fill(d), err_cb, None)?,
-        SampleFormat::I16 => dev.build_output_stream(c, move |d: &mut [i16], _: &_| pb.fill(d), err_cb, None)?,
-        SampleFormat::I32 => dev.build_output_stream(c, move |d: &mut [i32], _: &_| pb.fill(d), err_cb, None)?,
-        SampleFormat::U16 => dev.build_output_stream(c, move |d: &mut [u16], _: &_| pb.fill(d), err_cb, None)?,
+        SampleFormat::F32 => dev.build_output_stream(c, move |d: &mut [f32], i: &_| pb.fill(d, ahead(i)), err_cb, None)?,
+        SampleFormat::I16 => dev.build_output_stream(c, move |d: &mut [i16], i: &_| pb.fill(d, ahead(i)), err_cb, None)?,
+        SampleFormat::I32 => dev.build_output_stream(c, move |d: &mut [i32], i: &_| pb.fill(d, ahead(i)), err_cb, None)?,
+        SampleFormat::U16 => dev.build_output_stream(c, move |d: &mut [u16], i: &_| pb.fill(d, ahead(i)), err_cb, None)?,
         f => anyhow::bail!("unsupported output sample format {f}"),
     })
 }
@@ -970,16 +1104,79 @@ fn capture_callback_doesnt_allocate() {
     let pk = Packetizer::new(1, 64_000, &[7; 32]).unwrap();
     let mut tx = Tx::new(&Settings::default(), pk, UdpSocket::bind("127.0.0.1:0").unwrap(), peer.local_addr().unwrap(), shared.clone(), 2, rate);
     let chunk = [0.1f32; 2 * 960]; // 10 ms of device stereo
-    tx.process(&chunk);
+    tx.process(&chunk, 0);
     shared.set_music(true, Some((1, rate))); // what `Link::set_music` does
+    shared.gains(1.5, 1.0); // 150%: through the soft clip
     let before = alloc_count::allocations();
     for _ in 0..10 {
-        tx.process(&chunk);
+        tx.process(&chunk, 0);
     }
     assert_eq!(alloc_count::allocations() - before, 0, "the capture callback allocated");
     assert!(tx.music && tx.pk.channels() == 2 && tx.pk.frame() == 2 * FRAME, "switched to Music Mode");
     assert_eq!(shared.c.sent.load(Relaxed), 1 + 5, "one 10 ms mono packet, then five 20 ms stereo ones");
     assert!(shared.callback_us.load(Relaxed) > 0);
+}
+
+#[cfg(test)]
+#[test]
+fn volume_and_soft_clip() {
+    assert_eq!((gain(100, false), gain(150, false), gain(0, false), gain(150, true)), (1.0, 1.5, 0.0, 0.0));
+    for x in [-1.3f32, -0.95, 0.0, 0.5, 0.91, 1.0] {
+        assert_eq!(amplify(x, 1.0), x, "100% is untouched");
+    }
+    assert_eq!(amplify(0.5, 0.0), 0.0);
+    assert!((amplify(0.4, 1.5) - 0.6).abs() < 1e-6, "linear below 0.9");
+    let mut prev = 0.0;
+    for i in 1..=100 {
+        let y = amplify(i as f32 / 100.0, 1.5);
+        assert!(y > prev && y < 1.0, "rises smoothly and never reaches full scale: {y}");
+        assert!((y - prev) <= 0.015 + 1e-6, "no jump at the knee");
+        prev = y;
+    }
+    assert_eq!(amplify(-0.8, 1.5), -amplify(0.8, 1.5));
+}
+
+#[cfg(test)]
+#[test]
+fn send_gain_mute_and_capture_latency() {
+    let peer = UdpSocket::bind("127.0.0.1:0").unwrap();
+    let shared = Arc::new(Shared::default());
+    let pk = Packetizer::new(1, 64_000, &[7; 32]).unwrap();
+    let mut tx = Tx::new(&Settings::default(), pk, UdpSocket::bind("127.0.0.1:0").unwrap(), peer.local_addr().unwrap(), shared.clone(), 2, RATE);
+    let level = || f32::from_bits(shared.in_peak.swap(0, Relaxed));
+    shared.gains(gain(150, false), 1.0);
+    tx.process(&[0.4f32; 2 * 480], 0);
+    assert!((level() - 0.6).abs() < 1e-6, "150%");
+    assert_eq!(shared.in_latency_us.load(Relaxed), 10_000, "no timestamps: the 10 ms buffer itself");
+    tx.process(&[0.4f32; 2 * 480], 25_000);
+    assert_eq!(shared.in_latency_us.load(Relaxed), 25_000, "the host's timestamps when they say more");
+    level();
+    shared.gains(gain(150, true), 1.0); // muted: silence, still sent
+    let sent = shared.c.sent.load(Relaxed);
+    tx.process(&[0.4f32; 2 * 480], 0);
+    assert_eq!((level(), shared.c.sent.load(Relaxed)), (0.0, sent + 1));
+}
+
+#[cfg(test)]
+#[test]
+fn chirp_mixes_into_playback() {
+    let (_, cons) = HeapRb::<f32>::new(RATE as usize).split();
+    let shared = Arc::new(Shared::default());
+    shared.gains(1.0, 1.0);
+    let mut pb = Playback { cons, plan: Playout::default(), rs: Resampler::new(RATE, RATE, 2), base_step: 1.0, scratch: vec![], staged: vec![], dev_ch: 2, rate: RATE, chirp: None, shared: shared.clone() };
+    let mut out = vec![0f32; 2 * 480];
+    pb.fill(&mut out, 0);
+    assert!(out.iter().all(|s| *s == 0.0), "nothing received: silence");
+    assert_eq!(shared.out_latency_us.load(Relaxed), 10_000);
+    shared.chirp.store(1, Relaxed); // what `Link::chirp(true)` does
+    let mut heard: Vec<f32> = vec![];
+    for _ in 0..20 {
+        pb.fill(&mut out, 0);
+        heard.extend(out.iter().step_by(2));
+    }
+    let want: Vec<f32> = (0..heard.len()).map(|i| ptt::chirp(true, i as f32 / RATE as f32)).collect();
+    assert_eq!(heard, want, "the start chirp, from its first sample");
+    assert!(pb.chirp.is_none(), "done after {} s", ptt::CHIRP_SECS);
 }
 
 #[cfg(test)]

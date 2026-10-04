@@ -3,8 +3,9 @@
 
 use crate::dsp::{ceiling, RateControl, MUSIC_TARGET, RATE, TARGET};
 use crate::log::log;
+use crate::ptt::{self, Ev, PttKey, PttMode, Talk};
 use crate::vdev::Virtual;
-use crate::{AudioDevice, Failure, Keys, Link, Settings, Stats, EVERYTHING, NO_DEVICE, VIRTUAL_INPUT, VIRTUAL_OUTPUT};
+use crate::{AudioDevice, Failure, Keys, Link, Settings, Stats, EVERYTHING, MAX_VOLUME, NO_DEVICE, VIRTUAL_INPUT, VIRTUAL_OUTPUT};
 use anyhow::{anyhow, bail, ensure, Context, Result};
 use hkdf::Hkdf;
 use hmac::{Hmac, KeyInit, Mac};
@@ -44,6 +45,8 @@ const QUALITY_WINDOW: usize = 30; // seconds of receive reports that `Quality` c
 const QUALITY_LOG: Duration = Duration::from_secs(30);
 // a long `Text` reply goes in pieces: even fully JSON-escaped (6x) one fits a 64 KB frame
 const TEXT_CHUNK: usize = 8000;
+// how long `ptt_capture` waits for a key (short under test)
+const CAPTURE: Duration = Duration::from_millis(if cfg!(test) { 300 } else { 10_000 });
 
 #[derive(Serialize, Deserialize)]
 pub struct NodeState {
@@ -63,6 +66,12 @@ pub struct NodeState {
     pub virtual_error: Option<String>,
     /// How well audio is arriving over the last ~30 s (None when not streaming).
     pub quality: Option<Quality>,
+    /// Push-to-talk is on and this computer is talking.
+    #[serde(default)]
+    pub talking: bool,
+    /// Why push-to-talk can't hear its key (e.g. no Input Monitoring permission on macOS).
+    #[serde(default)]
+    pub ptt_error: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -152,16 +161,53 @@ struct Audio {
     output: Option<String>,
     bitrate: i32,
     channels: u16,
+    #[serde(default = "full_volume")]
+    send_volume: u16,
+    #[serde(default = "full_volume")]
+    recv_volume: u16,
+    #[serde(default)]
+    mute: bool,
+    #[serde(default)]
+    ptt: PttMode,
+    #[serde(default)]
+    ptt_key: Option<PttKey>,
+}
+
+fn full_volume() -> u16 {
+    100
 }
 
 impl Audio {
     fn of(s: &Settings) -> Audio {
-        Audio { input: s.input.clone(), output: s.output.clone(), bitrate: s.bitrate, channels: s.channels }
+        let s = s.clone();
+        Audio { input: s.input, output: s.output, bitrate: s.bitrate, channels: s.channels, send_volume: s.send_volume, recv_volume: s.recv_volume, mute: s.mute, ptt: s.ptt, ptt_key: s.ptt_key }
     }
 
     fn apply(&self, s: Settings) -> Settings {
-        Settings { input: self.input.clone(), output: self.output.clone(), bitrate: self.bitrate, channels: self.channels, ..s }
+        let a = self.clone();
+        Settings { input: a.input, output: a.output, bitrate: a.bitrate, channels: a.channels, send_volume: a.send_volume, recv_volume: a.recv_volume, mute: a.mute, ptt: a.ptt, ptt_key: a.ptt_key, ..s }
     }
+}
+
+/// A change between these settings needs the link restarted (new devices or encoder); volume,
+/// mute, push-to-talk and Music Mode apply live.
+fn restarts(a: &Settings, b: &Settings) -> bool {
+    (&a.input, &a.output, a.bitrate, a.channels) != (&b.input, &b.output, b.bitrate, b.channels)
+}
+
+/// Settings that can't be saved.
+fn check(s: &Settings) -> Result<()> {
+    ensure!(matches!(s.channels, 1 | 2), "channels must be 1 or 2");
+    ensure!(s.send_volume <= MAX_VOLUME && s.recv_volume <= MAX_VOLUME, "volume must be 0 to {MAX_VOLUME}%");
+    ensure!(s.ptt == PttMode::Off || s.ptt_key.is_some(), "pick a push-to-talk button first");
+    Ok(())
+}
+
+/// `cur` with the fields in `patch` (`Settings` fields as JSON) replaced.
+fn merge(cur: &Settings, patch: &serde_json::Map<String, serde_json::Value>) -> Result<Settings> {
+    let mut v = serde_json::to_value(cur)?;
+    v.as_object_mut().expect("Settings is a struct").extend(patch.clone());
+    Ok(serde_json::from_value(v)?)
 }
 
 /// Control messages. Pair/Hello/Session travel in clear; the rest inside Noise.
@@ -180,14 +226,32 @@ enum Msg {
     Ping,
     /// Deltas (since this node's previous report) of its own Link's receive-side counters,
     /// sent every second so the peer's sender can steer bitrate/FEC (MASTER.md §3.5).
-    Report { received: u64, lost: u64, underruns: u64, jitter_ms: f32 },
+    /// For the delay readout (all absent from old peers, which ignore them): `ts` = the sender's
+    /// clock (ms), `echo` = the peer's last `ts` and how long (ms) it waited here (round trip =
+    /// now − ts − waited), `send_ms`/`recv_ms` = the sender's own sending/receiving part of the delay.
+    Report {
+        received: u64,
+        lost: u64,
+        underruns: u64,
+        jitter_ms: f32,
+        #[serde(default)]
+        ts: Option<u64>,
+        #[serde(default)]
+        echo: Option<(u64, u64)>,
+        #[serde(default)]
+        send_ms: Option<f32>,
+        #[serde(default)]
+        recv_ms: Option<f32>,
+    },
     /// Instead of `Link`: a one-request remote-configuration session (MASTER.md §3.6 M6b).
     Manage,
     #[serde(rename = "get_config")]
     GetConfig,
     Config(RemoteConfig),
+    /// `settings` as JSON, merged onto the current ones: fields an older peer doesn't know
+    /// (e.g. volume) keep their value.
     #[serde(rename = "set_settings")]
-    SetSettings { settings: Settings, #[serde(default)] name: Option<String> },
+    SetSettings { settings: serde_json::Map<String, serde_json::Value>, #[serde(default)] name: Option<String> },
     /// This side's own Music Mode setting, sent after the session starts and on every change
     /// (MASTER.md §3.7). Old peers never send it (= off) and ignore it. `name` = the sender's own
     /// device name (at session start and on a rename; absent from old peers).
@@ -212,6 +276,18 @@ struct Session {
     peer_music: bool, // the peer's last `Mode`
     mine: bool,       // this node dialed it (only the initiator auto-reconnects)
     recent: VecDeque<[u64; 3]>, // per-second (received, lost, underruns) of our Link, newest last
+    rtt_ms: Option<f32>, // control-channel round trip, from `Report` echoes
+    peer_ms: (Option<f32>, Option<f32>), // the peer's (sending, receiving) part of the delay
+}
+
+/// Push-to-talk state.
+#[derive(Default)]
+struct Ptt {
+    listener: Option<ptt::Listener>, // runs while a key is configured or being captured
+    talk: Talk,
+    of: (PttMode, Option<String>), // the mode and key id `talk` follows
+    capture: Option<mpsc::Sender<Result<PttKey, String>>>, // a `ptt_capture` waiting for a key
+    error: Option<String>,
 }
 
 /// How a session's control loop ended.
@@ -236,6 +312,7 @@ struct St {
     /// runs while this still equals the value it started with.
     retry: u64,
     retrying: Option<String>, // peer the retry loop is after
+    ptt: Ptt,
 }
 
 struct Inner {
@@ -280,7 +357,7 @@ impl Node {
         } else {
             (None, None)
         };
-        let st = St { cfg, pin: new_pin(), failures: 0, pairing_until: None, locked_until: None, found: HashMap::new(), session: None, error: None, vdev: Virtual::setup(), retry: 0, retrying: None };
+        let st = St { cfg, pin: new_pin(), failures: 0, pairing_until: None, locked_until: None, found: HashMap::new(), session: None, error: None, vdev: Virtual::setup(), retry: 0, retrying: None, ptt: Ptt::default() };
         let node = Node(Arc::new(Inner { dir, port, mdns: daemon, st: Mutex::new(st), wake: Condvar::new(), pending: Mutex::default(), pairing: Mutex::default(), dialing: Mutex::default(), starting: Mutex::default(), #[cfg(test)] hook: Mutex::default() }));
         if let Some(rx) = browse {
             let n = node.clone();
@@ -298,6 +375,7 @@ impl Node {
             if let Some(id) = st.cfg.last_peer.clone().filter(|_| st.cfg.settings.auto_reconnect) {
                 node.start_retry(&mut st, id);
             }
+            node.sync_ptt(&mut st);
         }
         Ok(node)
     }
@@ -308,6 +386,7 @@ impl Node {
         let old = {
             let mut st = self.st();
             self.cancel_retry(&mut st);
+            st.ptt.listener = None;
             st.session.take()
         };
         if let Some(s) = old {
@@ -375,7 +454,14 @@ impl Node {
             }
         }
         devices.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()).then(a.id.cmp(&b.id)));
-        let stats = st.session.as_ref().and_then(|s| s.link.as_ref()).map(Link::stats);
+        let stats = st.session.as_ref().and_then(|s| Some((s, s.link.as_ref()?))).map(|(s, link)| {
+            let ((send, recv), mut x) = (link.latency(), link.stats());
+            // an older peer doesn't say its sending part: a typical capture buffer plus a frame
+            let peer_send = s.peer_ms.0.unwrap_or(if x.music { 30.0 } else { 20.0 });
+            x.delay_in_ms = recv.map(|r| one_way(peer_send, s.rtt_ms, r));
+            x.delay_out_ms = send.zip(s.peer_ms.1).map(|(m, r)| one_way(m, s.rtt_ms, r));
+            x
+        });
         NodeState {
             name: st.cfg.name.clone(),
             pin: st.pin.clone(),
@@ -388,6 +474,8 @@ impl Node {
             current: st.cfg.current.clone(),
             error: st.error.clone(),
             virtual_error: st.vdev.error.clone(),
+            talking: st.ptt.talk.on(),
+            ptt_error: st.ptt.error.clone(),
         }
     }
 
@@ -462,6 +550,11 @@ impl Node {
         let _ = writeln!(t, "\n== Settings ==\nSend from: {}\nPlay to: {}", dev(&s.input, &ins), dev(&s.output, &outs));
         let _ = writeln!(t, "Channels: {}\nBitrate: {} kbps", if s.channels == 2 { "Stereo" } else { "Mono" }, s.bitrate / 1000);
         let _ = writeln!(t, "Music Mode: {}\nRun in background: {}\nRemote configuration: {}\nReconnect automatically: {}", on(s.music_mode), on(s.service), on(s.remote_config), on(s.auto_reconnect));
+        let key = s.ptt_key.as_ref().map_or(String::new(), |k| format!(" ({})", k.label));
+        let _ = writeln!(t, "Send volume: {}%{}\nReceive volume: {}%\nPush-to-talk: {:?}{key}", s.send_volume, if s.mute { ", muted" } else { "" }, s.recv_volume, s.ptt);
+        if let Some(e) = &st.ptt.error {
+            let _ = writeln!(t, "Push-to-talk problem: {e}");
+        }
         let _ = writeln!(t, "\n== Audio devices ==\nSend from: {}\nPlay to: {}", names(&ins).join(" | "), names(&outs).join(" | "));
         let _ = writeln!(t, "\n== Paired devices ==");
         let conn = st.session.as_ref().map(|s| s.peer_id.as_str());
@@ -717,9 +810,9 @@ impl Node {
         save(&self.0.dir, &st.cfg)
     }
 
-    /// Saves the settings; a running link reconnects (fresh keys) to apply audio changes.
-    /// A change to `service` installs/removes the login agent first. Music Mode switches live:
-    /// the peer is told, no reconnect.
+    /// Saves the settings; a running link reconnects (fresh keys) to apply device, bitrate and
+    /// channel changes. A change to `service` installs/removes the login agent first. Music Mode,
+    /// volume, mute and push-to-talk apply live (the peer is told about Music Mode), no reconnect.
     pub fn set_settings(&self, s: Settings) -> Result<()> {
         self.save_settings(|_| Ok(s.clone()), None)
     }
@@ -728,21 +821,15 @@ impl Node {
     /// current settings under the lock that writes, so a change made meanwhile to another field
     /// (e.g. by the other computer) isn't undone.
     pub fn patch_settings(&self, patch: &serde_json::Map<String, serde_json::Value>) -> Result<()> {
-        self.save_settings(
-            |cur| {
-                let mut v = serde_json::to_value(cur)?;
-                v.as_object_mut().expect("Settings is a struct").extend(patch.clone());
-                Ok(serde_json::from_value(v)?)
-            },
-            None,
-        )
+        self.save_settings(|cur| merge(cur, patch), None)
     }
 
     /// `set_settings`, or with `from`, paired device `from`'s remote save: refused if remote
     /// configuration is off, `service` and `remote_config` stay as they are, and if `from` isn't
     /// the current connection only its saved audio changes. Decided under the lock that writes,
     /// so a local change made meanwhile isn't undone.
-    /// `new` makes the settings to save from the current ones.
+    /// `new` makes the settings to save from the current ones (for a remote save from a peer
+    /// that isn't the current connection: with that peer's saved audio).
     fn save_settings(&self, new: impl Fn(&Settings) -> Result<Settings>, from: Option<&str>) -> Result<()> {
         let service = {
             let cur = &self.st().cfg.settings;
@@ -754,20 +841,22 @@ impl Node {
         let (running, notify) = {
             let mut st = self.st();
             let old = st.cfg.settings.clone();
-            let mut s = new(&old)?;
-            ensure!(matches!(s.channels, 1 | 2), "channels must be 1 or 2");
-            if let Some(id) = from {
+            let other = from.filter(|id| st.cfg.current.as_deref() != Some(*id));
+            let saved = other.and_then(|id| st.cfg.peers.iter().find(|p| p.id == id)?.audio.clone());
+            let mut s = new(&saved.map_or_else(|| old.clone(), |a| a.apply(old.clone())))?;
+            check(&s)?;
+            if from.is_some() {
                 ensure!(old.remote_config, "remote configuration is off");
                 (s.service, s.remote_config) = (old.service, old.remote_config);
-                if st.cfg.current.as_deref() != Some(id) {
-                    if let Some(p) = st.cfg.peers.iter_mut().find(|p| p.id == id) {
-                        p.audio = Some(Audio::of(&s));
-                    }
-                    s = Audio::of(&old).apply(s);
+            }
+            if let Some(id) = other {
+                if let Some(p) = st.cfg.peers.iter_mut().find(|p| p.id == id) {
+                    p.audio = Some(Audio::of(&s));
                 }
+                s = Audio::of(&old).apply(s);
             }
             let music = s.music_mode;
-            let audio_changed = Settings { service: s.service, remote_config: s.remote_config, music_mode: music, auto_reconnect: s.auto_reconnect, ..old } != s;
+            let audio_changed = restarts(&old, &s);
             if !s.auto_reconnect && st.retrying.is_some() {
                 self.cancel_retry(&mut st);
             }
@@ -778,7 +867,8 @@ impl Node {
             }
             st.cfg.settings = s;
             save(&self.0.dir, &st.cfg)?;
-            apply_mode(&st);
+            self.sync_ptt(&mut st);
+            apply_live(&st);
             let sess = st.session.as_ref();
             (sess.filter(|_| audio_changed).map(|s| (s.peer_id.clone(), s.addr)), sess.filter(|_| !audio_changed && old.music_mode != music).map(|s| (s.ctl.clone(), music)))
         };
@@ -811,6 +901,7 @@ impl Node {
     /// Changes paired device `id`'s settings, except its `service` and `remote_config`; `name`
     /// renames it too, when given (MASTER.md §3.6 device rename).
     pub fn remote_set(&self, id: &str, settings: Settings, name: Option<String>) -> Result<()> {
+        let serde_json::Value::Object(settings) = serde_json::to_value(settings)? else { bail!("settings aren't an object") };
         match self.manage(id, &Msg::SetSettings { settings, name })? {
             Msg::Ok => Ok(()),
             _ => bail!("unexpected reply"),
@@ -844,6 +935,95 @@ impl Node {
         let p = st.cfg.peers.iter_mut().find(|p| p.id == id).ok_or_else(|| anyhow!("not paired with that device"))?;
         p.addr = Some(a);
         save(&self.0.dir, &st.cfg)
+    }
+
+    /// Waits (up to 10 s) for the next key or button press and returns it, for the push-to-talk
+    /// "Set button" (the window then saves it with `patch_settings`).
+    pub fn ptt_capture(&self) -> Result<PttKey> {
+        let (tx, rx) = mpsc::channel();
+        {
+            let mut st = self.st();
+            ensure!(st.ptt.capture.is_none(), "already waiting for a button");
+            st.ptt.capture = Some(tx);
+            self.sync_ptt(&mut st);
+            if st.ptt.listener.is_none() {
+                st.ptt.capture = None;
+                bail!("{}", st.ptt.error.clone().unwrap_or_default());
+            }
+        }
+        let r = rx.recv_timeout(CAPTURE);
+        let mut st = self.st();
+        st.ptt.capture = None;
+        self.sync_ptt(&mut st);
+        match r {
+            Ok(r) => r.map_err(|e| anyhow!("{e}")),
+            Err(_) => Err(match &st.ptt.error {
+                Some(e) => anyhow!("{e}"),
+                None => anyhow!("no key or button was pressed"),
+            }),
+        }
+    }
+
+    /// Runs the key listener while push-to-talk has a key (or one is being captured), and
+    /// starts the talk state over when the mode or key changes.
+    fn sync_ptt(&self, st: &mut St) {
+        let s = &st.cfg.settings;
+        let of = (s.ptt, s.ptt_key.as_ref().map(|k| k.id.clone()));
+        if st.ptt.of != of {
+            st.ptt.talk = Talk::new(of.0);
+            st.ptt.of = of;
+        }
+        let want = (st.ptt.of.0 != PttMode::Off && st.ptt.of.1.is_some()) || st.ptt.capture.is_some();
+        if !want {
+            (st.ptt.listener, st.ptt.error) = (None, None);
+        } else if st.ptt.listener.is_none() {
+            let (tx, rx) = mpsc::channel();
+            let n = self.clone();
+            let r = ptt::listen(tx).and_then(|l| {
+                std::thread::Builder::new().name("capralink-ptt".into()).spawn(move || n.ptt_loop(rx))?;
+                Ok(l)
+            });
+            match r {
+                Ok(l) => st.ptt.listener = Some(l),
+                Err(e) => st.ptt.error = Some(format!("Push-to-talk can't start: {e}")),
+            }
+        }
+    }
+
+    /// Follows the listener's keys until it stops: a capture takes the next press; the
+    /// push-to-talk key drives `Talk`, whose changes reach the link and play the chirp.
+    fn ptt_loop(&self, rx: mpsc::Receiver<Ev>) {
+        loop {
+            let wait = self.st().ptt.talk.deadline().map(|d| d.saturating_duration_since(Instant::now()));
+            let ev = match wait {
+                Some(w) => rx.recv_timeout(w),
+                None => rx.recv().map_err(|_| RecvTimeoutError::Disconnected),
+            };
+            let mut st = self.st();
+            let was = st.ptt.talk.on();
+            match ev {
+                Ok(Ev::Status(e)) => {
+                    if let Some((e, c)) = e.clone().zip(st.ptt.capture.take()) {
+                        let _ = c.send(Err(e));
+                    }
+                    st.ptt.error = e;
+                }
+                Ok(Ev::Key(k, true)) if st.ptt.capture.is_some() => {
+                    let _ = st.ptt.capture.take().map(|c| c.send(Ok(k)));
+                }
+                Ok(Ev::Key(k, down)) if st.ptt.of.1.as_deref() == Some(k.id.as_str()) => match down {
+                    true => st.ptt.talk.press(),
+                    false => st.ptt.talk.release(Instant::now()),
+                },
+                Ok(Ev::Key(..)) | Err(RecvTimeoutError::Timeout) => {}
+                Err(RecvTimeoutError::Disconnected) => return,
+            }
+            st.ptt.talk.tick(Instant::now());
+            if st.ptt.talk.on() != was {
+                apply_live(&st);
+                chirp(&st, !was);
+            }
+        }
     }
 
     /// One request over its own management session (a separate connection; any audio session
@@ -924,8 +1104,8 @@ impl Node {
             let st = self.st();
             match (link, refused(&st, gen)) {
                 (Ok(l), None) => {
-                    if Audio::of(&st.cfg.settings) == Audio::of(&settings) {
-                        break (st, l);
+                    if !restarts(&st.cfg.settings, &settings) {
+                        break (st, l); // volume, mute, push-to-talk: `apply_live` below
                     }
                     // the audio settings changed while it started: start again with the new ones
                     settings = st.cfg.settings.clone();
@@ -946,7 +1126,7 @@ impl Node {
             }
         };
         self.cancel_retry(&mut st);
-        st.session = Some(Session { peer_id: id.to_string(), addr, link, ctl: ctl.clone(), peer_music: false, mine: own.is_some(), recent: VecDeque::new() });
+        st.session = Some(Session { peer_id: id.to_string(), addr, link, ctl: ctl.clone(), peer_music: false, mine: own.is_some(), recent: VecDeque::new(), rtt_ms: None, peer_ms: (None, None) });
         log(&format!("session started with {} at {addr}, {}", peer_name(&st.cfg, id), if own.is_some() { "dialed from here" } else { "dialed by the other computer" }));
         st.error = None;
         set_addr(&mut st.cfg, id, addr.to_string());
@@ -954,7 +1134,8 @@ impl Node {
         if let Err(e) = save(&self.0.dir, &st.cfg) {
             st.error = Some(format!("{e:#}"));
         }
-        apply_mode(&st);
+        self.sync_ptt(&mut st); // this peer's push-to-talk settings
+        apply_live(&st);
         drop(st);
         let (n, id) = (self.clone(), id.to_string());
         std::thread::Builder::new().name("capralink-session".into()).spawn(move || n.serve(ctl, &id))?;
@@ -970,15 +1151,24 @@ impl Node {
         let mut last_counts = (0u64, 0u64, 0u64);
         let (mut last_rx, mut last_report, mut last_log) = (Instant::now(), Instant::now(), Instant::now());
         let mut rebuilding = false; // a reconnect for `Failure::Rebuild` is under way
+        let clock = Instant::now(); // `Report::ts`
+        let ms = || clock.elapsed().as_millis() as u64;
+        let mut their_ts: Option<(u64, Instant)> = None; // the peer's last `ts`, to echo
         let end = loop {
             match ctl.recv() {
                 Ok(Some(Msg::Stop)) => break End::Stop,
-                Ok(Some(Msg::Report { received, lost, underruns, .. })) => {
+                Ok(Some(Msg::Report { received, lost, underruns, ts, echo, send_ms, recv_ms, .. })) => {
                     last_rx = Instant::now();
-                    rate.set_ceiling({
-                        let st = self.st();
+                    their_ts = ts.map(|t| (t, last_rx)).or(their_ts);
+                    let ceil = {
+                        let mut st = self.st();
+                        if let Some(s) = st.session.as_mut().filter(|s| Arc::ptr_eq(&s.ctl, &ctl)) {
+                            s.rtt_ms = echo.map(|(t, waited)| ms().saturating_sub(t).saturating_sub(waited) as f32).or(s.rtt_ms);
+                            s.peer_ms = (send_ms, recv_ms);
+                        }
                         ceiling(st.cfg.settings.bitrate, music(&st))
-                    });
+                    };
+                    rate.set_ceiling(ceil);
                     let (bitrate, loss_perc) = rate.on_report(received, lost, underruns);
                     self.apply_rate(&ctl, bitrate, loss_perc);
                 }
@@ -988,7 +1178,7 @@ impl Node {
                     if let Some(s) = st.session.as_mut().filter(|s| Arc::ptr_eq(&s.ctl, &ctl)) {
                         s.peer_music = music;
                     }
-                    apply_mode(&st);
+                    apply_live(&st);
                     let name = name.map(|n| clean_name(n.trim())).filter(|n| !n.is_empty());
                     if let Some((p, n)) = st.cfg.peers.iter_mut().find(|p| p.id == peer).zip(name).filter(|(p, n)| p.name != *n) {
                         p.name = n;
@@ -1042,7 +1232,10 @@ impl Node {
                     break End::Device(f);
                 }
                 let m = match self.link_delta(&ctl, &mut last_counts) {
-                    Some((received, lost, underruns, jitter_ms)) => Msg::Report { received, lost, underruns, jitter_ms },
+                    Some(((received, lost, underruns, jitter_ms), (send_ms, recv_ms))) => {
+                        let echo = their_ts.take().map(|(t, at)| (t, at.elapsed().as_millis() as u64));
+                        Msg::Report { received, lost, underruns, jitter_ms, ts: Some(ms()), echo, send_ms, recv_ms }
+                    }
                     None => Msg::Ping, // no link (e.g. tests): keepalive only
                 };
                 if ctl.send(&m).is_err() {
@@ -1094,12 +1287,14 @@ impl Node {
         let _ = ctl.send(&m);
     }
 
-    /// This session's own receive-side counters, as deltas since `last` (updated in place).
-    /// `None` if the session moved on (or has no Link, e.g. under test).
+    /// This session's own receive-side counters, as deltas since `last` (updated in place), and
+    /// its `Link::latency`. `None` if the session moved on (or has no Link, e.g. under test).
     /// Also keeps the last `QUALITY_WINDOW` deltas for `Quality`.
-    fn link_delta(&self, ctl: &Arc<Ctl>, last: &mut (u64, u64, u64)) -> Option<(u64, u64, u64, f32)> {
+    #[allow(clippy::type_complexity)]
+    fn link_delta(&self, ctl: &Arc<Ctl>, last: &mut (u64, u64, u64)) -> Option<((u64, u64, u64, f32), (Option<f32>, Option<f32>))> {
         let mut st = self.st();
         let s = st.session.as_mut().filter(|s| Arc::ptr_eq(&s.ctl, ctl))?;
+        let latency = s.link.as_ref()?.latency();
         let (r, l, u, jitter_ms) = s.link.as_ref()?.report_counters();
         let delta = (r.saturating_sub(last.0), l.saturating_sub(last.1), u.saturating_sub(last.2));
         *last = (r, l, u);
@@ -1107,7 +1302,7 @@ impl Node {
         if s.recent.len() > QUALITY_WINDOW {
             s.recent.pop_front();
         }
-        Some((delta.0, delta.1, delta.2, jitter_ms))
+        Some(((delta.0, delta.1, delta.2, jitter_ms), latency))
     }
 
     /// One log line on how this session's audio is doing.
@@ -1272,32 +1467,34 @@ impl Node {
             (st.cfg.name.clone(), st.cfg.settings.clone(), theirs)
         };
         let peer = peer_name(&self.st().cfg, id);
+        let remote_config = local.remote_config;
+        let seen = match theirs { Some(a) => a.apply(local), None => local }; // what `GetConfig` shows `id`
         let reply = match req {
-            _ if !local.remote_config => Msg::Error { message: format!("remote configuration is off on {name}") },
+            _ if !remote_config => Msg::Error { message: format!("remote configuration is off on {name}") },
             Some(Msg::Diagnostics { redact }) => {
                 log(&format!("sending diagnostics to {peer}"));
                 Msg::Text { text: self.diagnostics(redact), more: false }
             }
             Some(Msg::GetConfig) => {
                 let (ins, outs) = (crate::input_devices(), crate::output_devices());
-                let settings = match theirs { Some(a) => a.apply(local), None => local };
-                Msg::Config(RemoteConfig { name, settings, inputs: names(&ins), outputs: names(&outs), input_devices: ins, output_devices: outs })
+                Msg::Config(RemoteConfig { name, settings: seen, inputs: names(&ins), outputs: names(&outs), input_devices: ins, output_devices: outs })
             }
             // `service` and `remote_config` only change locally
             Some(Msg::SetSettings { settings, name: new_name }) => {
                 log(&format!("{peer} changed this computer's settings{}", if new_name.is_some() { " and name" } else { "" }));
                 // validated before anything is renamed or stored for a peer that isn't connected
-                let r = match new_name {
-                    _ if !matches!(settings.channels, 1 | 2) => Err(anyhow!("channels must be 1 or 2")),
-                    // checked again right before renaming: it may have been turned off since the request arrived
-                    Some(_) if !self.st().cfg.settings.remote_config => Err(anyhow!("remote configuration is off")),
-                    Some(n) => self.set_name(&n),
-                    None => Ok(()),
-                }
-                .and_then(|()| {
+                let r = merge(&seen, &settings)
+                    .and_then(|s| check(&s))
+                    .and_then(|()| match new_name {
+                        // checked again right before renaming: it may have been turned off since the request arrived
+                        Some(_) if !self.st().cfg.settings.remote_config => Err(anyhow!("remote configuration is off")),
+                        Some(n) => self.set_name(&n),
+                        None => Ok(()),
+                    })
+                    .and_then(|()| {
                     #[cfg(test)]
                     self.pause("remote save");
-                    self.save_settings(|_| Ok(settings.clone()), Some(id))
+                    self.save_settings(|cur| merge(cur, &settings), Some(id))
                 });
                 match r {
                     Ok(()) => Msg::Ok,
@@ -1354,11 +1551,32 @@ fn music(st: &St) -> bool {
     st.cfg.settings.music_mode || st.session.as_ref().is_some_and(|s| s.peer_music)
 }
 
-/// Pushes the effective Music Mode to the running Link.
-fn apply_mode(st: &St) {
+/// Pushes the effective Music Mode, the volumes, mute and push-to-talk to the running Link.
+fn apply_live(st: &St) {
     if let Some(link) = st.session.as_ref().and_then(|s| s.link.as_ref()) {
+        let s = &st.cfg.settings;
         link.set_music(music(st));
+        link.set_volume(s.send_volume, s.recv_volume, s.mute || (s.ptt != PttMode::Off && !st.ptt.talk.on()));
     }
+}
+
+/// Plays the push-to-talk chirp: in the session's playback, else on the default output device.
+fn chirp(st: &St, start: bool) {
+    if st.session.as_ref().and_then(|s| s.link.as_ref()).is_some_and(|l| l.chirp(start)) || cfg!(test) {
+        return;
+    }
+    let wave: fn(f32) -> f32 = if start { |t| ptt::chirp(true, t) } else { |t| ptt::chirp(false, t) };
+    let _ = std::thread::Builder::new().name("capralink-chirp".into()).spawn(move || {
+        if let Err(e) = crate::play(&None, ptt::CHIRP_SECS, wave) {
+            log(&format!("push-to-talk sound: {e:#}"));
+        }
+    });
+}
+
+/// One-way delay estimate, ms: the sender's part (capture + frame), half the round trip
+/// (0 if unknown), the receiver's part (playout buffer + playback).
+fn one_way(send_ms: f32, rtt_ms: Option<f32>, recv_ms: f32) -> u32 {
+    (send_ms + rtt_ms.unwrap_or(0.0) / 2.0 + recv_ms).round().max(0.0) as u32
 }
 
 /// A session's audio quality over its last `QUALITY_WINDOW` reports, from its live stats.
@@ -2480,7 +2698,8 @@ mod tests {
         link(&l);
         assert!(refused(&l));
         m.send(&Msg::Manage).unwrap();
-        m.send(&Msg::SetSettings { settings: Settings { music_mode: true, ..b.state().settings }, name: Some("Taken over".into()) }).unwrap();
+        let settings = serde_json::json!({ "music_mode": true }).as_object().unwrap().clone();
+        m.send(&Msg::SetSettings { settings, name: Some("Taken over".into()) }).unwrap();
         assert!(refused(&m));
         assert!(!is(&b, |d| d.connected) && b.state().current.is_none() && b.state().name != "Taken over" && !b.state().settings.music_mode);
 
@@ -2634,5 +2853,143 @@ mod tests {
         drop(a);
         let _ = std::fs::remove_dir_all(adir);
         let _ = std::fs::remove_dir_all(bdir);
+    }
+
+    fn patch(n: &Node, v: serde_json::Value) -> Result<()> {
+        n.patch_settings(v.as_object().unwrap())
+    }
+
+    fn f13() -> PttKey {
+        PttKey { id: "key:105".into(), label: "F13".into() }
+    }
+
+    #[test]
+    fn volume_mute_and_ptt_settings_load_from_old_files_and_validate() {
+        // 0.2.x config: no volume, mute or push-to-talk, here or in a peer's saved audio
+        let cfg: Config = serde_json::from_str(
+            r#"{"device_id":"a","name":"b","bitrate":48000,"channels":1,
+                "peers":[{"id":"1","name":"c","secret":"00","audio":{"input":null,"output":null,"bitrate":32000,"channels":2}}]}"#,
+        )
+        .unwrap();
+        let s = &cfg.settings;
+        assert_eq!((s.send_volume, s.recv_volume, s.mute, s.ptt, &s.ptt_key), (100, 100, false, PttMode::Off, &None));
+        let a = cfg.peers[0].audio.clone().unwrap();
+        assert_eq!((a.send_volume, a.recv_volume, a.mute, a.ptt, a.bitrate), (100, 100, false, PttMode::Off, 32_000));
+        let json = serde_json::to_value(Settings { ptt: PttMode::Toggle, ptt_key: Some(f13()), ..Settings::default() }).unwrap();
+        assert_eq!((json["ptt"].as_str(), &json["ptt_key"]), (Some("toggle"), &serde_json::json!({ "id": "key:105", "label": "F13" })));
+
+        let (n, dir) = node();
+        for (bad, why) in [
+            (serde_json::json!({ "send_volume": 151 }), "volume must be 0 to 150%"),
+            (serde_json::json!({ "recv_volume": 200 }), "volume must be 0 to 150%"),
+            (serde_json::json!({ "ptt": "hold" }), "pick a push-to-talk button first"),
+            (serde_json::json!({ "ptt": "loud" }), "unknown variant"),
+        ] {
+            let e = patch(&n, bad).unwrap_err().to_string();
+            assert!(e.contains(why), "{e}");
+        }
+        assert_eq!(n.state().settings, Settings::default());
+        patch(&n, serde_json::json!({ "send_volume": 150, "recv_volume": 0, "mute": true, "ptt": "hold", "ptt_key": f13() })).unwrap();
+        let s = load(&dir).unwrap().settings;
+        assert_eq!((s.send_volume, s.recv_volume, s.mute, s.ptt, s.ptt_key), (150, 0, true, PttMode::Hold, Some(f13())));
+        assert!(n.st().ptt.listener.is_some(), "a key: listening");
+        patch(&n, serde_json::json!({ "ptt": "off" })).unwrap();
+        assert!(n.st().ptt.listener.is_none(), "off: not listening");
+        n.shutdown();
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn volume_mute_and_ptt_apply_live_and_are_per_connection() {
+        let ((a, adir), (b, bdir), bid) = connected();
+        let ctl = |n: &Node| n.st().session.as_ref().unwrap().ctl.clone();
+        let ca = ctl(&a);
+        patch(&a, serde_json::json!({ "send_volume": 40, "recv_volume": 120, "mute": true, "ptt": "toggle", "ptt_key": f13() })).unwrap();
+        assert!(Arc::ptr_eq(&ca, &ctl(&a)), "no reconnect");
+        let saved = peers(&adir).into_iter().find(|p| p.id == bid).unwrap().audio.unwrap();
+        assert_eq!((saved.send_volume, saved.recv_volume, saved.mute, saved.ptt), (40, 120, true, PttMode::Toggle), "saved for b");
+        patch(&a, serde_json::json!({ "bitrate": 16_000 })).unwrap();
+        assert!(!Arc::ptr_eq(&ca, &ctl(&a)), "a bitrate change still reconnects");
+
+        // b configures a remotely, as 0.2.x does: whole settings without the new fields
+        a.set_settings(Settings { remote_config: true, ..a.state().settings }).unwrap();
+        let aid = a.st().cfg.device_id.clone();
+        let old = serde_json::json!({ "input": null, "output": null, "bitrate": 24_000, "channels": 1, "service": false, "remote_config": false, "music_mode": false, "auto_reconnect": true });
+        let m = b.manage(&aid, &Msg::SetSettings { settings: old.as_object().unwrap().clone(), name: None }).unwrap();
+        assert!(matches!(m, Msg::Ok));
+        let s = a.state().settings;
+        assert_eq!((s.bitrate, s.send_volume, s.recv_volume, s.mute, s.ptt), (24_000, 40, 120, true, PttMode::Toggle), "fields it doesn't know are kept");
+        let e = b.remote_set(&aid, Settings { send_volume: 151, ..s.clone() }, None).unwrap_err().to_string();
+        assert!(e.contains("volume must be"), "{e}");
+        let _ = std::fs::remove_dir_all(adir);
+        let _ = std::fs::remove_dir_all(bdir);
+    }
+
+    #[test]
+    fn push_to_talk_follows_the_key_and_capture_takes_the_next_press() {
+        let (n, dir) = node();
+        let send = |down| n.st().ptt.listener.as_ref().unwrap().tx.send(Ev::Key(f13(), down)).unwrap();
+        let talking = || n.state().talking;
+        // capture: the next press, whatever push-to-talk is set to
+        let n2 = n.clone();
+        let got = std::thread::spawn(move || n2.ptt_capture());
+        wait(|| n.st().ptt.capture.is_some());
+        assert!(n.ptt_capture().unwrap_err().to_string().contains("already waiting"));
+        n.st().ptt.listener.as_ref().unwrap().tx.send(Ev::Key(f13(), false)).unwrap(); // a release isn't a press
+        send(true);
+        assert_eq!(got.join().unwrap().unwrap(), f13());
+        assert!(n.st().ptt.listener.is_none(), "stops listening once captured (no key set)");
+        assert!(n.ptt_capture().unwrap_err().to_string().contains("no key or button was pressed"), "times out");
+
+        patch(&n, serde_json::json!({ "ptt": "hold", "ptt_key": f13() })).unwrap();
+        send(true);
+        wait(talking);
+        send(false);
+        let t = Instant::now();
+        wait(|| !talking());
+        assert!(t.elapsed() >= ptt::TAIL - Duration::from_millis(20), "the release tail");
+        let other = PttKey { id: "key:9".into(), label: "V".into() };
+        n.st().ptt.listener.as_ref().unwrap().tx.send(Ev::Key(other, true)).unwrap();
+        std::thread::sleep(Duration::from_millis(50));
+        assert!(!talking(), "another key does nothing");
+
+        patch(&n, serde_json::json!({ "ptt": "toggle" })).unwrap();
+        send(true);
+        send(false);
+        wait(talking);
+        send(true);
+        wait(|| !talking());
+        send(false);
+        // a listener problem shows, and clears
+        n.st().ptt.listener.as_ref().unwrap().tx.send(Ev::Status(Some("no permission".into()))).unwrap();
+        wait(|| n.state().ptt_error.as_deref() == Some("no permission"));
+        n.st().ptt.listener.as_ref().unwrap().tx.send(Ev::Status(None)).unwrap();
+        wait(|| n.state().ptt_error.is_none());
+        n.shutdown();
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn delay_estimate_and_report_wire_compat() {
+        assert_eq!(one_way(20.0, Some(3.0), 31.4), 53, "capture + frame, half the round trip, buffer + playback");
+        assert_eq!(one_way(20.0, None, 10.0), 30, "round trip unknown: LAN, counted as 0");
+        // a 0.2.x report parses (no delay fields)...
+        let m: Msg = serde_json::from_str(r#"{"type":"report","received":5,"lost":0,"underruns":0,"jitter_ms":1.5}"#).unwrap();
+        assert!(matches!(m, Msg::Report { received: 5, ts: None, echo: None, send_ms: None, recv_ms: None, .. }));
+        // ...and 0.2.x reads the new one (unknown fields ignored)
+        #[derive(Deserialize)]
+        #[allow(dead_code)]
+        #[serde(tag = "type", rename_all = "lowercase")]
+        enum Old {
+            Report { received: u64, lost: u64, underruns: u64, jitter_ms: f32 },
+        }
+        let new = serde_json::to_vec(&Msg::Report { received: 5, lost: 1, underruns: 0, jitter_ms: 2.0, ts: Some(1000), echo: Some((900, 40)), send_ms: Some(20.0), recv_ms: Some(30.0) }).unwrap();
+        assert!(matches!(serde_json::from_slice(&new), Ok(Old::Report { received: 5, lost: 1, .. })));
+        let back: Msg = serde_json::from_slice(&new).unwrap();
+        assert!(matches!(back, Msg::Report { echo: Some((900, 40)), recv_ms: Some(30.0), .. }));
+        // so does the new NodeState/Stats JSON the window gets from an older engine
+        let st: Stats = serde_json::from_str(r#"{"sent":0,"received":0,"lost":0,"fec_recovered":0,"underruns":0,"buffer_ms":0,"target_ms":0,
+            "in_peak":0,"out_peak":0,"tx_gap_ms":0,"rx_gap_ms":0,"bitrate":0,"complexity":0}"#).unwrap();
+        assert_eq!((st.delay_in_ms, st.delay_out_ms), (None, None));
     }
 }

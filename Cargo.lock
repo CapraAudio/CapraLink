@@ -485,6 +485,7 @@ dependencies = [
  "snow",
  "spake2",
  "time",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
