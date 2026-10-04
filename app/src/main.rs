@@ -106,8 +106,8 @@ const RELEASES: &str = "https://github.com/CapraAudio/CapraLink/releases/latest"
 
 /// This build's version (the Cargo/Tauri version), shown in the window's corner.
 #[tauri::command]
-fn version() -> &'static str {
-    env!("CARGO_PKG_VERSION")
+fn version() -> String {
+    capralink_engine::version()
 }
 
 /// The update this install can apply in place, if any. Not for Linux deb/rpm (the updater only

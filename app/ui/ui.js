@@ -726,12 +726,12 @@ async function checkUpdate(current) {
   } catch (_) {} // offline: just the version
 }
 
-// "v1.2.10" > "1.2.9"
+// "v1.2.10" > "1.2.9"; "0.3.0" > "0.3.0.alpha-build.4"
 function newer(a, b) {
   const p = (v) => v.replace(/^v/, '').split('.').map(Number);
   const [x, y] = [p(a), p(b)];
   for (let i = 0; i < 3; i++) if ((x[i] || 0) !== (y[i] || 0)) return (x[i] || 0) > (y[i] || 0);
-  return false;
+  return b.includes('alpha') && !a.includes('alpha'); // a test build is older than its release
 }
 
 (async function init() {

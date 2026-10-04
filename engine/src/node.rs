@@ -378,7 +378,7 @@ impl Node {
                 }
             })?;
         }
-        log(&format!("CapraLink {} started on {} {}, port {port}", env!("CARGO_PKG_VERSION"), std::env::consts::OS, std::env::consts::ARCH));
+        log(&format!("CapraLink {} started on {} {}, port {port}", crate::version(), std::env::consts::OS, std::env::consts::ARCH));
         let n = node.clone();
         std::thread::Builder::new().name("capralink-ctl".into()).spawn(move || n.accept(listener))?;
         {
@@ -547,7 +547,7 @@ impl Node {
         let (ins, outs, checks) = (crate::input_devices(), crate::output_devices(), self.checks());
         let mut t = String::new();
         let st = self.st();
-        let _ = writeln!(t, "CapraLink {} diagnostics, {}", env!("CARGO_PKG_VERSION"), crate::log::now());
+        let _ = writeln!(t, "CapraLink {} diagnostics, {}", crate::version(), crate::log::now());
         let _ = writeln!(t, "System: {} ({})", crate::os_version(), std::env::consts::ARCH);
         if !redact {
             let _ = writeln!(t, "This computer: {}", st.cfg.name);

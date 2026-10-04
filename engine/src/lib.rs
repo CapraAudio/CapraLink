@@ -36,6 +36,13 @@ use std::time::{Duration, Instant};
 
 /// Settings device names that mean the CapraLink virtual devices (MASTER.md §3.4).
 /// On macOS the drivers carry these names; on Linux `label` maps the Pulse devices to them.
+/// This build's version as shown to people: the release version, plus ".alpha-build.N" on test
+/// builds (CI sets CAPRALINK_BUILD on everything that isn't a release tag).
+pub fn version() -> String {
+    let v = env!("CARGO_PKG_VERSION");
+    option_env!("CAPRALINK_BUILD").map_or_else(|| v.to_string(), |b| format!("{v}.{b}"))
+}
+
 pub const VIRTUAL_OUTPUT: &str = "CapraLink Output";
 pub const VIRTUAL_INPUT: &str = "CapraLink Input";
 
