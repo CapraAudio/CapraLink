@@ -671,7 +671,7 @@ impl Node {
             _ => bail!("unexpected reply"),
         };
         check_id(&id)?;
-        let secret = pake(&mut s, pin, true, &my_id, &id).map_err(|_| anyhow!("pairing failed — check the PIN"))?;
+        let (secret, _) = pake(&mut s, pin, true, &my_id, &id).map_err(|_| anyhow!("pairing failed — check the PIN"))?;
         let mut st = self.st();
         add_peer(&mut st.cfg, &id, &name, &secret, Some(addr));
         save(&self.0.dir, &st.cfg)?;
@@ -1374,16 +1374,14 @@ impl Node {
                 }
                 p.push(ip);
             }
-            let (authed, rx) = mpsc::channel::<()>();
-            let n = self.clone();
+            let (stop, rx) = mpsc::channel::<()>();
+            let authed = Slot { node: self.clone(), ip, _stop: stop };
             let watchdog = move || {
                 if rx.recv_timeout(AUTH_DEADLINE) == Err(RecvTimeoutError::Timeout) {
                     let _ = s2.shutdown(Shutdown::Both);
                 }
-                n.release(ip);
             };
             if std::thread::Builder::new().name("capralink-auth".into()).spawn(watchdog).is_err() {
-                self.release(ip);
                 continue;
             }
             let n = self.clone();
@@ -1406,9 +1404,9 @@ impl Node {
         }
     }
 
-    fn incoming(&self, mut s: TcpStream, authed: mpsc::Sender<()>) -> Result<()> {
+    fn incoming(&self, mut s: TcpStream, authed: Slot) -> Result<()> {
         match recv_msg(&mut s)? {
-            Msg::Pair { id, name, port } => self.on_pair(s, &id, &name, port),
+            Msg::Pair { id, name, port } => self.on_pair(s, &id, &name, port, authed),
             Msg::Session { id } => self.on_session(s, &id, authed),
             _ => bail!("unexpected hello"),
         }
@@ -1416,7 +1414,7 @@ impl Node {
 
     /// Answers a PIN attempt only while the pairing window is open and not locked, one at a time.
     /// A wrong PIN rotates the PIN and locks pairing (`LOCK_FIRST`, doubling, up to `LOCK_MAX`).
-    fn on_pair(&self, mut s: TcpStream, id: &str, name: &str, port: Option<u16>) -> Result<()> {
+    fn on_pair(&self, mut s: TcpStream, id: &str, name: &str, port: Option<u16>, authed: Slot) -> Result<()> {
         check_id(id)?;
         let name = &clean_name(name); // also keeps the log one line per entry
         let addr = match port {
@@ -1441,6 +1439,7 @@ impl Node {
         };
         if let Some(message) = refused {
             log(&format!("pairing attempt from {name} refused: {message}"));
+            drop((one_at_a_time, authed)); // free before the peer reads the refusal and retries
             send_msg(&mut s, &Msg::Error { message: message.clone() })?;
             bail!("{message}");
         }
@@ -1448,11 +1447,15 @@ impl Node {
         let r = pake(&mut s, &pin, false, id, &my_id);
         let mut st = self.st();
         match r {
-            Ok(secret) => {
+            Ok((secret, reply)) => {
                 log(&format!("paired with {name} [{}] (it entered this computer's PIN)", short(id)));
                 add_peer(&mut st.cfg, id, name, &secret, addr);
                 (st.pin, st.failures, st.error, st.pairing_until, st.locked_until) = (new_pin(), 0, None, None, None);
-                save(&self.0.dir, &st.cfg)
+                save(&self.0.dir, &st.cfg)?;
+                // done here before the peer can finish: its next connection finds the pairing
+                // stored, pairing free and this connection's slot released
+                drop((st, one_at_a_time, authed));
+                send(&mut s, &reply)
             }
             Err(e) => {
                 st.failures += 1;
@@ -1464,7 +1467,7 @@ impl Node {
         }
     }
 
-    fn on_session(&self, mut s: TcpStream, id: &str, authed: mpsc::Sender<()>) -> Result<()> {
+    fn on_session(&self, mut s: TcpStream, id: &str, authed: Slot) -> Result<()> {
         let secret = secret(&self.st().cfg, id).ok_or_else(|| anyhow!("unknown device"))?;
         let (ctl, keys) = handshake(&mut s, &secret, false)?;
         // the connection deadline (`authed` still alive) also covers the first request, so an
@@ -1489,7 +1492,7 @@ impl Node {
     /// Answers one remote-configuration request from peer `id`. Its audio settings are this
     /// computer's settings for sessions with `id` (MASTER.md §3.10); the current session restarts
     /// only if it is with `id`.
-    fn on_manage(&self, ctl: &Ctl, id: &str, secret: &[u8; 32], authed: mpsc::Sender<()>) -> Result<()> {
+    fn on_manage(&self, ctl: &Ctl, id: &str, secret: &[u8; 32], authed: Slot) -> Result<()> {
         let req = ctl.recv()?; // read before replying, so closing can't reset the reply away
         drop(authed);
         if !still_paired(&self.st().cfg, id, secret) {
@@ -1931,21 +1934,23 @@ fn confirm(k: &[u8], role: &[u8], init_id: &str, resp_id: &str) -> Hmac<Sha256> 
     m
 }
 
-/// SPAKE2 on the responder's PIN + key confirmation; returns the pairing secret.
+/// SPAKE2 on the responder's PIN + key confirmation; returns the pairing secret and, for the
+/// responder, its confirmation, which it sends last (once it has stored the pairing).
 /// The responder only confirms after checking the initiator's MAC, so a guesser learns nothing.
-fn pake(s: &mut TcpStream, pin: &str, initiator: bool, init_id: &str, resp_id: &str) -> Result<[u8; 32]> {
+fn pake(s: &mut TcpStream, pin: &str, initiator: bool, init_id: &str, resp_id: &str) -> Result<([u8; 32], Vec<u8>)> {
     let (st, msg) = Spake2::<Ed25519Group>::start_symmetric(&Password::new(pin.as_bytes()), &Identity::new(b"capralink-pair-v1"));
     send(s, &msg)?;
     let k = st.finish(&recv(s)?).map_err(|_| anyhow!("bad SPAKE2 message"))?;
     let (i, r) = (confirm(&k, b"initiator", init_id, resp_id), confirm(&k, b"responder", init_id, resp_id));
-    if initiator {
+    let reply = if initiator {
         send(s, &i.finalize().into_bytes())?;
         r.verify_slice(&recv(s)?).map_err(|_| anyhow!("key confirmation failed"))?;
+        Vec::new()
     } else {
         i.verify_slice(&recv(s)?).map_err(|_| anyhow!("key confirmation failed"))?;
-        send(s, &r.finalize().into_bytes())?;
-    }
-    Ok(hkdf(&k, b"capralink pairing secret"))
+        r.finalize().into_bytes().to_vec()
+    };
+    Ok((hkdf(&k, b"capralink pairing secret"), reply))
 }
 
 /// Noise NNpsk0 over the open connection. Audio keys come from the raw split keys (which
@@ -1974,6 +1979,20 @@ fn handshake(s: &mut TcpStream, secret: &[u8; 32], initiator: bool) -> Result<(A
     let (i2r, r2i) = (key(&i2r), key(&r2i));
     let keys = if initiator { Keys { send: i2r, recv: r2i } } else { Keys { send: r2i, recv: i2r } };
     Ok((Arc::new(Ctl { stream: s.try_clone()?, noise: Mutex::new(hs.into_transport_mode()?), inbox: Mutex::default() }), keys))
+}
+
+/// A connection's pending slot (see `Node::accept`), freed as soon as its own thread drops it: a
+/// reply sent after that can't race the peer's next connection into a full slot list.
+struct Slot {
+    node: Node,
+    ip: IpAddr,
+    _stop: mpsc::Sender<()>, // dropping it stops the watchdog
+}
+
+impl Drop for Slot {
+    fn drop(&mut self) {
+        self.node.release(self.ip);
+    }
 }
 
 /// The encrypted control channel of a session.
@@ -2773,16 +2792,17 @@ mod tests {
         let settings = serde_json::json!({ "music_mode": true }).as_object().unwrap().clone();
         m.send(&Msg::SetSettings { settings, name: Some("Taken over".into()) }).unwrap();
         assert!(refused(&m));
+        assert!(b.pending().is_empty(), "their slots are free before the refusals arrive");
         assert!(!is(&b, |d| d.connected) && b.state().current.is_none() && b.state().name != "Taken over" && !b.state().settings.music_mode);
 
         // paired again (new key) after the handshake: the old key's session is refused too
         b.open_pairing().unwrap();
         a.pair_addr(&[addr(&b)], &b.state().pin).unwrap();
-        wait(|| is(&b, |d| d.paired));
+        assert!(is(&b, |d| d.paired) && b.pending().is_empty(), "stored, slot free, before pairing returns");
         let old = pending(&a, &b, &aid, &bid);
         b.open_pairing().unwrap();
         a.pair_addr(&[addr(&b)], &b.state().pin).unwrap();
-        wait(|| secret(&b.st().cfg, &aid) == secret(&a.st().cfg, &bid));
+        assert!(secret(&b.st().cfg, &aid) == secret(&a.st().cfg, &bid));
         link(&old);
         assert!(refused(&old));
         assert!(!is(&b, |d| d.connected));
