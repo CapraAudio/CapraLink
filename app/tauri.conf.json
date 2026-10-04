@@ -14,7 +14,7 @@
   },
   "plugins": {
     "updater": {
-      "pubkey": "REPLACE_WITH_PUBKEY",
+      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IEFFNzgzNEFEQTkxMzI5MTgKUldRWUtST3ByVFI0cmdnYUdwNmZNOVpOT1hPaURtVStpOU9WY3FhTHVFVFBxRWFIOWZzc29iYVcK",
       "endpoints": ["https://github.com/CapraAudio/CapraLink/releases/latest/download/latest.json"]
     }
   },
