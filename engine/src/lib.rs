@@ -768,7 +768,11 @@ struct Tx {
     last_bitrate: i32,
     last_loss_perc: u8,
     cx: Complexity,
+    gain: f32, // send gain now: moves to the target over `GAIN_RAMP_S`, so mute/push-to-talk don't click
 }
+
+/// How long a send-gain change takes (0 → 1): an instant jump would click.
+const GAIN_RAMP_S: f32 = 0.01;
 
 impl Tx {
     // ponytail: encode + send run inside the capture callback; move them to a dedicated
@@ -785,9 +789,12 @@ impl Tx {
         // at least this callback's own buffer, when the host's timestamps don't say more
         let buffer_us = (data.len() / dev_ch) as u64 * 1_000_000 / self.rate as u64;
         self.shared.in_latency_us.store(age_us.max(buffer_us as u32), Relaxed);
-        let g = f32::from_bits(self.shared.send_gain.load(Relaxed));
+        let target = f32::from_bits(self.shared.send_gain.load(Relaxed));
+        let step = 1.0 / (self.rate as f32 * GAIN_RAMP_S);
         self.mixed.clear();
         for f in data.chunks_exact(dev_ch) {
+            self.gain += (target - self.gain).clamp(-step, step); // lands exactly on the target
+            let g = self.gain;
             let s = |i: usize| amplify(f32::from_sample(f[i.min(dev_ch - 1)]), g);
             if out_ch == 1 {
                 self.mixed.push(amplify((0..dev_ch).map(|i| f32::from_sample(f[i])).sum::<f32>() / dev_ch as f32, g));
@@ -892,6 +899,7 @@ impl Tx {
     fn new(cfg: &Settings, pk: Packetizer, sock: UdpSocket, peer: SocketAddr, shared: Arc<Shared>, dev_ch: usize, rate: u32) -> Tx {
         let ch = cfg.channels as usize;
         let (last_bitrate, last_loss_perc) = (shared.bitrate.load(Relaxed), shared.target_loss_perc.load(Relaxed));
+        let gain = f32::from_bits(shared.send_gain.load(Relaxed)); // a link that starts silent stays so
         Tx {
             pk,
             sock,
@@ -908,6 +916,7 @@ impl Tx {
             last_bitrate,
             last_loss_perc,
             cx: Complexity::default(),
+            gain,
         }
     }
 }
@@ -1302,13 +1311,20 @@ fn send_gain_mute_and_capture_latency() {
     let mut tx = Tx::new(&Settings::default(), pk, UdpSocket::bind("127.0.0.1:0").unwrap(), peer.local_addr().unwrap(), shared.clone(), 2, RATE);
     let level = || f32::from_bits(shared.in_peak.swap(0, Relaxed));
     shared.gains(gain(150, false), 1.0);
+    tx.process(&[0.4f32; 2 * 480], 0); // fades up from silence over 10 ms (no click)...
+    assert!(level() < 0.45, "still fading in");
     tx.process(&[0.4f32; 2 * 480], 0);
-    assert!((level() - 0.6).abs() < 1e-6, "150%");
+    assert!((level() - 0.6).abs() < 1e-6, "...then 150%");
     assert_eq!(shared.in_latency_us.load(Relaxed), 10_000, "no timestamps: the 10 ms buffer itself");
     tx.process(&[0.4f32; 2 * 480], 25_000);
     assert_eq!(shared.in_latency_us.load(Relaxed), 25_000, "the host's timestamps when they say more");
     level();
-    shared.gains(gain(150, true), 1.0); // muted: silence, still sent
+    shared.gains(gain(150, true), 1.0); // muted: fades out over 10 ms, then silence, still sent
+    tx.process(&[0.4f32; 2 * 480], 0);
+    let fading = tx.mixed.iter().step_by(2).copied().collect::<Vec<_>>();
+    assert!(fading[0] > 0.5 && fading.windows(2).all(|w| w[1] <= w[0] && w[0] - w[1] < 0.01), "a smooth fade, no jump");
+    tx.process(&[0.4f32; 2 * 480], 0); // 150% → 0 takes 15 ms
+    level();
     let sent = shared.c.sent.load(Relaxed);
     tx.process(&[0.4f32; 2 * 480], 0);
     assert_eq!((level(), shared.c.sent.load(Relaxed)), (0.0, sent + 1));
