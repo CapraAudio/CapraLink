@@ -1032,8 +1032,19 @@ impl Node {
             }
             st.ptt.talk.tick(Instant::now());
             if st.ptt.talk.on() != was {
-                apply_live(&st);
-                chirp(&st, !was);
+                if was && chirp(&st, false) {
+                    // the stop chirp reaches the user through the link: mute once it has been sent
+                    let n = self.clone();
+                    std::thread::spawn(move || {
+                        std::thread::sleep(Duration::from_secs_f32(ptt::CHIRP_SECS + 0.25));
+                        apply_live(&n.st());
+                    });
+                } else {
+                    apply_live(&st);
+                    if !was {
+                        chirp(&st, true);
+                    }
+                }
             }
         }
     }
@@ -1592,9 +1603,10 @@ fn apply_live(st: &St) {
 }
 
 /// Plays the push-to-talk chirp: in the session's playback, else on the default output device.
-fn chirp(st: &St, start: bool) {
+/// True if that default device is CapraLink's own output, i.e. the chirp is heard through the link.
+fn chirp(st: &St, start: bool) -> bool {
     if st.session.as_ref().and_then(|s| s.link.as_ref()).is_some_and(|l| l.chirp(start)) || cfg!(test) {
-        return;
+        return false;
     }
     let wave: fn(f32) -> f32 = if start { |t| ptt::chirp(true, t) } else { |t| ptt::chirp(false, t) };
     let _ = std::thread::Builder::new().name("capralink-chirp".into()).spawn(move || {
@@ -1602,6 +1614,7 @@ fn chirp(st: &St, start: bool) {
             log(&format!("push-to-talk sound: {e:#}"));
         }
     });
+    crate::default_output_is_virtual()
 }
 
 /// One-way delay estimate, ms: the sender's part (capture + frame), half the round trip

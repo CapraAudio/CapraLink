@@ -563,6 +563,12 @@ impl Drop for Link {
 
 /// The device (and its listed name) a Send from (`input`) / Play to setting names: `None` =
 /// system default, `Ok(None)` = that direction is off.
+/// The system's default output is CapraLink's own virtual output, so what plays there is sent
+/// over the link (e.g. a Mac whose sound is heard on the other computer).
+pub(crate) fn default_output_is_virtual() -> bool {
+    find(false, &None).ok().flatten().is_some_and(|(n, _)| n == VIRTUAL_OUTPUT)
+}
+
 fn find(input: bool, want: &Option<String>) -> anyhow::Result<Option<(String, cpal::Device)>> {
     let host = cpal::default_host();
     Ok(Some(match want.as_deref() {
