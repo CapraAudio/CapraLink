@@ -74,6 +74,11 @@ impl Talk {
         self.on
     }
 
+    /// Input may have been missed: stop talking until the next press.
+    pub fn reset(&mut self) {
+        *self = Talk::new(self.mode);
+    }
+
     /// When `tick` next has something to do.
     pub fn deadline(&self) -> Option<Instant> {
         self.until
@@ -107,6 +112,8 @@ pub enum Ev {
     Key(PttKey, bool),
     /// Why listening doesn't work right now (`None` = it works again).
     Status(Option<String>),
+    /// Key changes may have been missed (a device went away, events were dropped).
+    Lost,
 }
 
 /// A running listener; dropping it stops it.
@@ -262,6 +269,13 @@ fn evdev_events(buf: &[u8], size: usize) -> impl Iterator<Item = (u16, bool)> + 
     })
 }
 
+/// Whether the kernel dropped events (SYN_DROPPED): key releases may be lost.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn evdev_dropped(buf: &[u8], size: usize) -> bool {
+    let at = size - 8;
+    buf.chunks_exact(size).any(|e| u16::from_ne_bytes([e[at], e[at + 1]]) == 0 && u16::from_ne_bytes([e[at + 2], e[at + 3]]) == 3)
+}
+
 /// Steam Deck back grips in the controller's raw state report (kernel hid-steam.c: type 9 at
 /// byte 2; L4 = byte 13 bit 1, R4 = 13.2, L5 = 9.7, R5 = 10.0). Read straight from the controller,
 /// so they work while Steam's menus are open and need no Steam Input mapping.
@@ -345,7 +359,7 @@ fn mac_key(code: u16) -> PttKey {
 
 #[cfg(all(target_os = "linux", not(test)))]
 mod linux {
-    use super::{deck_grips, deck_key, evdev_events, evdev_key, Ev};
+    use super::{deck_grips, deck_key, evdev_dropped, evdev_events, evdev_key, Ev};
     use std::fs::File;
     use std::io::{ErrorKind, Read};
     use std::os::unix::fs::OpenOptionsExt;
@@ -401,13 +415,20 @@ mod linux {
             open.retain_mut(|(_, f)| loop {
                 match f.read(&mut buf) {
                     Ok(n) if n > 0 => {
+                        if evdev_dropped(&buf[..n], size) {
+                            let _ = tx.send(Ev::Lost);
+                        }
                         for (code, down) in evdev_events(&buf[..n], size) {
                             let _ = tx.send(Ev::Key(evdev_key(code), down));
                         }
                     }
                     Err(e) if e.kind() == ErrorKind::WouldBlock => break true,
                     Err(e) if e.kind() == ErrorKind::Interrupted => {}
-                    _ => break false, // unplugged: found again by the next scan if it comes back
+                    _ => {
+                        // unplugged: found again by the next scan if it comes back
+                        let _ = tx.send(Ev::Lost);
+                        break false;
+                    }
                 }
             });
             pads.retain_mut(|(_, f, held)| loop {
@@ -422,7 +443,10 @@ mod linux {
                     }
                     Err(e) if e.kind() == ErrorKind::WouldBlock => break true,
                     Err(e) if e.kind() == ErrorKind::Interrupted => {}
-                    _ => break false,
+                    _ => {
+                        let _ = tx.send(Ev::Lost);
+                        break false;
+                    }
                 }
             });
             std::thread::sleep(Duration::from_millis(10));
@@ -437,7 +461,7 @@ mod win {
     use std::sync::atomic::{AtomicBool, AtomicU32, Ordering::SeqCst};
     use std::sync::mpsc::Sender;
     use windows_sys::Win32::System::Threading::GetCurrentThreadId;
-    use windows_sys::Win32::UI::Input::{GetRawInputData, RegisterRawInputDevices, HRAWINPUT, RAWINPUT, RAWINPUTDEVICE, RAWINPUTHEADER, RIDEV_INPUTSINK, RID_INPUT, RIM_TYPEKEYBOARD, RIM_TYPEMOUSE};
+    use windows_sys::Win32::UI::Input::{GetRawInputData, RegisterRawInputDevices, HRAWINPUT, RAWINPUT, RAWINPUTDEVICE, RAWINPUTHEADER, RIDEV_DEVNOTIFY, RIDEV_INPUTSINK, RID_INPUT, RIM_TYPEKEYBOARD, RIM_TYPEMOUSE};
     use windows_sys::Win32::UI::WindowsAndMessaging::*;
 
     /// Ends `run`'s message loop.
@@ -463,7 +487,7 @@ mod win {
             }
             // the thread has a message queue now: `wake` can reach it
             thread.store(GetCurrentThreadId(), SeqCst);
-            let dev = |usage| RAWINPUTDEVICE { usUsagePage: 1, usUsage: usage, dwFlags: RIDEV_INPUTSINK, hwndTarget: hwnd };
+            let dev = |usage| RAWINPUTDEVICE { usUsagePage: 1, usUsage: usage, dwFlags: RIDEV_INPUTSINK | RIDEV_DEVNOTIFY, hwndTarget: hwnd };
             let devs = [dev(6), dev(2)]; // keyboard, mouse
             if RegisterRawInputDevices(devs.as_ptr(), 2, size_of::<RAWINPUTDEVICE>() as u32) == 0 {
                 fail("register");
@@ -474,6 +498,8 @@ mod win {
                         for (key, down) in read(msg.lParam as HRAWINPUT) {
                             let _ = tx.send(Ev::Key(key, down));
                         }
+                    } else if msg.message == WM_INPUT_DEVICE_CHANGE && msg.wParam == GIDC_REMOVAL as usize {
+                        let _ = tx.send(Ev::Lost); // unplugged: its held keys never come up
                     }
                     DispatchMessageW(&msg);
                 }
@@ -592,7 +618,11 @@ mod mac {
         let send = |k, down| drop(tap.tx.send(Ev::Key(k, down)));
         unsafe {
             match ty {
-                DISABLED_BY_TIMEOUT | DISABLED_BY_USER_INPUT => CGEventTapEnable(tap.port, true),
+                DISABLED_BY_TIMEOUT | DISABLED_BY_USER_INPUT => {
+                    // events went by unseen while the tap was off
+                    let _ = tap.tx.send(Ev::Lost);
+                    CGEventTapEnable(tap.port, true);
+                }
                 KEY_DOWN | KEY_UP => send(mac_key(CGEventGetIntegerValueField(event, KEYCODE) as u16), ty == KEY_DOWN),
                 FLAGS_CHANGED => {
                     let code = CGEventGetIntegerValueField(event, KEYCODE);
@@ -753,6 +783,7 @@ mod tests {
         let ev = |ty: u16, code: u16, value: i32| [&[0u8; 16][..], &ty.to_ne_bytes(), &code.to_ne_bytes(), &value.to_ne_bytes()].concat();
         let buf = [ev(1, 183, 1), ev(0, 0, 0), ev(1, 183, 2), ev(4, 4, 7), ev(1, 0x110, 1), ev(1, 183, 0)].concat();
         assert_eq!(evdev_events(&buf, 24).collect::<Vec<_>>(), [(183, true), (183, false)], "keys only; repeats, sync, scan and left click skipped");
+        assert!(!evdev_dropped(&buf, 24) && evdev_dropped(&[buf, ev(0, 3, 0)].concat(), 24), "SYN_DROPPED");
     }
 
     #[test]

@@ -663,6 +663,7 @@ impl Node {
             (st.cfg.device_id.clone(), st.cfg.name.clone())
         };
         let mut s = dial(addrs)?;
+        let _deadline = deadline(&s, IO_TIMEOUT)?;
         let addr = s.peer_addr()?.to_string();
         send_msg(&mut s, &Msg::Pair { id: my_id.clone(), name: my_name, port: Some(self.0.port) })?;
         let (id, name) = match recv_msg(&mut s)? {
@@ -737,7 +738,7 @@ impl Node {
             Some(Msg::Error { message }) => bail!("other computer: {message}"),
             _ => bail!("unexpected reply"),
         }
-        self.activate(id, &secret, addr, &keys, ctl.clone(), Some(gen))?;
+        self.activate(id, &secret, addr, &keys, ctl.clone(), (gen, true))?;
         self.send_mode(&ctl);
         Ok(())
     }
@@ -1013,6 +1014,8 @@ impl Node {
             };
             let mut st = self.st();
             let was = st.ptt.talk.on();
+            let gone = matches!(ev, Err(RecvTimeoutError::Disconnected));
+            let lost = gone || matches!(ev, Ok(Ev::Lost | Ev::Status(Some(_))));
             match ev {
                 Ok(Ev::Status(e)) => {
                     if let Some((e, c)) = e.clone().zip(st.ptt.capture.take()) {
@@ -1020,6 +1023,7 @@ impl Node {
                     }
                     st.ptt.error = e;
                 }
+                Ok(Ev::Lost) | Err(RecvTimeoutError::Disconnected) => {}
                 Ok(Ev::Key(k, true)) if st.ptt.capture.is_some() => {
                     let _ = st.ptt.capture.take().map(|c| c.send(Ok(k)));
                 }
@@ -1028,12 +1032,15 @@ impl Node {
                     false => st.ptt.talk.release(Instant::now()),
                 },
                 Ok(Ev::Key(..)) | Err(RecvTimeoutError::Timeout) => {}
-                Err(RecvTimeoutError::Disconnected) => return,
+            }
+            if lost {
+                st.ptt.talk.reset(); // fail closed: a key release may never arrive
             }
             st.ptt.talk.tick(Instant::now());
             if st.ptt.talk.on() != was {
                 log(if was { "push-to-talk: stopped talking" } else { "push-to-talk: talking" });
-                if was && chirp(&st, false) {
+                // input lost: mute at once, even if that cuts the stop chirp
+                if was && chirp(&st, false) && !lost {
                     // the stop chirp reaches the user through the link: mute once it has been sent
                     let n = self.clone();
                     std::thread::spawn(move || {
@@ -1046,6 +1053,9 @@ impl Node {
                         chirp(&st, true);
                     }
                 }
+            }
+            if gone {
+                return;
             }
         }
     }
@@ -1084,26 +1094,26 @@ impl Node {
     }
 
     /// Installs a new session: stops the old one, starts the Link, watches the control channel,
-    /// remembers the peer's address. `own` = this node dialed it, as part of retry generation
-    /// `own` (refused if that was cancelled meanwhile); it becomes `last_peer`. An incoming
-    /// session clears `last_peer`: the side that dialed owns reconnecting. Either kind is refused
-    /// if cancelled (e.g. Disconnect) while its audio starts.
-    fn activate(&self, id: &str, secret: &[u8; 32], addr: SocketAddr, keys: &Keys, ctl: Arc<Ctl>, own: Option<u64>) -> Result<()> {
+    /// remembers the peer's address. Refused if retry generation `gen` (taken when the `Link`
+    /// went out or came in) was cancelled meanwhile, e.g. by Disconnect. `mine` = this node dialed
+    /// it; it becomes `last_peer`. An incoming session clears `last_peer`: the side that dialed
+    /// owns reconnecting.
+    fn activate(&self, id: &str, secret: &[u8; 32], addr: SocketAddr, keys: &Keys, ctl: Arc<Ctl>, (gen, mine): (u64, bool)) -> Result<()> {
         let _one = self.0.starting.lock().unwrap_or_else(|e| e.into_inner());
         // the checks run again after the audio has started: either may change while it does
         let refused = |st: &St, gen: u64| -> Option<&'static str> {
-            // cancelled (Disconnect, another connect) since this start began; for an own dial,
-            // since its `Link` went out: the peer's copy gets `stop` (own dials are serialized,
-            // so no newer one of ours reached the peer before it)
+            // cancelled (Disconnect, another connect) since this start began: for an own dial,
+            // since its `Link` went out (the peer's copy gets `stop`; own dials are serialized,
+            // so no newer one of ours reached the peer before it), for the peer's, since its
+            // `Link` came in (also while it waited for another start)
             if st.retry != gen {
                 return Some("cancelled");
             }
             // forgotten (or paired again with a new key) since this session's handshake
             (!still_paired(&st.cfg, id, secret)).then_some("pairing was removed or changed")
         };
-        let (gen, mut settings) = {
+        let mut settings = {
             let mut st = self.st();
-            let gen = own.unwrap_or(st.retry);
             match refused(&st, gen) {
                 Some("cancelled") => {
                     drop(st);
@@ -1117,7 +1127,7 @@ impl Node {
                 old.ctl.close(); // its Link drops here, freeing the UDP port before the new bind
             }
             use_peer(&mut st.cfg, id);
-            (gen, st.cfg.settings.clone())
+            st.cfg.settings.clone()
         };
         // Opening devices can wait on the OS (e.g. macOS asking for microphone permission), so never
         // under the state lock: the window, Quit and everything else keep working meanwhile.
@@ -1150,11 +1160,11 @@ impl Node {
             }
         };
         self.cancel_retry(&mut st);
-        st.session = Some(Session { peer_id: id.to_string(), addr, link, ctl: ctl.clone(), peer_music: false, peer_hifi: (false, false), hifi_fallback: false, mine: own.is_some(), recent: VecDeque::new(), rtt_ms: None, peer_ms: (None, None) });
-        log(&format!("session started with {} at {addr}, {}", peer_name(&st.cfg, id), if own.is_some() { "dialed from here" } else { "dialed by the other computer" }));
+        st.session = Some(Session { peer_id: id.to_string(), addr, link, ctl: ctl.clone(), peer_music: false, peer_hifi: (false, false), hifi_fallback: false, mine, recent: VecDeque::new(), rtt_ms: None, peer_ms: (None, None) });
+        log(&format!("session started with {} at {addr}, {}", peer_name(&st.cfg, id), if mine { "dialed from here" } else { "dialed by the other computer" }));
         st.error = None;
         set_addr(&mut st.cfg, id, addr.to_string());
-        st.cfg.last_peer = own.map(|_| id.to_string());
+        st.cfg.last_peer = mine.then(|| id.to_string());
         if let Err(e) = save(&self.0.dir, &st.cfg) {
             st.error = Some(format!("{e:#}"));
         }
@@ -1367,7 +1377,7 @@ impl Node {
     /// can't hold a slot; dropping `authed` stops the watchdog and frees the slot.
     fn accept(&self, l: TcpListener) {
         for s in l.incoming().flatten() {
-            let (Ok(ip), Ok(s2)) = (s.peer_addr().map(|a| a.ip()), s.try_clone()) else { continue };
+            let Ok(ip) = s.peer_addr().map(|a| a.ip()) else { continue };
             {
                 let mut p = self.pending();
                 if p.len() >= MAX_PENDING || p.iter().filter(|&&a| a == ip).count() >= MAX_PENDING_PER_IP {
@@ -1375,16 +1385,11 @@ impl Node {
                 }
                 p.push(ip);
             }
-            let (stop, rx) = mpsc::channel::<()>();
-            let authed = Slot { node: self.clone(), ip, _stop: stop };
-            let watchdog = move || {
-                if rx.recv_timeout(AUTH_DEADLINE) == Err(RecvTimeoutError::Timeout) {
-                    let _ = s2.shutdown(Shutdown::Both);
-                }
-            };
-            if std::thread::Builder::new().name("capralink-auth".into()).spawn(watchdog).is_err() {
+            let Ok(stop) = deadline(&s, AUTH_DEADLINE) else {
+                self.release(ip);
                 continue;
-            }
+            };
+            let authed = Slot { node: self.clone(), ip, _stop: stop };
             let n = self.clone();
             let _ = std::thread::Builder::new().name("capralink-conn".into()).spawn(move || {
                 if let Err(e) = setup(&s).map_err(Into::into).and_then(|_| n.incoming(s, authed)) {
@@ -1479,9 +1484,10 @@ impl Node {
             Some(Msg::Stop) => return Ok(()), // its dial was cancelled after the handshake
             _ => bail!("expected link request"),
         };
+        let gen = self.st().retry; // a Disconnect from now on cancels it, also while it waits to start
         drop(authed); // the usual per-read timeouts from here on
         let addr = SocketAddr::new(s.peer_addr()?.ip(), port);
-        if let Err(e) = self.activate(id, &secret, addr, &keys, ctl.clone(), None) {
+        if let Err(e) = self.activate(id, &secret, addr, &keys, ctl.clone(), (gen, false)) {
             let _ = ctl.send(&Msg::Error { message: format!("{e:#}") });
             return Err(e);
         }
@@ -2090,6 +2096,7 @@ fn open(addrs: &[SocketAddr], my_id: &str, secret: &[u8; 32]) -> Result<(Arc<Ctl
     let mut err = anyhow!("no address for that device");
     for a in addrs {
         let r = dial(&[*a]).and_then(|mut s| {
+            let _deadline = deadline(&s, IO_TIMEOUT)?;
             send_msg(&mut s, &Msg::Session { id: my_id.into() })?;
             handshake(&mut s, secret, true).context("secure connection failed (try pairing again)")
         });
@@ -2099,6 +2106,19 @@ fn open(addrs: &[SocketAddr], my_id: &str, secret: &[u8; 32]) -> Result<(Arc<Ctl
         }
     }
     Err(err)
+}
+
+/// Closes `s` after `d` unless the returned guard is dropped first: per-read timeouts alone
+/// let a peer trickling bytes hold a handshake open for ever.
+fn deadline(s: &TcpStream, d: Duration) -> io::Result<mpsc::Sender<()>> {
+    let (stop, rx) = mpsc::channel::<()>();
+    let s = s.try_clone()?;
+    std::thread::Builder::new().name("capralink-deadline".into()).spawn(move || {
+        if rx.recv_timeout(d) == Err(RecvTimeoutError::Timeout) {
+            let _ = s.shutdown(Shutdown::Both);
+        }
+    })?;
+    Ok(stop)
 }
 
 fn setup(s: &TcpStream) -> io::Result<()> {
@@ -3085,4 +3105,68 @@ mod tests {
             "in_peak":0,"out_peak":0,"tx_gap_ms":0,"rx_gap_ms":0,"bitrate":0,"complexity":0}"#).unwrap();
         assert_eq!((st.delay_in_ms, st.delay_out_ms), (None, None));
     }
+    #[test]
+    fn ptt_input_loss_stops_talking() {
+        let (n, dir) = node();
+        patch(&n, serde_json::json!({"ptt":"hold", "ptt_key": f13()})).unwrap();
+        let tx = n.st().ptt.listener.as_ref().unwrap().tx.clone();
+        tx.send(Ev::Key(f13(), true)).unwrap();
+        wait(|| n.state().talking);
+        tx.send(Ev::Status(Some("input device lost".into()))).unwrap();
+        wait(|| n.state().ptt_error.is_some());
+        let after_error = n.state().talking; // at once: no release tail
+        tx.send(Ev::Status(None)).unwrap();
+        tx.send(Ev::Key(f13(), true)).unwrap();
+        wait(|| n.state().talking);
+        tx.send(Ev::Lost).unwrap();
+        wait(|| !n.state().talking); // a device went away with the key held
+        n.shutdown();
+        let _ = std::fs::remove_dir_all(dir);
+        assert!(!after_error, "Hold PTT stays transmitting after input failure");
+    }
+
+    #[test]
+    fn disconnect_cancels_queued_incoming_link() {
+        let ((a, adir), (b, bdir), aid, bid) = paired_nodes();
+        // Simulates another start currently owning the serialized audio-start lock.
+        let starting = b.0.starting.lock().unwrap();
+        let ctl = pending(&a, &b, &aid, &bid);
+        ctl.send(&Msg::Link { channels: 1, port: a.port() }).unwrap();
+        wait(|| b.pending().is_empty()); // handler accepted Link and is waiting for starting
+        b.disconnect();
+        drop(starting);
+        let accepted = matches!(ctl.recv(), Ok(Some(Msg::Ok)));
+        let connected = b.state().devices.iter().any(|d| d.connected);
+        b.disconnect();
+        a.shutdown();
+        b.shutdown();
+        let _ = std::fs::remove_dir_all(adir);
+        let _ = std::fs::remove_dir_all(bdir);
+        assert!(!accepted && !connected, "queued incoming session starts after Disconnect");
+    }
+
+    #[test]
+    fn outgoing_handshake_has_deadline() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut s, _) = listener.accept().unwrap();
+            setup(&s).unwrap();
+            recv_msg(&mut s).unwrap(); // Session
+            recv(&mut s).unwrap(); // initiator's Noise message
+            s.write_all(&256u16.to_be_bytes()).unwrap();
+            for _ in 0..7 {
+                if s.write_all(&[0]).is_err() {
+                    break; // cut off
+                }
+                std::thread::sleep(Duration::from_secs(1));
+            }
+        });
+        let start = Instant::now();
+        assert!(open(&[addr], &"a".repeat(32), &[7;32]).is_err());
+        let elapsed = start.elapsed();
+        server.join().unwrap();
+        assert!(elapsed < IO_TIMEOUT + Duration::from_millis(500), "untrusted trickling server held outgoing handshake for {elapsed:?}");
+    }
+
 }

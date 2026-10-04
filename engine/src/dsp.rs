@@ -232,16 +232,20 @@ pub fn is_nack(p: &[u8]) -> bool {
 }
 
 /// TX side of Hi-Fi resends: authenticates the peer's NACKs (each counter only once, so a replayed
-/// NACK can't make this side resend) and lists the seqs asked for.
+/// NACK can't make this side resend) and lists the seqs asked for: never more than were sent
+/// (REORDER packets a second, as a budget that refills at that rate), so a NACK of repeated
+/// ranges can't turn into a flood.
 pub struct Nacks {
     aead: ChaCha20Poly1305,
     last: Option<u32>,
+    budget: f32,
+    at: Instant,
 }
 
 impl Nacks {
     /// `key`: this side's send key (the peer sends its NACKs under it).
     pub fn new(key: &[u8; 32]) -> Self {
-        Nacks { aead: cipher(key), last: None }
+        Nacks { aead: cipher(key), last: None, budget: REORDER as f32, at: Instant::now() }
     }
 
     pub fn open<'a>(&mut self, p: &'a mut [u8]) -> Option<impl Iterator<Item = u32> + 'a> {
@@ -257,11 +261,17 @@ impl Nacks {
         let tag = Tag::try_from(&*tag).ok()?;
         self.aead.decrypt_inout_detached(&nack_nonce(counter), hdr, (&mut *body).into(), &tag).ok()?;
         self.last = Some(counter);
+        let now = Instant::now();
+        self.budget = (self.budget + now.duration_since(self.at).as_secs_f32() * REORDER as f32).min(REORDER as f32);
+        self.at = now;
         // ranges: first seq u32 | count u16
-        Some(body.as_chunks::<6>().0.iter().flat_map(|r| {
+        let seqs = body.as_chunks::<6>().0.iter().flat_map(|r| {
             let first = u32::from_be_bytes([r[0], r[1], r[2], r[3]]);
             first..first.saturating_add(u16::from_be_bytes([r[4], r[5]]).min(REORDER as u16) as u32)
-        }))
+        });
+        let n = seqs.clone().take(self.budget as usize).count();
+        self.budget -= n as f32;
+        Some(seqs.take(n))
     }
 }
 
@@ -1496,4 +1506,23 @@ mod tests {
         assert!(alias <= -60.0 && pass.abs() <= 0.5, "48 → 16 kHz: alias {alias} dB, 1 kHz {pass} dB");
         assert!(Resampler::new(48_000, RATE, 2).fir.is_empty() && Resampler::new(RATE, 44_100, 2).fir.is_empty(), "no filter, no delay at ≤ 48 kHz");
     }
+    #[test]
+    fn nack_resends_bounded() {
+        let key = [7u8;32];
+        let ranges = (MAX_PACKET - HEADER - TAG) / 6;
+        let mut packet = vec![0u8; HEADER + ranges * 6];
+        packet[..2].copy_from_slice(&MAGIC.to_be_bytes());
+        packet[2] = NACK;
+        for r in packet[HEADER..].as_chunks_mut::<6>().0 {
+            r[..4].copy_from_slice(&0u32.to_be_bytes());
+            r[4..].copy_from_slice(&(REORDER as u16).to_be_bytes());
+        }
+        let (hdr, body) = packet.split_at_mut(HEADER);
+        let tag = cipher(&key).encrypt_inout_detached(&nack_nonce(0), hdr, body.into()).unwrap();
+        packet.extend_from_slice(&tag);
+        let mut nacks = Nacks::new(&key);
+        let requests = nacks.open(&mut packet).unwrap().count();
+        assert!(requests <= REORDER as usize, "{} bytes requested {} resends ({} repeated ranges)", packet.len(), requests, ranges);
+    }
+
 }

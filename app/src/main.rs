@@ -247,18 +247,26 @@ fn export_diagnostics(window: tauri::WebviewWindow, app: State<App>, redact: boo
 /// Tray Quit: the engine goes too unless it is meant to run in the background. Never waits more
 /// than 2 s on the engine, so Quit works even if the engine is stuck.
 fn quit(app: &AppHandle) {
-    // never waits on the lock either: it is held while the engine is (re)started
-    let client = app.state::<App>().client.try_lock().ok().and_then(|c| c.clone());
-    if let Some(c) = client {
-        let (done, finished) = std::sync::mpsc::channel();
-        std::thread::spawn(move || {
-            if c.state().is_ok_and(|s| !s.settings.service) {
-                let _ = c.shutdown();
+    let a = app.state::<App>();
+    let (dir, rpc) = (a.dir.clone(), a.port.checked_add(1));
+    let (done, finished) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        // its own connection, not the cached client (whose lock is held while the engine is
+        // (re)started): an engine still starting is reached once it answers
+        let c = loop {
+            match rpc.map(|p| Client::local(dir.clone(), p)) {
+                Some(Ok(c)) => break c,
+                None => return,
+                Some(Err(_)) => std::thread::sleep(Duration::from_millis(100)),
             }
-            let _ = done.send(());
-        });
-        let _ = finished.recv_timeout(Duration::from_secs(2));
-    }
+        };
+        // stops it unless it is known to be meant to run in the background
+        if !c.state().is_ok_and(|s| s.settings.service) {
+            let _ = c.shutdown();
+        }
+        let _ = done.send(());
+    });
+    let _ = finished.recv_timeout(Duration::from_secs(2));
     app.exit(0);
 }
 
